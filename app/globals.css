@@ -132,7 +132,7 @@ h1 em { color: var(--green); font-style: normal; }
 .account-stats > div:last-child { border-right: 0; }
 .account-stats span { color: var(--muted); font-size: 10px; margin-bottom: 11px; }
 .account-stats strong { font: 500 20px DM Mono, monospace; }
-.exchange-balances { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+.exchange-balances { display: grid; grid-template-columns: 1fr; gap: 10px; margin-bottom: 12px; }
 .exchange-balances article { display: grid; grid-template-columns: minmax(135px, 1.1fr) repeat(4, minmax(115px, 1fr)); align-items: center; gap: 18px; border: 1px solid var(--line); background: var(--white); padding: 17px 20px; overflow: hidden; }
 .exchange-balances article > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .exchange-balances article > div > span { font-size: 9px; color: var(--muted); }

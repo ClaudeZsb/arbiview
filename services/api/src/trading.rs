@@ -9,7 +9,7 @@ use reqwest::{Client, Method};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -23,6 +23,7 @@ type FundingCache = Option<(Instant, IncomeSummary, IncomeSummary)>;
 #[derive(Clone, Default)]
 struct IncomeSummary {
     funding_by_symbol: FundingTotals,
+    trading_fees_by_symbol: FundingTotals,
     funding_income: f64,
     trading_fees: f64,
 }
@@ -30,6 +31,27 @@ struct IncomeSummary {
 impl IncomeSummary {
     fn realized_pnl(&self) -> f64 {
         self.funding_income - self.trading_fees
+    }
+
+    fn for_symbols(&self, symbols: &HashSet<String>) -> Self {
+        let funding_by_symbol = self
+            .funding_by_symbol
+            .iter()
+            .filter(|(symbol, _)| symbols.contains(*symbol))
+            .map(|(symbol, value)| (symbol.clone(), *value))
+            .collect::<HashMap<_, _>>();
+        let trading_fees_by_symbol = self
+            .trading_fees_by_symbol
+            .iter()
+            .filter(|(symbol, _)| symbols.contains(*symbol))
+            .map(|(symbol, value)| (symbol.clone(), *value))
+            .collect::<HashMap<_, _>>();
+        Self {
+            funding_income: funding_by_symbol.values().sum(),
+            trading_fees: trading_fees_by_symbol.values().sum(),
+            funding_by_symbol,
+            trading_fees_by_symbol,
+        }
     }
 }
 
@@ -565,6 +587,19 @@ impl TradingService {
                 })
             })
             .count();
+        let managed_symbols = all_legs
+            .iter()
+            .filter(|leg| {
+                all_legs.iter().any(|other| {
+                    other.symbol == leg.symbol
+                        && other.side != leg.side
+                        && other.exchange != leg.exchange
+                })
+            })
+            .map(|leg| leg.symbol.clone())
+            .collect::<HashSet<_>>();
+        let binance_income = binance_income.for_symbols(&managed_symbols);
+        let bybit_income = bybit_income.for_symbols(&managed_symbols);
         let unrealized_pnl = all_legs.iter().map(|leg| leg.unrealized_pnl).sum();
         let unhedged_legs = all_legs
             .iter()
@@ -1754,8 +1789,15 @@ impl TradingService {
             }
         }
         for item in commissions.as_array().unwrap_or(&vec![]) {
-            if let Some(commission) = number(&item["income"]) {
-                summary.trading_fees -= commission;
+            if let (Some(symbol), Some(commission)) =
+                (item["symbol"].as_str(), number(&item["income"]))
+            {
+                let expense = -commission;
+                *summary
+                    .trading_fees_by_symbol
+                    .entry(symbol.to_string())
+                    .or_insert(0.0) += expense;
+                summary.trading_fees += expense;
             }
         }
         Ok(summary)
@@ -1806,7 +1848,11 @@ impl TradingService {
                         .or_insert(0.0) += funding;
                     summary.funding_income += funding;
                 }
-                if let Some(fee) = number(&item["fee"]) {
+                if let (Some(symbol), Some(fee)) = (item["symbol"].as_str(), number(&item["fee"])) {
+                    *summary
+                        .trading_fees_by_symbol
+                        .entry(symbol.to_string())
+                        .or_insert(0.0) += fee;
                     summary.trading_fees += fee;
                 }
             }
@@ -2206,5 +2252,22 @@ mod tests {
             ..Default::default()
         };
         assert!((summary.realized_pnl() - 9.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn income_summary_can_be_scoped_to_managed_symbols() {
+        let summary = IncomeSummary {
+            funding_by_symbol: HashMap::from([("DEXEUSDT".into(), 8.0), ("XMRUSDT".into(), -2.0)]),
+            trading_fees_by_symbol: HashMap::from([
+                ("DEXEUSDT".into(), 0.7),
+                ("XMRUSDT".into(), 4.0),
+            ]),
+            funding_income: 6.0,
+            trading_fees: 4.7,
+        };
+        let filtered = summary.for_symbols(&HashSet::from(["DEXEUSDT".into()]));
+        assert!((filtered.funding_income - 8.0).abs() < 1e-9);
+        assert!((filtered.trading_fees - 0.7).abs() < 1e-9);
+        assert!((filtered.realized_pnl() - 7.3).abs() < 1e-9);
     }
 }
