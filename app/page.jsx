@@ -288,11 +288,11 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
             <div><span>可用金额</span><strong>{money(item.availableUsdt)}</strong></div>
             <div><span>账户权益</span><b>{money(item.equityUsdt)}</b></div>
             <div><span>未实现盈亏</span><b className={item.unrealizedPnl >= 0 ? "positive" : "negative"}>{money(item.unrealizedPnl)}</b></div>
-            <div><span>套利合约近 {account?.realizedPeriodDays || 7} 日已实现</span><b className={item.realizedPnl >= 0 ? "positive" : "negative"}>{money(item.realizedPnl)}</b><small>Funding {money(item.fundingIncome)} − 手续费 {money(item.tradingFees)}</small></div>
+            <div><span>套利合约近 {account?.realizedPeriodDays || 7} 日已实现</span><b className={item.realizedPnl >= 0 ? "positive" : "negative"}>{money(item.realizedPnl)}</b><small>平仓 {money(item.closedPositionPnl)} + Funding {money(item.fundingIncome)} − 手续费 {money(item.tradingFees)}</small></div>
           </article>
         ))}
       </div>
-      <p className="balance-note">未实现盈亏仅统计当前未平仓仓位；已实现盈亏只统计当前跨所套利合约近 {account?.realizedPeriodDays || 7} 日的资金费净收入减交易手续费，不含账户内其他策略和平仓价格损益。Bybit 可用金额为 Unified Account 的 USD 口径，可能低于账户权益。</p>
+      <p className="balance-note">未实现盈亏仅统计当前未平仓仓位；已实现盈亏只统计当前跨所套利合约近 {account?.realizedPeriodDays || 7} 日的平仓损益加 Funding 净额再减交易手续费，不含账户内其他策略。Bybit 可用金额为 Unified Account 的 USD 口径，可能低于账户权益。</p>
       {(account?.unhedgedLegs || []).length > 0 && (
         <div className="risk-alert">
           <b>检测到未对冲仓位</b>

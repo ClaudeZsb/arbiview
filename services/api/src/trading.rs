@@ -24,13 +24,15 @@ type FundingCache = Option<(Instant, IncomeSummary, IncomeSummary)>;
 struct IncomeSummary {
     funding_by_symbol: FundingTotals,
     trading_fees_by_symbol: FundingTotals,
+    closed_pnl_by_symbol: FundingTotals,
+    closed_position_pnl: f64,
     funding_income: f64,
     trading_fees: f64,
 }
 
 impl IncomeSummary {
     fn realized_pnl(&self) -> f64 {
-        self.funding_income - self.trading_fees
+        self.closed_position_pnl + self.funding_income - self.trading_fees
     }
 
     fn for_symbols(&self, symbols: &HashSet<String>) -> Self {
@@ -46,11 +48,19 @@ impl IncomeSummary {
             .filter(|(symbol, _)| symbols.contains(*symbol))
             .map(|(symbol, value)| (symbol.clone(), *value))
             .collect::<HashMap<_, _>>();
+        let closed_pnl_by_symbol = self
+            .closed_pnl_by_symbol
+            .iter()
+            .filter(|(symbol, _)| symbols.contains(*symbol))
+            .map(|(symbol, value)| (symbol.clone(), *value))
+            .collect::<HashMap<_, _>>();
         Self {
+            closed_position_pnl: closed_pnl_by_symbol.values().sum(),
             funding_income: funding_by_symbol.values().sum(),
             trading_fees: trading_fees_by_symbol.values().sum(),
             funding_by_symbol,
             trading_fees_by_symbol,
+            closed_pnl_by_symbol,
         }
     }
 }
@@ -561,6 +571,7 @@ impl TradingService {
                         .sum::<f64>(),
                 unrealized_pnl,
                 realized_pnl: 0.0,
+                closed_position_pnl: 0.0,
                 funding_income: 0.0,
                 trading_fees: 0.0,
                 realized_period_days: 7,
@@ -626,6 +637,7 @@ impl TradingService {
                     available_usdt: binance.1,
                     unrealized_pnl: binance.2,
                     realized_pnl: binance_income.realized_pnl(),
+                    closed_position_pnl: binance_income.closed_position_pnl,
                     funding_income: binance_income.funding_income,
                     trading_fees: binance_income.trading_fees,
                 },
@@ -635,6 +647,7 @@ impl TradingService {
                     available_usdt: bybit.1,
                     unrealized_pnl: bybit.2,
                     realized_pnl: bybit_income.realized_pnl(),
+                    closed_position_pnl: bybit_income.closed_position_pnl,
                     funding_income: bybit_income.funding_income,
                     trading_fees: bybit_income.trading_fees,
                 },
@@ -643,6 +656,8 @@ impl TradingService {
             available_usdt: binance.1 + bybit.1,
             unrealized_pnl,
             realized_pnl: binance_income.realized_pnl() + bybit_income.realized_pnl(),
+            closed_position_pnl: binance_income.closed_position_pnl
+                + bybit_income.closed_position_pnl,
             funding_income: binance_income.funding_income + bybit_income.funding_income,
             trading_fees: binance_income.trading_fees + bybit_income.trading_fees,
             realized_period_days: 7,
@@ -1773,9 +1788,13 @@ impl TradingService {
         let commission_query = format!(
             "incomeType=COMMISSION&startTime={start}&endTime={now}&limit=1000&timestamp={now}"
         );
-        let (funding, commissions) = tokio::try_join!(
+        let realized_query = format!(
+            "incomeType=REALIZED_PNL&startTime={start}&endTime={now}&limit=1000&timestamp={now}"
+        );
+        let (funding, commissions, realized) = tokio::try_join!(
             self.binance_signed(Method::GET, "/fapi/v1/income", &funding_query, creds),
-            self.binance_signed(Method::GET, "/fapi/v1/income", &commission_query, creds)
+            self.binance_signed(Method::GET, "/fapi/v1/income", &commission_query, creds),
+            self.binance_signed(Method::GET, "/fapi/v1/income", &realized_query, creds)
         )?;
         let mut summary = IncomeSummary::default();
         for item in funding.as_array().unwrap_or(&vec![]) {
@@ -1798,6 +1817,15 @@ impl TradingService {
                     .entry(symbol.to_string())
                     .or_insert(0.0) += expense;
                 summary.trading_fees += expense;
+            }
+        }
+        for item in realized.as_array().unwrap_or(&vec![]) {
+            if let (Some(symbol), Some(pnl)) = (item["symbol"].as_str(), number(&item["income"])) {
+                *summary
+                    .closed_pnl_by_symbol
+                    .entry(symbol.to_string())
+                    .or_insert(0.0) += pnl;
+                summary.closed_position_pnl += pnl;
             }
         }
         Ok(summary)
@@ -1854,6 +1882,15 @@ impl TradingService {
                         .entry(symbol.to_string())
                         .or_insert(0.0) += fee;
                     summary.trading_fees += fee;
+                }
+                if let (Some(symbol), Some(cash_flow)) =
+                    (item["symbol"].as_str(), number(&item["cashFlow"]))
+                {
+                    *summary
+                        .closed_pnl_by_symbol
+                        .entry(symbol.to_string())
+                        .or_insert(0.0) += cash_flow;
+                    summary.closed_position_pnl += cash_flow;
                 }
             }
             cursor = json["result"]["nextPageCursor"]
@@ -2150,6 +2187,7 @@ fn paper_exchange_balances(positions: &[Position]) -> Vec<ExchangeBalance> {
                 available_usdt: 50_000.0 - used_margin,
                 unrealized_pnl,
                 realized_pnl: 0.0,
+                closed_position_pnl: 0.0,
                 funding_income: 0.0,
                 trading_fees: 0.0,
             }
@@ -2264,10 +2302,22 @@ mod tests {
             ]),
             funding_income: 6.0,
             trading_fees: 4.7,
+            ..Default::default()
         };
         let filtered = summary.for_symbols(&HashSet::from(["DEXEUSDT".into()]));
         assert!((filtered.funding_income - 8.0).abs() < 1e-9);
         assert!((filtered.trading_fees - 0.7).abs() < 1e-9);
         assert!((filtered.realized_pnl() - 7.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_pnl_includes_partial_close_pnl() {
+        let summary = IncomeSummary {
+            closed_position_pnl: 4.5,
+            funding_income: 2.0,
+            trading_fees: 0.75,
+            ..Default::default()
+        };
+        assert!((summary.realized_pnl() - 5.75).abs() < 1e-9);
     }
 }

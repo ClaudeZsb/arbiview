@@ -235,6 +235,7 @@ pub struct AccountSummary {
     pub available_usdt: f64,
     pub unrealized_pnl: f64,
     pub realized_pnl: f64,
+    pub closed_position_pnl: f64,
     pub funding_income: f64,
     pub trading_fees: f64,
     pub realized_period_days: u8,
@@ -250,6 +251,7 @@ pub struct ExchangeBalance {
     pub available_usdt: f64,
     pub unrealized_pnl: f64,
     pub realized_pnl: f64,
+    pub closed_position_pnl: f64,
     pub funding_income: f64,
     pub trading_fees: f64,
 }
