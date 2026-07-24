@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/api/opportunities", get(opportunities))
+        .route("/api/position-quotes", get(position_quotes))
         .route("/api/account/summary", get(account_summary))
         .route("/api/positions", get(positions))
         .route("/api/trades/open", post(open_trade))
@@ -75,6 +76,12 @@ async fn main() -> anyhow::Result<()> {
 
 async fn opportunities(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.market.opportunities().await?))
+}
+
+async fn position_quotes(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.market.position_quotes().await?))
 }
 
 async fn account_summary(

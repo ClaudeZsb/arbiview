@@ -324,7 +324,8 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
             <div className="position-details">
               <div className="position-detail-head">
                 <span>方向 / 交易所</span>
-                <span>当前价格</span>
+                <span>可平仓价</span>
+                <span>标记价格</span>
                 <span>开仓均价</span>
                 <span>仓位数量</span>
                 <span>Funding Rate</span>
@@ -334,6 +335,7 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
               {[p.long, p.short].map((leg) => (
                 <div className="position-leg-detail" key={`${leg.exchange}-${leg.side}`}>
                   <div className="leg-detail-title"><i className={`side-dot ${leg.side}`} /><b>{leg.side.toUpperCase()} · {leg.exchange}</b></div>
+                  <b>{price(leg.closePrice ?? leg.markPrice)}</b>
                   <b>{price(leg.markPrice)}</b>
                   <b>{price(leg.entryPrice)}</b>
                   <b>{formatter.format(leg.quantity)}</b>
@@ -461,106 +463,57 @@ export default function Dashboard() {
   );
 
   useEffect(() => {
-    const subscriptions = positionSubscriptionKey
-      .split("|")
-      .filter(Boolean)
-      .map((item) => {
-        const [exchange, symbol] = item.split(":");
-        return { exchange, symbol };
-      });
-    if (subscriptions.length === 0) return undefined;
+    const subscriptions = new Set(positionSubscriptionKey.split("|").filter(Boolean));
+    if (subscriptions.size === 0) return undefined;
     setStreamStatus({ Binance: "connecting", Bybit: "connecting" });
-
     let stopped = false;
-    const sockets = [];
-    const reconnectTimers = [];
-    const pingTimers = [];
-    const updateQuote = (exchange, symbol, markPrice, fundingRate) => {
-      if (!Number.isFinite(markPrice)) return;
-      setPositions((current) => current.map((position) => {
-        const updateLeg = (leg) => {
-          if (leg.exchange !== exchange || leg.symbol !== symbol) return leg;
-          const unrealizedPnl = leg.side === "long"
-            ? (markPrice - leg.entryPrice) * leg.quantity
-            : (leg.entryPrice - markPrice) * leg.quantity;
-          return {
-            ...leg,
-            markPrice,
-            fundingRate: Number.isFinite(fundingRate) ? fundingRate : leg.fundingRate,
-            unrealizedPnl
+    const refreshQuotes = async () => {
+      try {
+        const response = await fetch("/backend/position-quotes", { cache: "no-store" });
+        const quotes = await response.json();
+        if (!response.ok) throw new Error(quotes.error);
+        if (stopped) return;
+        const relevant = new Map(
+          quotes
+            .filter((quote) => subscriptions.has(`${quote.exchange}:${quote.symbol}`))
+            .map((quote) => [`${quote.exchange}:${quote.symbol}`, quote])
+        );
+        setPositions((current) => current.map((position) => {
+          const updateLeg = (leg) => {
+            const quote = relevant.get(`${leg.exchange}:${leg.symbol}`);
+            if (!quote) return leg;
+            const markPrice = Number(quote.markPrice);
+            const closePrice = leg.side === "long"
+              ? Number(quote.bidPrice)
+              : Number(quote.askPrice);
+            const unrealizedPnl = leg.side === "long"
+              ? (markPrice - leg.entryPrice) * leg.quantity
+              : (leg.entryPrice - markPrice) * leg.quantity;
+            return {
+              ...leg,
+              markPrice,
+              closePrice,
+              fundingRate: Number(quote.fundingRate),
+              unrealizedPnl
+            };
           };
-        };
-        const long = updateLeg(position.long);
-        const short = updateLeg(position.short);
-        return { ...position, long, short, unrealizedPnl: long.unrealizedPnl + short.unrealizedPnl };
-      }));
-    };
-    const reconnect = (connect) => {
-      if (!stopped) reconnectTimers.push(window.setTimeout(connect, 3_000));
-    };
-
-    const binanceSymbols = subscriptions.filter((item) => item.exchange === "Binance");
-    const connectBinanceSymbol = (item) => {
-      if (stopped) return;
-      const stream = `${item.symbol.toLowerCase()}@markPrice@1s`;
-      const socket = new WebSocket(`wss://fstream.binancefuture.com/ws/${stream}`);
-      sockets.push(socket);
-      socket.onopen = () => {
-        setStreamStatus((current) => ({ ...current, Binance: "connected" }));
-      };
-      socket.onmessage = (event) => {
-        const message = JSON.parse(event.data);
-        const quote = message.data || message;
-        setStreamStatus((current) => ({ ...current, Binance: "live" }));
-        updateQuote("Binance", quote.s, Number(quote.p), Number(quote.r));
-      };
-      socket.onclose = () => {
-        setStreamStatus((current) => ({ ...current, Binance: "reconnecting" }));
-        reconnect(() => connectBinanceSymbol(item));
-      };
-      socket.onerror = () => socket.close();
-    };
-
-    const bybitSymbols = subscriptions.filter((item) => item.exchange === "Bybit");
-    const connectBybit = () => {
-      if (stopped || bybitSymbols.length === 0) return;
-      const socket = new WebSocket("wss://stream.bybit.com/v5/public/linear");
-      sockets.push(socket);
-      let pingTimer;
-      socket.onopen = () => {
-        setStreamStatus((current) => ({ ...current, Bybit: "connected" }));
-        socket.send(JSON.stringify({
-          op: "subscribe",
-          args: bybitSymbols.map((item) => `tickers.${item.symbol}`)
+          const long = updateLeg(position.long);
+          const short = updateLeg(position.short);
+          return { ...position, long, short, unrealizedPnl: long.unrealizedPnl + short.unrealizedPnl };
         }));
-        pingTimer = window.setInterval(() => {
-          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ op: "ping" }));
-        }, 20_000);
-        pingTimers.push(pingTimer);
-      };
-      socket.onmessage = (event) => {
-        const message = JSON.parse(event.data);
-        if (!message.topic?.startsWith("tickers.")) return;
-        const quote = Array.isArray(message.data) ? message.data[0] : message.data;
-        const symbol = quote?.symbol || message.topic.slice("tickers.".length);
-        setStreamStatus((current) => ({ ...current, Bybit: "live" }));
-        updateQuote("Bybit", symbol, Number(quote?.markPrice), Number(quote?.fundingRate));
-      };
-      socket.onclose = () => {
-        setStreamStatus((current) => ({ ...current, Bybit: "reconnecting" }));
-        if (pingTimer) window.clearInterval(pingTimer);
-        reconnect(connectBybit);
-      };
-      socket.onerror = () => socket.close();
+        setStreamStatus({
+          Binance: [...relevant.values()].some((quote) => quote.exchange === "Binance") ? "live" : "offline",
+          Bybit: [...relevant.values()].some((quote) => quote.exchange === "Bybit") ? "live" : "offline"
+        });
+      } catch {
+        if (!stopped) setStreamStatus({ Binance: "reconnecting", Bybit: "reconnecting" });
+      }
     };
-
-    binanceSymbols.forEach(connectBinanceSymbol);
-    connectBybit();
+    refreshQuotes();
+    const timer = window.setInterval(refreshQuotes, 2_000);
     return () => {
       stopped = true;
-      reconnectTimers.forEach(window.clearTimeout);
-      pingTimers.forEach(window.clearInterval);
-      sockets.forEach((socket) => socket.close());
+      window.clearInterval(timer);
     };
   }, [positionSubscriptionKey]);
 

@@ -135,31 +135,57 @@ impl MarketService {
                 return Ok(quotes.clone());
             }
         }
-        let (binance, bybit): (Value, Value) = tokio::try_join!(
+        let (binance_marks, binance_book, bybit): (Value, Value, Value) = tokio::try_join!(
             self.get_json("https://fapi.binance.com/fapi/v1/premiumIndex".into()),
+            self.get_json("https://fapi.binance.com/fapi/v1/ticker/bookTicker".into()),
             self.get_json("https://api.bybit.com/v5/market/tickers?category=linear".into())
         )?;
+        let binance_funding = binance_marks
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item["symbol"].as_str()?.to_string(),
+                    (
+                        parse(&item["markPrice"])?,
+                        parse(&item["lastFundingRate"]).unwrap_or(0.0),
+                    ),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
         let mut quotes = Vec::new();
-        for item in binance.as_array().unwrap_or(&vec![]) {
-            if let (Some(symbol), Some(mark_price)) =
-                (item["symbol"].as_str(), parse(&item["markPrice"]))
-            {
+        for item in binance_book.as_array().unwrap_or(&vec![]) {
+            if let (Some(symbol), Some(bid_price), Some(ask_price)) = (
+                item["symbol"].as_str(),
+                parse(&item["bidPrice"]),
+                parse(&item["askPrice"]),
+            ) {
+                let (mark_price, funding_rate) =
+                    binance_funding.get(symbol).copied().unwrap_or((0.0, 0.0));
                 quotes.push(PositionQuote {
                     exchange: "Binance".into(),
                     symbol: symbol.into(),
                     mark_price,
-                    funding_rate: parse(&item["lastFundingRate"]).unwrap_or(0.0),
+                    bid_price,
+                    ask_price,
+                    funding_rate,
                 });
             }
         }
         for item in bybit["result"]["list"].as_array().unwrap_or(&vec![]) {
-            if let (Some(symbol), Some(mark_price)) =
-                (item["symbol"].as_str(), parse(&item["markPrice"]))
-            {
+            if let (Some(symbol), Some(mark_price), Some(bid_price), Some(ask_price)) = (
+                item["symbol"].as_str(),
+                parse(&item["markPrice"]),
+                parse(&item["bid1Price"]),
+                parse(&item["ask1Price"]),
+            ) {
                 quotes.push(PositionQuote {
                     exchange: "Bybit".into(),
                     symbol: symbol.into(),
                     mark_price,
+                    bid_price,
+                    ask_price,
                     funding_rate: parse(&item["fundingRate"]).unwrap_or(0.0),
                 });
             }

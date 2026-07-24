@@ -76,6 +76,8 @@ pub struct PositionQuote {
     pub exchange: String,
     pub symbol: String,
     pub mark_price: f64,
+    pub bid_price: f64,
+    pub ask_price: f64,
     pub funding_rate: f64,
 }
 
