@@ -628,12 +628,36 @@ export default function Dashboard() {
       const response = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(20000)
       });
       const task = await response.json();
       if (!response.ok) throw new Error(task.error);
       setBatchTask(task);
     } catch (error) {
+      try {
+        const recoveryResponse = await fetch("/backend/trades/batch-tasks", {
+          cache: "no-store",
+          signal: AbortSignal.timeout(10000)
+        });
+        const tasks = await recoveryResponse.json();
+        const action = batchPanel.type === "reduce" ? "reduce" : "increase";
+        const recovered = recoveryResponse.ok && tasks.find((task) =>
+          task.action === action &&
+          task.token === batchPanel.position.token &&
+          Math.abs(task.targetNotionalUsdt - settings.targetNotionalUsdt) < 0.01 &&
+          Math.abs(task.orderNotionalUsdt - settings.orderNotionalUsdt) < 0.01 &&
+          Math.abs(task.intervalSeconds - settings.intervalSeconds) < 0.01 &&
+          Date.now() - task.startedAt < 10 * 60 * 1000
+        );
+        if (recovered) {
+          setBatchTask(recovered);
+          setNotice("创建响应超时，已自动接管后端正在执行的批量任务");
+          return;
+        }
+      } catch {
+        // Keep the original creation error when recovery is unavailable.
+      }
       setNotice(`批量${batchPanel.type === "reduce" ? "减仓" : "加仓"}启动失败：${error.message}`);
     } finally {
       setTradeBusy(false);

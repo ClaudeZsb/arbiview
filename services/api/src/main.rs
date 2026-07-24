@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/trades/open", post(open_trade))
         .route("/api/trades/batch-increase", post(start_batch_increase))
         .route("/api/trades/batch-reduce", post(start_batch_reduce))
+        .route("/api/trades/batch-tasks", get(batch_tasks))
         .route("/api/trades/batch-increase/:id", get(batch_increase))
         .route(
             "/api/trades/batch-increase/:id/cancel",
@@ -125,6 +126,10 @@ async fn batch_increase(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.batch_task(&id).await?))
+}
+
+async fn batch_tasks(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.batch_tasks().await))
 }
 
 async fn cancel_batch_increase(

@@ -420,11 +420,18 @@ impl TradingService {
         }
         let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
         let mut tasks = self.batch_tasks.write().await;
+        if let Some(existing) = tasks.values().find(|task| {
+            task.action == "increase"
+                && task.token == opportunity.token.symbol
+                && matches!(task.status.as_str(), "queued" | "running" | "cancelling")
+        }) {
+            return Ok(existing.clone());
+        }
         if tasks
             .values()
             .any(|task| matches!(task.status.as_str(), "queued" | "running" | "cancelling"))
         {
-            bail!("another batch increase task is already active");
+            bail!("another batch position task is already active");
         }
         let now = chrono::Utc::now().timestamp_millis();
         let total_batches =
@@ -490,6 +497,13 @@ impl TradingService {
             );
         }
         let mut tasks = self.batch_tasks.write().await;
+        if let Some(existing) = tasks.values().find(|task| {
+            task.action == "reduce"
+                && task.token == position.token
+                && matches!(task.status.as_str(), "queued" | "running" | "cancelling")
+        }) {
+            return Ok(existing.clone());
+        }
         if tasks
             .values()
             .any(|task| matches!(task.status.as_str(), "queued" | "running" | "cancelling"))
@@ -537,6 +551,18 @@ impl TradingService {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("batch task not found"))
+    }
+
+    pub async fn batch_tasks(&self) -> Vec<BatchIncreaseTask> {
+        let mut tasks = self
+            .batch_tasks
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.started_at));
+        tasks
     }
 
     pub async fn cancel_batch_task(&self, id: &str) -> Result<BatchIncreaseTask> {
