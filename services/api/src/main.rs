@@ -1,6 +1,7 @@
 mod config;
 mod market;
 mod models;
+mod telegram;
 mod trading;
 
 use axum::{
@@ -41,6 +42,9 @@ async fn main() -> anyhow::Result<()> {
     let market = MarketService::new(config.clone())?;
     let trading = TradingService::new(config.clone(), market.clone())?;
     let state = Arc::new(AppState { market, trading });
+    if let Some(telegram) = config.telegram.clone() {
+        telegram::spawn(telegram, state.clone());
+    }
     let cors = CorsLayer::new()
         .allow_origin(config.web_origin.parse::<HeaderValue>()?)
         .allow_methods([Method::GET, Method::POST])

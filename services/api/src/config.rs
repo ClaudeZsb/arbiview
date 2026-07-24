@@ -6,6 +6,14 @@ pub struct ExchangeCredentials {
     pub api_secret: String,
 }
 
+#[derive(Clone)]
+pub struct TelegramConfig {
+    pub token: String,
+    pub chat_id: i64,
+    pub topic_id: Option<i64>,
+    pub authorized_users: Vec<i64>,
+}
+
 #[derive(Clone, PartialEq)]
 pub enum TradingMode {
     Paper,
@@ -22,6 +30,7 @@ pub struct Config {
     pub web_origin: String,
     pub max_slippage_bps: u32,
     pub position_tolerance_usdt: f64,
+    pub telegram: Option<TelegramConfig>,
 }
 
 impl Config {
@@ -58,6 +67,7 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(10.0),
+            telegram: telegram_config()?,
         })
     }
 }
@@ -67,4 +77,46 @@ fn credentials(prefix: &str) -> Option<ExchangeCredentials> {
         api_key: std::env::var(format!("{prefix}_API_KEY")).ok()?,
         api_secret: std::env::var(format!("{prefix}_API_SECRET")).ok()?,
     })
+}
+
+fn telegram_config() -> Result<Option<TelegramConfig>> {
+    let enabled = std::env::var("TELEGRAM_ENABLED")
+        .unwrap_or_else(|_| "false".into())
+        .parse::<bool>()
+        .map_err(|_| anyhow::anyhow!("TELEGRAM_ENABLED must be true or false"))?;
+    if !enabled {
+        return Ok(None);
+    }
+    let token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN is required when Telegram is enabled"))?;
+    let chat_id = std::env::var("TELEGRAM_CHAT_ID")
+        .map_err(|_| anyhow::anyhow!("TELEGRAM_CHAT_ID is required when Telegram is enabled"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("TELEGRAM_CHAT_ID must be an integer"))?;
+    let topic_id = std::env::var("TELEGRAM_TOPIC_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("TELEGRAM_TOPIC_ID must be an integer"))
+        })
+        .transpose()?;
+    let authorized_users = std::env::var("TELEGRAM_AUTHORIZED_USERS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("TELEGRAM_AUTHORIZED_USERS must contain integers"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(TelegramConfig {
+        token,
+        chat_id,
+        topic_id,
+        authorized_users,
+    }))
 }

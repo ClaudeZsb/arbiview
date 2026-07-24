@@ -68,3 +68,25 @@ BYBIT_API_SECRET=
 - 两腿使用并发市价单提交，减少单腿方向暴露时间。
 - 每腿实际名义价值距离目标超过 `POSITION_TOLERANCE_USDT`（默认 10 USDT）时，优先对不足腿补单。
 - 补单后两腿差额仍超出容差时，对较大腿执行 `reduceOnly` 减仓，与较小腿对齐。
+## Telegram Bot
+
+Rust 后端可像 Freqtrade 一样以 Telegram long polling 方式运行 Bot。Bot 直接调用后端现有的行情与交易服务，支持：
+
+- `/opportunities` 查询当前资费套利机会并从 Inline Keyboard 选择开仓；
+- `/positions` 查询持仓，并执行加仓、减仓、调整杠杆和完全平仓；
+- `/account` 查询各交易所余额和账户盈亏；
+- `/open TOKEN 金额 [杠杆]`、`/reduce TOKEN 金额`、`/leverage TOKEN 杠杆`、`/close TOKEN` 精确管理仓位。
+
+所有会修改仓位的操作都需要二次确认。Bot 首先校验 `chat_id`，配置 `TELEGRAM_AUTHORIZED_USERS` 后还会校验发出命令的用户 ID；群组 Topic 可通过 `TELEGRAM_TOPIC_ID` 限定。
+
+在 `services/api/.env.local` 或后端服务的环境文件中配置：
+
+```dotenv
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=123456:replace-me
+TELEGRAM_CHAT_ID=123456789
+TELEGRAM_TOPIC_ID=
+TELEGRAM_AUTHORIZED_USERS=123456789
+```
+
+不要让两个进程使用同一个 Bot Token 同时执行 long polling，否则它们会争抢 updates。配置修改后重启 `arbiview-api` 即可。
