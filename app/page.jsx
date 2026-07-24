@@ -16,6 +16,7 @@ function price(value) {
 }
 
 function money(value) {
+  if (value === undefined || value === null || !Number.isFinite(Number(value))) return "—";
   return `$${Number(value || 0).toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
@@ -205,7 +206,7 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
         <div><span>账户权益</span><strong>{money(account?.equityUsdt)}</strong></div>
         <div><span>可用余额</span><strong>{money(account?.availableUsdt)}</strong></div>
         <div><span>未实现盈亏</span><strong className={(account?.unrealizedPnl || 0) >= 0 ? "positive" : "negative"}>{money(account?.unrealizedPnl)}</strong></div>
-        <div><span>活跃套利仓位</span><strong>{account?.activePositions || 0}</strong></div>
+        <div><span>活跃套利仓位</span><strong>{account ? account.activePositions : "—"}</strong></div>
       </div>
       <div className="exchange-balances">
         {(account?.exchanges || []).map((item) => (
@@ -230,7 +231,7 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
         </div>
       )}
       <div className="position-list">
-        {positions.length === 0 && <div className="state compact">暂无持仓，可从下方机会列表建立模拟双腿仓位</div>}
+        {positions.length === 0 && <div className="state compact">{account ? "暂无持仓，可从下方机会列表建立模拟双腿仓位" : "正在读取账户与持仓…"}</div>}
         {positions.map((p) => (
           <details className="position-item" key={p.id}>
             <summary className="position-row">
@@ -320,13 +321,14 @@ export default function Dashboard() {
       ]);
       const summary = await summaryResponse.json();
       const active = await positionsResponse.json();
-      if (!summaryResponse.ok) throw new Error(summary.error);
-      if (!positionsResponse.ok) throw new Error(active.error);
-      setAccount(summary);
-      setPositions(active);
+      if (summaryResponse.ok) setAccount(summary);
+      if (positionsResponse.ok) setPositions(active);
+      if (!summaryResponse.ok || !positionsResponse.ok) {
+        throw new Error(summary.error || active.error);
+      }
       accountBackoffUntil.current = 0;
     } catch (e) {
-      accountBackoffUntil.current = Date.now() + 60_000;
+      accountBackoffUntil.current = Date.now() + 15_000;
       setNotice(`账户服务：${e.message}`);
     }
   }, []);
@@ -340,7 +342,7 @@ export default function Dashboard() {
       setAccount(summary);
       accountBackoffUntil.current = 0;
     } catch (e) {
-      accountBackoffUntil.current = Date.now() + 60_000;
+      accountBackoffUntil.current = Date.now() + 15_000;
       setNotice(`账户服务：${e.message}`);
     }
   }, []);
@@ -354,7 +356,7 @@ export default function Dashboard() {
       setPositions(active);
       accountBackoffUntil.current = 0;
     } catch (e) {
-      accountBackoffUntil.current = Date.now() + 60_000;
+      accountBackoffUntil.current = Date.now() + 15_000;
       setNotice(`持仓服务：${e.message}`);
     }
   }, []);

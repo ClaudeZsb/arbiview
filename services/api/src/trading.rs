@@ -1446,8 +1446,13 @@ impl TradingService {
         query: &str,
         creds: &ExchangeCredentials,
     ) -> Result<Value> {
-        let signature = sign(&creds.api_secret, query);
-        let url = format!("https://fapi.binance.com{path}?{query}&signature={signature}");
+        let signed_query = if query.contains("recvWindow=") {
+            query.to_string()
+        } else {
+            format!("{query}&recvWindow=10000")
+        };
+        let signature = sign(&creds.api_secret, &signed_query);
+        let url = format!("https://fapi.binance.com{path}?{signed_query}&signature={signature}");
         let response = self
             .client
             .request(method, url)
