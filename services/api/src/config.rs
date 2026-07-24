@@ -21,6 +21,7 @@ pub struct Config {
     pub trading_mode: TradingMode,
     pub web_origin: String,
     pub max_slippage_bps: u32,
+    pub position_tolerance_usdt: f64,
 }
 
 impl Config {
@@ -53,6 +54,10 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(50),
+            position_tolerance_usdt: std::env::var("POSITION_TOLERANCE_USDT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(10.0),
         })
     }
 }

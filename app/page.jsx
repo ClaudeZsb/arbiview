@@ -122,7 +122,7 @@ function TradeModal({ item, mode, onClose, onSubmit, busy }) {
         </select></label>
         <div className={`trade-warning ${isLive ? "live" : "paper"}`}><ShieldCheck size={16} />
           {isLive
-            ? "真实交易模式：确认后将立即向 Binance 与 Bybit 提交真实市价单。"
+            ? "真实交易模式：两腿将并发提交市价单；不足目标时优先补仓，差额超过 10 USDT 时自动减仓对齐。"
             : mode === "paper"
               ? "模拟交易模式：只在后端记录模拟仓位，不会向交易所发送订单。"
               : "尚未读取后端交易模式，暂时禁止提交。"}
@@ -249,7 +249,10 @@ export default function Dashboard() {
       const orderSummary = json.execution?.orders
         ?.map((order) => `${order.exchange} ${order.status} #${order.orderId}`)
         .join(" · ");
-      setNotice(orderSummary ? `${json.message} · ${orderSummary}` : json.message);
+      const balanceSummary = json.execution
+        ? `Long ${money(json.execution.longNotionalUsdt)} / Short ${money(json.execution.shortNotionalUsdt)} · 补单 ${json.execution.supplementOrders?.length || 0} · 对齐减仓 ${json.execution.rebalanceOrders?.length || 0}`
+        : "";
+      setNotice([json.message, balanceSummary, orderSummary].filter(Boolean).join(" · "));
       setTradeItem(null);
       await loadAccount();
     } catch (e) { setNotice(`开仓失败：${e.message}`); }

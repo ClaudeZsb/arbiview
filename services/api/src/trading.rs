@@ -14,6 +14,53 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+struct LegFill {
+    quantity: f64,
+    average_entry: f64,
+}
+
+impl LegFill {
+    fn from_order(order: OrderExecution) -> Self {
+        Self {
+            quantity: order.executed_quantity,
+            average_entry: order.average_price,
+        }
+    }
+
+    fn add(&mut self, order: &OrderExecution) {
+        let total = self.quantity + order.executed_quantity;
+        if total > 0.0 {
+            self.average_entry = (self.average_entry * self.quantity
+                + order.average_price * order.executed_quantity)
+                / total;
+            self.quantity = total;
+        }
+    }
+
+    fn reduce(&mut self, order: &OrderExecution) {
+        self.quantity = (self.quantity - order.executed_quantity).max(0.0);
+    }
+
+    fn notional(&self, reference_price: f64) -> f64 {
+        self.quantity * reference_price
+    }
+
+    fn average_price(&self) -> f64 {
+        self.average_entry
+    }
+
+    fn as_execution(&self, exchange: &str) -> OrderExecution {
+        OrderExecution {
+            exchange: exchange.into(),
+            client_order_id: "aggregate".into(),
+            order_id: "aggregate".into(),
+            status: "FILLED".into(),
+            executed_quantity: self.quantity,
+            average_price: self.average_entry,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TradingService {
     config: Config,
@@ -300,45 +347,27 @@ impl TradingService {
             outcome: "executing".into(),
             naked_exposure: false,
             max_slippage_bps: self.config.max_slippage_bps,
+            target_notional_usdt: request.notional_usdt,
+            long_notional_usdt: 0.0,
+            short_notional_usdt: 0.0,
+            tolerance_usdt: self.config.position_tolerance_usdt,
+            balanced: false,
             orders: vec![],
+            supplement_orders: vec![],
+            rebalance_orders: vec![],
             compensation_orders: vec![],
         };
-        let long_order = self
-            .place(
+
+        let (long_result, short_result) = tokio::join!(
+            self.place(
                 &opportunity.long.exchange,
                 &opportunity.long.symbol,
                 "Buy",
                 long_qty,
                 false,
                 opportunity.long.ask,
-            )
-            .await
-            .context("long leg failed; no short order was sent")?;
-        if let Err(slippage_error) = self.ensure_slippage(&long_order, opportunity.long.ask, true) {
-            let client_id = long_order.client_order_id.clone();
-            match self
-                .place(
-                    &opportunity.long.exchange,
-                    &opportunity.long.symbol,
-                    "Sell",
-                    long_qty,
-                    true,
-                    0.0,
-                )
-                .await
-            {
-                Ok(_) => return Err(slippage_error.context("long leg was compensated")),
-                Err(compensation_error) => {
-                    return Err(anyhow!(
-                        "NAKED_EXPOSURE: {slippage_error:#}; compensating close failed ({compensation_error:#}); longClientOrderId={client_id}"
-                    ));
-                }
-            }
-        }
-        report.orders.push(long_order);
-
-        let short_order = match self
-            .place(
+            ),
+            self.place(
                 &opportunity.short.exchange,
                 &opportunity.short.symbol,
                 "Sell",
@@ -346,66 +375,71 @@ impl TradingService {
                 false,
                 opportunity.short.bid,
             )
-            .await
-        {
-            Ok(order) => order,
-            Err(error) => {
-                match self
-                    .place(
-                        &opportunity.long.exchange,
-                        &opportunity.long.symbol,
-                        "Sell",
-                        long_qty,
-                        true,
-                        0.0,
-                    )
-                    .await
-                {
-                    Ok(order) => report.compensation_orders.push(order),
-                    Err(compensation_error) => {
-                        return Err(anyhow!(
-                            "NAKED_EXPOSURE: short leg failed ({error:#}); compensating long close failed ({compensation_error:#}); longClientOrderId={}",
-                            report.orders[0].client_order_id
-                        ));
-                    }
-                }
-                return Err(error.context("short leg failed; long leg compensation was confirmed"));
+        );
+        let (long_order, short_order) = match (long_result, short_result) {
+            (Ok(long), Ok(short)) => (long, short),
+            (Ok(long), Err(short_error)) => {
+                return self
+                    .compensate_single_leg(&opportunity.long, "Sell", long, short_error, "short")
+                    .await;
             }
-        };
-        if let Err(slippage_error) =
-            self.ensure_slippage(&short_order, opportunity.short.bid, false)
-        {
-            let long_compensation = self
-                .place(
-                    &opportunity.long.exchange,
-                    &opportunity.long.symbol,
-                    "Sell",
-                    long_qty,
-                    true,
-                    0.0,
-                )
-                .await;
-            let short_compensation = self
-                .place(
-                    &opportunity.short.exchange,
-                    &opportunity.short.symbol,
-                    "Buy",
-                    short_qty,
-                    true,
-                    0.0,
-                )
-                .await;
-            if long_compensation.is_err() || short_compensation.is_err() {
+            (Err(long_error), Ok(short)) => {
+                return self
+                    .compensate_single_leg(&opportunity.short, "Buy", short, long_error, "long")
+                    .await;
+            }
+            (Err(long_error), Err(short_error)) => {
                 return Err(anyhow!(
-                    "NAKED_EXPOSURE: {slippage_error:#}; one or more compensation orders failed; longClientOrderId={}; shortClientOrderId={}",
-                    report.orders[0].client_order_id,
-                    short_order.client_order_id
+                    "both concurrent legs failed; long=({long_error:#}); short=({short_error:#})"
                 ));
             }
-            return Err(slippage_error.context("both filled legs were compensated"));
+        };
+
+        let mut long_fill = LegFill::from_order(long_order.clone());
+        let mut short_fill = LegFill::from_order(short_order.clone());
+        report.orders.extend([long_order, short_order]);
+
+        self.supplement_leg(
+            &opportunity.long,
+            "Buy",
+            &mut long_fill,
+            request.notional_usdt,
+            &mut report,
+        )
+        .await?;
+        self.supplement_leg(
+            &opportunity.short,
+            "Sell",
+            &mut short_fill,
+            request.notional_usdt,
+            &mut report,
+        )
+        .await?;
+        self.rebalance_legs(&opportunity, &mut long_fill, &mut short_fill, &mut report)
+            .await?;
+
+        self.ensure_slippage(
+            &long_fill.as_execution(&opportunity.long.exchange),
+            opportunity.long.ask,
+            true,
+        )?;
+        self.ensure_slippage(
+            &short_fill.as_execution(&opportunity.short.exchange),
+            opportunity.short.bid,
+            false,
+        )?;
+        report.long_notional_usdt = long_fill.notional(opportunity.long.ask);
+        report.short_notional_usdt = short_fill.notional(opportunity.short.bid);
+        report.balanced = (report.long_notional_usdt - report.short_notional_usdt).abs()
+            <= self.config.position_tolerance_usdt;
+        if !report.balanced {
+            bail!(
+                "NAKED_EXPOSURE: final leg mismatch {:.2} USDT exceeds tolerance {:.2}",
+                (report.long_notional_usdt - report.short_notional_usdt).abs(),
+                self.config.position_tolerance_usdt
+            );
         }
-        report.orders.push(short_order);
-        report.outcome = "filled".into();
+        report.outcome = "filled_and_balanced".into();
         let position = Position {
             id: format!("live-{}", opportunity.token.symbol),
             token: opportunity.token.symbol,
@@ -417,8 +451,8 @@ impl TradingService {
                 exchange: opportunity.long.exchange,
                 symbol: opportunity.long.symbol,
                 side: "long".into(),
-                quantity: long_qty,
-                entry_price: report.orders[0].average_price,
+                quantity: long_fill.quantity,
+                entry_price: long_fill.average_price(),
                 mark_price: opportunity.long.mark,
                 unrealized_pnl: 0.0,
             },
@@ -426,8 +460,8 @@ impl TradingService {
                 exchange: opportunity.short.exchange,
                 symbol: opportunity.short.symbol,
                 side: "short".into(),
-                quantity: short_qty,
-                entry_price: report.orders[1].average_price,
+                quantity: short_fill.quantity,
+                entry_price: short_fill.average_price(),
                 mark_price: opportunity.short.mark,
                 unrealized_pnl: 0.0,
             },
@@ -437,9 +471,112 @@ impl TradingService {
         Ok(TradeResponse {
             position,
             mode: "live".into(),
-            message: "双腿市价单已确认成交".into(),
+            message: "双腿已并发成交并完成仓位对齐".into(),
             execution: Some(report),
         })
+    }
+
+    async fn compensate_single_leg(
+        &self,
+        leg: &Leg,
+        close_side: &str,
+        order: OrderExecution,
+        other_error: anyhow::Error,
+        failed_side: &str,
+    ) -> Result<TradeResponse> {
+        let compensation = self
+            .place(
+                &leg.exchange,
+                &leg.symbol,
+                close_side,
+                order.executed_quantity,
+                true,
+                0.0,
+            )
+            .await;
+        match compensation {
+            Ok(_) => Err(other_error.context(format!(
+                "concurrent {failed_side} leg failed; opposite confirmed fill was compensated"
+            ))),
+            Err(compensation_error) => Err(anyhow!(
+                "NAKED_EXPOSURE: concurrent {failed_side} leg failed ({other_error:#}); compensation failed ({compensation_error:#}); filledClientOrderId={}",
+                order.client_order_id
+            )),
+        }
+    }
+
+    async fn supplement_leg(
+        &self,
+        leg: &Leg,
+        side: &str,
+        fill: &mut LegFill,
+        target_usdt: f64,
+        report: &mut ExecutionReport,
+    ) -> Result<()> {
+        let reference = if side == "Buy" { leg.ask } else { leg.bid };
+        let missing = target_usdt - fill.notional(reference);
+        if missing <= self.config.position_tolerance_usdt {
+            return Ok(());
+        }
+        let quantity = floor_step(missing / reference, leg.qty_step);
+        if quantity <= 0.0 {
+            return Ok(());
+        }
+        match self
+            .place(&leg.exchange, &leg.symbol, side, quantity, false, reference)
+            .await
+        {
+            Ok(order) => {
+                fill.add(&order);
+                report.supplement_orders.push(order);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("unknown") || message.contains("NAKED_EXPOSURE") {
+                    return Err(error.context(
+                        "NAKED_EXPOSURE: supplement result is uncertain; reconciliation stopped",
+                    ));
+                }
+                tracing::warn!(
+                    exchange = %leg.exchange,
+                    symbol = %leg.symbol,
+                    error = %error,
+                    "target supplement failed; falling back to reducing the larger leg"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn rebalance_legs(
+        &self,
+        opportunity: &Opportunity,
+        long_fill: &mut LegFill,
+        short_fill: &mut LegFill,
+        report: &mut ExecutionReport,
+    ) -> Result<()> {
+        let long_notional = long_fill.notional(opportunity.long.ask);
+        let short_notional = short_fill.notional(opportunity.short.bid);
+        let difference = (long_notional - short_notional).abs();
+        if difference <= self.config.position_tolerance_usdt {
+            return Ok(());
+        }
+        let (leg, side, fill, reference) = if long_notional > short_notional {
+            (&opportunity.long, "Sell", long_fill, opportunity.long.ask)
+        } else {
+            (&opportunity.short, "Buy", short_fill, opportunity.short.bid)
+        };
+        let quantity = floor_step(difference / reference, leg.qty_step);
+        if quantity <= 0.0 {
+            return Ok(());
+        }
+        let order = self
+            .place(&leg.exchange, &leg.symbol, side, quantity, true, 0.0)
+            .await
+            .context("NAKED_EXPOSURE: failed to reduce the larger leg during reconciliation")?;
+        fill.reduce(&order);
+        report.rebalance_orders.push(order);
+        Ok(())
     }
 
     async fn close_live(&self, id: &str) -> Result<TradeResponse> {
@@ -452,7 +589,14 @@ impl TradingService {
             outcome: "closing".into(),
             naked_exposure: false,
             max_slippage_bps: self.config.max_slippage_bps,
+            target_notional_usdt: position.notional_usdt,
+            long_notional_usdt: position.long.quantity * position.long.mark_price,
+            short_notional_usdt: position.short.quantity * position.short.mark_price,
+            tolerance_usdt: self.config.position_tolerance_usdt,
+            balanced: true,
             orders: vec![],
+            supplement_orders: vec![],
+            rebalance_orders: vec![],
             compensation_orders: vec![],
         };
         let long_close = self
@@ -620,13 +764,8 @@ impl TradingService {
             }
         };
         let status = response["status"].as_str().unwrap_or("UNKNOWN");
-        if status != "FILLED" {
-            let executed = number(&response["executedQty"]).unwrap_or(0.0);
-            if executed > 0.0 {
-                bail!(
-                    "NAKED_EXPOSURE: Binance order partially filled {executed}; status={status}; clientOrderId={client_order_id}"
-                );
-            }
+        let executed = number(&response["executedQty"]).unwrap_or(0.0);
+        if status != "FILLED" && executed <= 0.0 {
             bail!("Binance order not filled: status={status}, clientOrderId={client_order_id}");
         }
         Ok(OrderExecution {
@@ -634,7 +773,7 @@ impl TradingService {
             client_order_id: client_order_id.into(),
             order_id: response["orderId"].to_string().trim_matches('"').into(),
             status: status.into(),
-            executed_quantity: number(&response["executedQty"]).unwrap_or(0.0),
+            executed_quantity: executed,
             average_price: number(&response["avgPrice"]).unwrap_or(0.0),
         })
     }
@@ -670,6 +809,7 @@ impl TradingService {
             .unwrap_or("")
             .to_string();
         let mut partial_quantity = 0.0;
+        let mut partial_average_price = 0.0;
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let path = format!(
@@ -685,6 +825,7 @@ impl TradingService {
             {
                 let status = order["orderStatus"].as_str().unwrap_or("Unknown");
                 partial_quantity = number(&order["cumExecQty"]).unwrap_or(0.0);
+                partial_average_price = number(&order["avgPrice"]).unwrap_or(0.0);
                 if status == "Filled" {
                     return Ok(OrderExecution {
                         exchange: "Bybit".into(),
@@ -708,9 +849,14 @@ impl TradingService {
             );
         }
         if partial_quantity > 0.0 {
-            bail!(
-                "NAKED_EXPOSURE: Bybit order partially filled {partial_quantity}; confirmation timed out; orderLinkId={client_order_id}"
-            );
+            return Ok(OrderExecution {
+                exchange: "Bybit".into(),
+                client_order_id: client_order_id.into(),
+                order_id,
+                status: "PartiallyFilled".into(),
+                executed_quantity: partial_quantity,
+                average_price: partial_average_price,
+            });
         }
         bail!("Bybit order confirmation timed out; query orderLinkId={client_order_id} before any retry")
     }
@@ -976,4 +1122,37 @@ fn number(value: &Value) -> Option<f64> {
         .as_str()
         .and_then(|x| x.parse().ok())
         .or_else(|| value.as_f64())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn order(quantity: f64, price: f64) -> OrderExecution {
+        OrderExecution {
+            exchange: "Test".into(),
+            client_order_id: "client".into(),
+            order_id: "order".into(),
+            status: "Filled".into(),
+            executed_quantity: quantity,
+            average_price: price,
+        }
+    }
+
+    #[test]
+    fn aggregates_supplements_and_reductions() {
+        let mut fill = LegFill::from_order(order(25.0, 2.0));
+        fill.add(&order(25.0, 2.2));
+        assert!((fill.quantity - 50.0).abs() < f64::EPSILON);
+        assert!((fill.average_price() - 2.1).abs() < 1e-9);
+        fill.reduce(&order(10.0, 2.1));
+        assert!((fill.quantity - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantity_rounding_never_exceeds_requested_amount() {
+        let quantity = floor_step(12.3456, 0.01);
+        assert!(quantity <= 12.3456);
+        assert!((quantity - 12.34).abs() < 1e-9);
+    }
 }

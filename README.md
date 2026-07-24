@@ -65,3 +65,6 @@ BYBIT_API_SECRET=
 - `MAX_SLIPPAGE_BPS` 控制最大不利滑点，默认 50 bps（0.5%）。
 - 第二腿失败时自动 `reduceOnly` 补偿；无法确认或补偿失败会返回 `NAKED_EXPOSURE`。
 - 账户接口返回 `unhedgedLegs`，前端会用红色警报展示未配对仓位。
+- 两腿使用并发市价单提交，减少单腿方向暴露时间。
+- 每腿实际名义价值距离目标超过 `POSITION_TOLERANCE_USDT`（默认 10 USDT）时，优先对不足腿补单。
+- 补单后两腿差额仍超出容差时，对较大腿执行 `reduceOnly` 减仓，与较小腿对齐。

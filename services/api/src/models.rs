@@ -121,7 +121,14 @@ pub struct ExecutionReport {
     pub outcome: String,
     pub naked_exposure: bool,
     pub max_slippage_bps: u32,
+    pub target_notional_usdt: f64,
+    pub long_notional_usdt: f64,
+    pub short_notional_usdt: f64,
+    pub tolerance_usdt: f64,
+    pub balanced: bool,
     pub orders: Vec<OrderExecution>,
+    pub supplement_orders: Vec<OrderExecution>,
+    pub rebalance_orders: Vec<OrderExecution>,
     pub compensation_orders: Vec<OrderExecution>,
 }
 
