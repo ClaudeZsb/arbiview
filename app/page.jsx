@@ -131,6 +131,16 @@ function AccountBoard({ account, positions, onClose, busyId }) {
         <div><span>未实现盈亏</span><strong className={(account?.unrealizedPnl || 0) >= 0 ? "positive" : "negative"}>{price(account?.unrealizedPnl || 0)}</strong></div>
         <div><span>活跃套利仓位</span><strong>{account?.activePositions || 0}</strong></div>
       </div>
+      <div className="exchange-balances">
+        {(account?.exchanges || []).map((item) => (
+          <article key={item.exchange}>
+            <div className="exchange-balance-head"><ExchangeLogo name={item.exchange} /><b>{item.exchange}</b><span>USDT 永续账户</span></div>
+            <div><span>可用金额</span><strong>{price(item.availableUsdt)}</strong></div>
+            <div><span>账户权益</span><b>{price(item.equityUsdt)}</b></div>
+            <div><span>未实现盈亏</span><b className={item.unrealizedPnl >= 0 ? "positive" : "negative"}>{price(item.unrealizedPnl)}</b></div>
+          </article>
+        ))}
+      </div>
       <div className="position-list">
         {positions.length === 0 && <div className="state compact">暂无持仓，可从下方机会列表建立模拟双腿仓位</div>}
         {positions.map((p) => (

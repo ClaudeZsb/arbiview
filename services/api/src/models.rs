@@ -107,10 +107,20 @@ pub struct TradeResponse {
 pub struct AccountSummary {
     pub mode: String,
     pub configured_exchanges: Vec<String>,
+    pub exchanges: Vec<ExchangeBalance>,
     pub equity_usdt: f64,
     pub available_usdt: f64,
     pub unrealized_pnl: f64,
     pub active_positions: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeBalance {
+    pub exchange: String,
+    pub equity_usdt: f64,
+    pub available_usdt: f64,
+    pub unrealized_pnl: f64,
 }
 
 #[derive(Debug, Deserialize)]

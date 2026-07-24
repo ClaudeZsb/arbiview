@@ -96,6 +96,7 @@ impl TradingService {
             return Ok(AccountSummary {
                 mode: "paper".into(),
                 configured_exchanges,
+                exchanges: paper_exchange_balances(&positions),
                 equity_usdt: 100_000.0 + unrealized_pnl,
                 available_usdt: 100_000.0
                     - positions
@@ -110,6 +111,20 @@ impl TradingService {
         Ok(AccountSummary {
             mode: "live".into(),
             configured_exchanges,
+            exchanges: vec![
+                ExchangeBalance {
+                    exchange: "Binance".into(),
+                    equity_usdt: binance.0,
+                    available_usdt: binance.1,
+                    unrealized_pnl: binance.2,
+                },
+                ExchangeBalance {
+                    exchange: "Bybit".into(),
+                    equity_usdt: bybit.0,
+                    available_usdt: bybit.1,
+                    unrealized_pnl: bybit.2,
+                },
+            ],
             equity_usdt: binance.0 + bybit.0,
             available_usdt: binance.1 + bybit.1,
             unrealized_pnl: positions.iter().map(|x| x.unrealized_pnl).sum(),
@@ -500,7 +515,7 @@ impl TradingService {
             .collect())
     }
 
-    async fn binance_balance(&self) -> Result<(f64, f64)> {
+    async fn binance_balance(&self) -> Result<(f64, f64, f64)> {
         let creds = self
             .config
             .binance
@@ -513,10 +528,11 @@ impl TradingService {
         Ok((
             number(&json["totalWalletBalance"]).unwrap_or(0.0),
             number(&json["availableBalance"]).unwrap_or(0.0),
+            number(&json["totalUnrealizedProfit"]).unwrap_or(0.0),
         ))
     }
 
-    async fn bybit_balance(&self) -> Result<(f64, f64)> {
+    async fn bybit_balance(&self) -> Result<(f64, f64, f64)> {
         let json = self
             .bybit_signed(
                 Method::GET,
@@ -531,6 +547,7 @@ impl TradingService {
         Ok((
             number(&account["totalEquity"]).unwrap_or(0.0),
             number(&account["totalAvailableBalance"]).unwrap_or(0.0),
+            number(&account["totalPerpUPL"]).unwrap_or(0.0),
         ))
     }
 
@@ -592,6 +609,33 @@ impl TradingService {
             .await
             .map_err(Into::into)
     }
+}
+
+fn paper_exchange_balances(positions: &[Position]) -> Vec<ExchangeBalance> {
+    ["Binance", "Bybit"]
+        .into_iter()
+        .map(|exchange| {
+            let used_margin = positions
+                .iter()
+                .filter(|position| {
+                    position.long.exchange == exchange || position.short.exchange == exchange
+                })
+                .map(|position| position.notional_usdt / position.leverage as f64)
+                .sum::<f64>();
+            let unrealized_pnl = positions
+                .iter()
+                .flat_map(|position| [&position.long, &position.short])
+                .filter(|leg| leg.exchange == exchange)
+                .map(|leg| leg.unrealized_pnl)
+                .sum::<f64>();
+            ExchangeBalance {
+                exchange: exchange.into(),
+                equity_usdt: 50_000.0 + unrealized_pnl,
+                available_usdt: 50_000.0 - used_margin,
+                unrealized_pnl,
+            }
+        })
+        .collect()
 }
 
 fn sign(secret: &str, message: &str) -> String {

@@ -114,6 +114,15 @@ h1 em { color: var(--green); font-style: normal; }
 .account-stats > div:last-child { border-right: 0; }
 .account-stats span { color: var(--muted); font-size: 10px; margin-bottom: 11px; }
 .account-stats strong { font: 500 20px DM Mono, monospace; }
+.exchange-balances { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+.exchange-balances article { display: grid; grid-template-columns: 1.3fr 1fr 1fr 1fr; align-items: center; gap: 18px; border: 1px solid var(--line); background: var(--white); padding: 17px 20px; }
+.exchange-balances article > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.exchange-balances article > div > span { font-size: 9px; color: var(--muted); }
+.exchange-balances article > div > strong { font: 600 18px DM Mono, monospace; }
+.exchange-balances article > div > b { font: 500 11px DM Mono, monospace; }
+.exchange-balance-head { display: grid !important; grid-template-columns: 20px 1fr; column-gap: 5px !important; }
+.exchange-balance-head .exchange-logo { grid-row: 1 / span 2; }
+.exchange-balance-head b { font-family: Manrope, sans-serif !important; font-size: 12px !important; }
 .position-list { display: flex; flex-direction: column; gap: 7px; }
 .position-row { display: grid; grid-template-columns: 145px 1fr 1fr 155px 130px 90px; gap: 15px; align-items: center; padding: 15px 18px; border: 1px solid var(--line); background: var(--white); }
 .position-row > div { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
@@ -176,6 +185,7 @@ footer span { display: flex; align-items: center; gap: 7px; }
   .metric-label { margin: 0; } .metric small { text-align: right; margin: 0; }
   .methodology { grid-template-columns: 1fr; }
   .account-stats { grid-template-columns: 1fr 1fr; }
+  .exchange-balances { grid-template-columns: 1fr; }
   .account-stats > div:nth-child(2) { border-right: 0; }
   .account-stats > div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
   .position-row { grid-template-columns: 1fr; }
