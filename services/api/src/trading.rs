@@ -182,6 +182,7 @@ impl TradingService {
             updated_at: now,
             cancel_requested: false,
             error: None,
+            current_position: None,
             logs: vec![],
         };
         tasks.insert(task.id.clone(), task.clone());
@@ -251,6 +252,7 @@ impl TradingService {
             updated_at: now,
             cancel_requested: false,
             error: None,
+            current_position: None,
             logs: vec![],
         };
         tasks.insert(task.id.clone(), task.clone());
@@ -327,9 +329,11 @@ impl TradingService {
                 Ok(response) => {
                     completed += batch_notional;
                     let logs = batch_logs(&opportunity, batch, &response, batch_notional);
+                    let current_position = response.position.clone();
                     self.update_batch(&task_id, |task| {
                         task.completed_notional_usdt = completed.min(task.target_notional_usdt);
                         task.completed_batches = batch;
+                        task.current_position = Some(current_position);
                         for mut log in logs {
                             log.sequence = task.logs.len() + 1;
                             task.logs.push(log);
@@ -408,9 +412,11 @@ impl TradingService {
                 Ok(response) => {
                     completed += batch_notional;
                     let logs = batch_reduce_logs(&position, batch, &response, batch_notional);
+                    let current_position = response.position.clone();
                     self.update_batch(&task_id, |task| {
                         task.completed_notional_usdt = completed.min(task.target_notional_usdt);
                         task.completed_batches = batch;
+                        task.current_position = Some(current_position);
                         for mut log in logs {
                             log.sequence = task.logs.len() + 1;
                             task.logs.push(log);

@@ -646,9 +646,29 @@ export default function Dashboard() {
       const task = await response.json();
       if (!response.ok) throw new Error(task.error);
       setBatchTask(task);
+      if (task.currentPosition) {
+        setPositions((current) => {
+          const index = current.findIndex((position) =>
+            position.id === task.currentPosition.id ||
+            (
+              position.token === task.currentPosition.token &&
+              position.long.exchange === task.currentPosition.long.exchange &&
+              position.short.exchange === task.currentPosition.short.exchange
+            )
+          );
+          if (index < 0) return [...current, task.currentPosition];
+          const previous = current[index];
+          const updated = {
+            ...task.currentPosition,
+            long: { ...task.currentPosition.long, closePrice: previous.long.closePrice },
+            short: { ...task.currentPosition.short, closePrice: previous.short.closePrice }
+          };
+          return current.map((position, positionIndex) => positionIndex === index ? updated : position);
+        });
+      }
       if (["completed", "failed", "cancelled"].includes(task.status)) await loadAccount();
     } catch (error) {
-      setNotice(`批量加仓进度读取失败：${error.message}`);
+      setNotice(`批量仓位任务进度读取失败：${error.message}`);
     }
   }, [loadAccount]);
 

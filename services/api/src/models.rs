@@ -161,6 +161,7 @@ pub struct BatchIncreaseTask {
     pub updated_at: i64,
     pub cancel_requested: bool,
     pub error: Option<String>,
+    pub current_position: Option<Position>,
     pub logs: Vec<BatchExecutionLog>,
 }
 
