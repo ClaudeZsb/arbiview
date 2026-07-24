@@ -114,6 +114,15 @@ pub struct BatchIncreaseRequest {
     pub leverage: u8,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchReduceRequest {
+    pub position_id: String,
+    pub target_notional_usdt: f64,
+    pub order_notional_usdt: f64,
+    pub interval_seconds: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchExecutionLog {
@@ -135,6 +144,7 @@ pub struct BatchExecutionLog {
 #[serde(rename_all = "camelCase")]
 pub struct BatchIncreaseTask {
     pub id: String,
+    pub action: String,
     pub status: String,
     pub token: String,
     pub long_exchange: String,

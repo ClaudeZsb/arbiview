@@ -13,7 +13,8 @@ use axum::{
 use config::Config;
 use market::MarketService;
 use models::{
-    AdjustLeverageRequest, AdjustPositionRequest, BatchIncreaseRequest, OpenTradeRequest,
+    AdjustLeverageRequest, AdjustPositionRequest, BatchIncreaseRequest, BatchReduceRequest,
+    OpenTradeRequest,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -51,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/positions", get(positions))
         .route("/api/trades/open", post(open_trade))
         .route("/api/trades/batch-increase", post(start_batch_increase))
+        .route("/api/trades/batch-reduce", post(start_batch_reduce))
         .route("/api/trades/batch-increase/:id", get(batch_increase))
         .route(
             "/api/trades/batch-increase/:id/cancel",
@@ -97,6 +99,13 @@ async fn start_batch_increase(
     Json(request): Json<BatchIncreaseRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.start_batch_increase(request).await?))
+}
+
+async fn start_batch_reduce(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchReduceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.start_batch_reduce(request).await?))
 }
 
 async fn batch_increase(

@@ -192,9 +192,11 @@ function AdjustModal({ position, type, onClose, onSubmit, busy }) {
   );
 }
 
-function BatchIncreasePanel({ position, task, onClose, onStart, onCancel, busy }) {
-  const [target, setTarget] = useState(1000);
-  const [orderNotional, setOrderNotional] = useState(100);
+function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel, busy }) {
+  const isReduce = action === "reduce";
+  const maximumReduction = Math.max(0, position.notionalUsdt - 10);
+  const [target, setTarget] = useState(isReduce ? Math.min(1000, maximumReduction) : 1000);
+  const [orderNotional, setOrderNotional] = useState(Math.min(100, isReduce ? maximumReduction : 100));
   const [intervalSeconds, setIntervalSeconds] = useState(2);
   const logRef = useRef(null);
   const progress = task
@@ -208,8 +210,8 @@ function BatchIncreasePanel({ position, task, onClose, onStart, onCancel, busy }
     <aside className="batch-panel">
       <div className="batch-panel-head">
         <div>
-          <div className="section-kicker"><Zap size={14} /> BATCH INCREASE</div>
-          <h3>{position.token} 双腿批量加仓</h3>
+          <div className="section-kicker"><Zap size={14} /> BATCH {isReduce ? "REDUCE" : "INCREASE"}</div>
+          <h3>{position.token} 双腿批量{isReduce ? "减仓" : "加仓"}</h3>
         </div>
         <button className="batch-close" disabled={active} title={active ? "任务运行中，请先停止或等待完成" : "关闭"} onClick={onClose}><X size={18} /></button>
       </div>
@@ -219,7 +221,7 @@ function BatchIncreasePanel({ position, task, onClose, onStart, onCancel, busy }
         <span><i className="side-dot short" />SHORT · {position.short.exchange}</span>
       </div>
       {!task && <>
-        <label>每腿目标加仓金额（USDT）<input type="number" min="10" step="100" value={target} onChange={(event) => setTarget(Number(event.target.value))} /></label>
+        <label>每腿目标{isReduce ? "减仓" : "加仓"}金额（USDT）<input type="number" min="10" max={isReduce ? maximumReduction : undefined} step="100" value={target} onChange={(event) => setTarget(Number(event.target.value))} /></label>
         <label>单次每腿下单金额（USDT）<input type="number" min="10" step="10" value={orderNotional} onChange={(event) => setOrderNotional(Number(event.target.value))} /></label>
         <label>批次间隔（秒）<input type="number" min="0.5" max="3600" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /></label>
         <div className="batch-estimate">
@@ -228,10 +230,10 @@ function BatchIncreasePanel({ position, task, onClose, onStart, onCancel, busy }
         </div>
         <button
           className="batch-start"
-          disabled={busy || target < 10 || orderNotional < 10 || orderNotional > target || intervalSeconds < 0.5}
+          disabled={busy || target < 10 || orderNotional < 10 || orderNotional > target || intervalSeconds < 0.5 || (isReduce && target > maximumReduction)}
           onClick={() => onStart({ targetNotionalUsdt: target, orderNotionalUsdt: orderNotional, intervalSeconds })}
         >
-          {busy ? "正在创建任务…" : "启动批量加仓"}
+          {busy ? "正在创建任务…" : `启动批量${isReduce ? "减仓" : "加仓"}`}
         </button>
       </>}
       {task && <>
@@ -649,26 +651,35 @@ export default function Dashboard() {
     if (!batchPanel) return;
     setTradeBusy(true);
     try {
-      const opportunity = data?.opportunities?.find((item) =>
-        item.token.symbol === batchPanel.token &&
-        item.long.exchange === batchPanel.long.exchange &&
-        item.short.exchange === batchPanel.short.exchange
-      );
-      if (!opportunity) throw new Error("当前机会列表中没有与该持仓方向一致的机会，无法安全加仓");
-      const response = await fetch("/backend/trades/batch-increase", {
+      let path;
+      let body;
+      if (batchPanel.type === "increase") {
+        const opportunity = data?.opportunities?.find((item) =>
+          item.token.symbol === batchPanel.position.token &&
+          item.long.exchange === batchPanel.position.long.exchange &&
+          item.short.exchange === batchPanel.position.short.exchange
+        );
+        if (!opportunity) throw new Error("当前机会列表中没有与该持仓方向一致的机会，无法安全加仓");
+        path = "/backend/trades/batch-increase";
+        body = {
+          opportunityId: opportunity.id,
+          leverage: batchPanel.position.leverage,
+          ...settings
+        };
+      } else {
+        path = "/backend/trades/batch-reduce";
+        body = { positionId: batchPanel.position.id, ...settings };
+      }
+      const response = await fetch(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          opportunityId: opportunity.id,
-          leverage: batchPanel.leverage,
-          ...settings
-        })
+        body: JSON.stringify(body)
       });
       const task = await response.json();
       if (!response.ok) throw new Error(task.error);
       setBatchTask(task);
     } catch (error) {
-      setNotice(`批量加仓启动失败：${error.message}`);
+      setNotice(`批量${batchPanel.type === "reduce" ? "减仓" : "加仓"}启动失败：${error.message}`);
     } finally {
       setTradeBusy(false);
     }
@@ -751,12 +762,12 @@ export default function Dashboard() {
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
 
       <AccountBoard account={account} positions={positions} onClose={closePosition} onAdjust={(position, type) => {
-        if (type === "increase") {
+        if (type === "increase" || type === "reduce") {
           if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {
-            setNotice("已有批量加仓任务正在执行，请先等待完成或停止任务");
+            setNotice("已有批量仓位任务正在执行，请先等待完成或停止任务");
             return;
           }
-          setBatchPanel(position);
+          setBatchPanel({ position, type });
           setBatchTask(null);
         } else {
           setAdjustment({ position, type });
@@ -829,7 +840,8 @@ export default function Dashboard() {
       {tradeItem && <TradeModal item={tradeItem} mode={account?.mode} onClose={() => setTradeItem(null)} onSubmit={openTrade} busy={tradeBusy} />}
       {adjustment && <AdjustModal position={adjustment.position} type={adjustment.type} onClose={() => setAdjustment(null)} onSubmit={adjustPosition} busy={tradeBusy} />}
       {batchPanel && <BatchIncreasePanel
-        position={batchPanel}
+        position={batchPanel.position}
+        action={batchPanel.type}
         task={batchTask}
         busy={tradeBusy}
         onStart={startBatchIncrease}

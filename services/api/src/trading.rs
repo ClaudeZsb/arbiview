@@ -120,6 +120,7 @@ impl TradingService {
             (request.target_notional_usdt / request.order_notional_usdt).ceil() as usize;
         let task = BatchIncreaseTask {
             id: Uuid::new_v4().to_string(),
+            action: "increase".into(),
             status: "queued".into(),
             token: opportunity.token.symbol.clone(),
             long_exchange: opportunity.long.exchange.clone(),
@@ -145,6 +146,73 @@ impl TradingService {
             service
                 .run_batch_increase(task_id, opportunity, request)
                 .await;
+        });
+        Ok(task)
+    }
+
+    pub async fn start_batch_reduce(
+        &self,
+        request: BatchReduceRequest,
+    ) -> Result<BatchIncreaseTask> {
+        if !(10.0..=1_000_000.0).contains(&request.target_notional_usdt) {
+            bail!("targetNotionalUsdt must be between 10 and 1,000,000");
+        }
+        if !(10.0..=request.target_notional_usdt).contains(&request.order_notional_usdt) {
+            bail!("orderNotionalUsdt must be between 10 and targetNotionalUsdt");
+        }
+        if !(0.5..=3_600.0).contains(&request.interval_seconds) {
+            bail!("intervalSeconds must be between 0.5 and 3,600");
+        }
+        let position = self
+            .positions()
+            .await?
+            .into_iter()
+            .find(|position| position.id == request.position_id)
+            .ok_or_else(|| anyhow!("position not found"))?;
+        let maximum_reduction =
+            (position.notional_usdt - self.config.position_tolerance_usdt).max(0.0);
+        if request.target_notional_usdt > maximum_reduction {
+            bail!(
+                "targetNotionalUsdt must leave at least {:.2} USDT per leg; use close for a full exit",
+                self.config.position_tolerance_usdt
+            );
+        }
+        let mut tasks = self.batch_tasks.write().await;
+        if tasks
+            .values()
+            .any(|task| matches!(task.status.as_str(), "queued" | "running" | "cancelling"))
+        {
+            bail!("another batch position task is already active");
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let total_batches =
+            (request.target_notional_usdt / request.order_notional_usdt).ceil() as usize;
+        let task = BatchIncreaseTask {
+            id: Uuid::new_v4().to_string(),
+            action: "reduce".into(),
+            status: "queued".into(),
+            token: position.token.clone(),
+            long_exchange: position.long.exchange.clone(),
+            short_exchange: position.short.exchange.clone(),
+            target_notional_usdt: request.target_notional_usdt,
+            order_notional_usdt: request.order_notional_usdt,
+            interval_seconds: request.interval_seconds,
+            completed_notional_usdt: 0.0,
+            completed_batches: 0,
+            total_batches,
+            started_at: now,
+            updated_at: now,
+            cancel_requested: false,
+            error: None,
+            logs: vec![],
+        };
+        tasks.insert(task.id.clone(), task.clone());
+        drop(tasks);
+
+        let service = self.clone();
+        let task_id = task.id.clone();
+        tokio::spawn(async move {
+            service.run_batch_reduce(task_id, position, request).await;
         });
         Ok(task)
     }
@@ -212,6 +280,87 @@ impl TradingService {
                 Ok(response) => {
                     completed += batch_notional;
                     let logs = batch_logs(&opportunity, batch, &response, batch_notional);
+                    self.update_batch(&task_id, |task| {
+                        task.completed_notional_usdt = completed.min(task.target_notional_usdt);
+                        task.completed_batches = batch;
+                        for mut log in logs {
+                            log.sequence = task.logs.len() + 1;
+                            task.logs.push(log);
+                        }
+                    })
+                    .await;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    self.update_batch(&task_id, |task| {
+                        task.status = "failed".into();
+                        task.error = Some(message.clone());
+                        task.logs.push(BatchExecutionLog {
+                            sequence: task.logs.len() + 1,
+                            batch,
+                            timestamp: chrono::Utc::now().timestamp_millis(),
+                            exchange: "System".into(),
+                            side: "error".into(),
+                            token: task.token.clone(),
+                            notional_usdt: 0.0,
+                            executed_quantity: 0.0,
+                            average_price: 0.0,
+                            status: "failed".into(),
+                            order_id: String::new(),
+                            message: message.clone(),
+                        });
+                    })
+                    .await;
+                    return;
+                }
+            }
+            if completed + 0.001 < request.target_notional_usdt {
+                tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds)).await;
+            }
+        }
+        self.update_batch(&task_id, |task| task.status = "completed".into())
+            .await;
+    }
+
+    async fn run_batch_reduce(
+        &self,
+        task_id: String,
+        position: Position,
+        request: BatchReduceRequest,
+    ) {
+        self.update_batch(&task_id, |task| task.status = "running".into())
+            .await;
+        let mut completed = 0.0;
+        let mut batch = 0usize;
+        while completed + 0.001 < request.target_notional_usdt {
+            let cancelled = self
+                .batch_tasks
+                .read()
+                .await
+                .get(&task_id)
+                .map(|task| task.cancel_requested)
+                .unwrap_or(true);
+            if cancelled {
+                self.update_batch(&task_id, |task| task.status = "cancelled".into())
+                    .await;
+                return;
+            }
+            batch += 1;
+            let batch_notional = request
+                .order_notional_usdt
+                .min(request.target_notional_usdt - completed);
+            match self
+                .reduce(
+                    &request.position_id,
+                    AdjustPositionRequest {
+                        notional_usdt: batch_notional,
+                    },
+                )
+                .await
+            {
+                Ok(response) => {
+                    completed += batch_notional;
+                    let logs = batch_reduce_logs(&position, batch, &response, batch_notional);
                     self.update_batch(&task_id, |task| {
                         task.completed_notional_usdt = completed.min(task.target_notional_usdt);
                         task.completed_batches = batch;
@@ -1797,6 +1946,75 @@ fn batch_logs(
         status: "FILLED".into(),
         order_id: format!("paper-{batch}-{side}"),
         message: "模拟批次成交".into(),
+    })
+    .collect()
+}
+
+fn batch_reduce_logs(
+    position: &Position,
+    batch: usize,
+    response: &TradeResponse,
+    batch_notional: f64,
+) -> Vec<BatchExecutionLog> {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    if let Some(report) = &response.execution {
+        return report
+            .orders
+            .iter()
+            .chain(&report.supplement_orders)
+            .chain(&report.rebalance_orders)
+            .chain(&report.compensation_orders)
+            .map(|order| {
+                let side = if order.exchange == position.long.exchange {
+                    "long"
+                } else if order.exchange == position.short.exchange {
+                    "short"
+                } else {
+                    "unknown"
+                };
+                BatchExecutionLog {
+                    sequence: 0,
+                    batch,
+                    timestamp,
+                    exchange: order.exchange.clone(),
+                    side: side.into(),
+                    token: position.token.clone(),
+                    notional_usdt: order.executed_quantity * order.average_price,
+                    executed_quantity: order.executed_quantity,
+                    average_price: order.average_price,
+                    status: order.status.clone(),
+                    order_id: order.order_id.clone(),
+                    message: if report
+                        .orders
+                        .iter()
+                        .any(|item| item.client_order_id == order.client_order_id)
+                    {
+                        "批次减仓市价单成交".into()
+                    } else {
+                        "减仓后双腿差额对齐".into()
+                    },
+                }
+            })
+            .collect();
+    }
+    [
+        (&position.long.exchange, "long", position.long.mark_price),
+        (&position.short.exchange, "short", position.short.mark_price),
+    ]
+    .into_iter()
+    .map(|(exchange, side, price)| BatchExecutionLog {
+        sequence: 0,
+        batch,
+        timestamp,
+        exchange: exchange.clone(),
+        side: side.into(),
+        token: position.token.clone(),
+        notional_usdt: batch_notional,
+        executed_quantity: batch_notional / price,
+        average_price: price,
+        status: "FILLED".into(),
+        order_id: format!("paper-reduce-{batch}-{side}"),
+        message: "模拟批次减仓成交".into(),
     })
     .collect()
 }
