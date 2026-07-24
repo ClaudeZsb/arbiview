@@ -219,6 +219,7 @@ impl TradingService {
                 mark_price: opportunity.long.mark,
                 unrealized_pnl: 0.0,
                 funding_earned: 0.0,
+                funding_rate: opportunity.long.rate,
             },
             short: PositionLeg {
                 exchange: opportunity.short.exchange,
@@ -229,6 +230,7 @@ impl TradingService {
                 mark_price: opportunity.short.mark,
                 unrealized_pnl: 0.0,
                 funding_earned: 0.0,
+                funding_rate: opportunity.short.rate,
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
@@ -957,17 +959,24 @@ impl TradingService {
     }
 
     async fn live_positions(&self) -> Result<Vec<Position>> {
-        let (mut binance, mut bybit, binance_funding, bybit_funding) = tokio::try_join!(
+        let (mut binance, mut bybit, binance_funding, bybit_funding, funding_rates) = tokio::try_join!(
             self.binance_positions(),
             self.bybit_positions(),
             self.binance_funding_income(),
-            self.bybit_funding_income()
+            self.bybit_funding_income(),
+            self.market.funding_rates()
         )?;
         for leg in &mut binance {
             leg.funding_earned = *binance_funding.get(&leg.symbol).unwrap_or(&0.0);
+            leg.funding_rate = *funding_rates
+                .get(&format!("Binance:{}", leg.symbol))
+                .unwrap_or(&0.0);
         }
         for leg in &mut bybit {
             leg.funding_earned = *bybit_funding.get(&leg.symbol).unwrap_or(&0.0);
+            leg.funding_rate = *funding_rates
+                .get(&format!("Bybit:{}", leg.symbol))
+                .unwrap_or(&0.0);
         }
         let mut grouped: HashMap<String, Vec<PositionLeg>> = HashMap::new();
         for leg in binance.into_iter().chain(bybit) {
@@ -1027,6 +1036,7 @@ impl TradingService {
                     mark_price: number(&x["markPrice"])?,
                     unrealized_pnl: number(&x["unRealizedProfit"]).unwrap_or(0.0),
                     funding_earned: 0.0,
+                    funding_rate: 0.0,
                 })
             })
             .collect())
@@ -1058,6 +1068,7 @@ impl TradingService {
                     mark_price: number(&x["markPrice"])?,
                     unrealized_pnl: number(&x["unrealisedPnl"]).unwrap_or(0.0),
                     funding_earned: 0.0,
+                    funding_rate: 0.0,
                 })
             })
             .collect())

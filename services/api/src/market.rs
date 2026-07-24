@@ -82,6 +82,29 @@ impl MarketService {
         Ok(result)
     }
 
+    pub async fn funding_rates(&self) -> Result<HashMap<String, f64>> {
+        let (binance, bybit): (Value, Value) = tokio::try_join!(
+            self.get_json("https://fapi.binance.com/fapi/v1/premiumIndex".into()),
+            self.get_json("https://api.bybit.com/v5/market/tickers?category=linear".into())
+        )?;
+        let mut rates = HashMap::new();
+        for item in binance.as_array().unwrap_or(&vec![]) {
+            if let (Some(symbol), Some(rate)) =
+                (item["symbol"].as_str(), parse(&item["lastFundingRate"]))
+            {
+                rates.insert(format!("Binance:{symbol}"), rate);
+            }
+        }
+        for item in bybit["result"]["list"].as_array().unwrap_or(&vec![]) {
+            if let (Some(symbol), Some(rate)) =
+                (item["symbol"].as_str(), parse(&item["fundingRate"]))
+            {
+                rates.insert(format!("Bybit:{symbol}"), rate);
+            }
+        }
+        Ok(rates)
+    }
+
     async fn top_tokens(&self) -> Result<Vec<Token>> {
         let base = if self.config.cmc_api_key.is_empty() {
             "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/listings/latest"

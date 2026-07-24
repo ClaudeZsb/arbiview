@@ -188,20 +188,20 @@ function AccountBoard({ account, positions, onClose, busyId }) {
             <div className="position-details">
               <div className="position-detail-head">
                 <span>方向 / 交易所</span>
-                <span>合约</span>
                 <span>当前价格</span>
                 <span>开仓均价</span>
                 <span>仓位数量</span>
+                <span>Funding Rate</span>
                 <span>未实现收益</span>
                 <span>累计 Funding</span>
               </div>
               {[p.long, p.short].map((leg) => (
                 <div className="position-leg-detail" key={`${leg.exchange}-${leg.side}`}>
                   <div className="leg-detail-title"><i className={`side-dot ${leg.side}`} /><b>{leg.side.toUpperCase()} · {leg.exchange}</b></div>
-                  <b>{leg.symbol}</b>
                   <b>{price(leg.markPrice)}</b>
                   <b>{price(leg.entryPrice)}</b>
                   <b>{formatter.format(leg.quantity)}</b>
+                  <b className={leg.fundingRate >= 0 ? "positive" : "negative"}>{pct(leg.fundingRate)}</b>
                   <b className={leg.unrealizedPnl >= 0 ? "positive" : "negative"}>{money(leg.unrealizedPnl)}</b>
                   <b className={leg.fundingEarned >= 0 ? "positive" : "negative"}>{money(leg.fundingEarned)}</b>
                 </div>
