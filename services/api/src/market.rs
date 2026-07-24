@@ -83,26 +83,50 @@ impl MarketService {
     }
 
     pub async fn funding_rates(&self) -> Result<HashMap<String, f64>> {
+        Ok(self
+            .position_quotes()
+            .await?
+            .into_iter()
+            .map(|quote| {
+                (
+                    format!("{}:{}", quote.exchange, quote.symbol),
+                    quote.funding_rate,
+                )
+            })
+            .collect())
+    }
+
+    pub async fn position_quotes(&self) -> Result<Vec<PositionQuote>> {
         let (binance, bybit): (Value, Value) = tokio::try_join!(
             self.get_json("https://fapi.binance.com/fapi/v1/premiumIndex".into()),
             self.get_json("https://api.bybit.com/v5/market/tickers?category=linear".into())
         )?;
-        let mut rates = HashMap::new();
+        let mut quotes = Vec::new();
         for item in binance.as_array().unwrap_or(&vec![]) {
-            if let (Some(symbol), Some(rate)) =
-                (item["symbol"].as_str(), parse(&item["lastFundingRate"]))
+            if let (Some(symbol), Some(mark_price)) =
+                (item["symbol"].as_str(), parse(&item["markPrice"]))
             {
-                rates.insert(format!("Binance:{symbol}"), rate);
+                quotes.push(PositionQuote {
+                    exchange: "Binance".into(),
+                    symbol: symbol.into(),
+                    mark_price,
+                    funding_rate: parse(&item["lastFundingRate"]).unwrap_or(0.0),
+                });
             }
         }
         for item in bybit["result"]["list"].as_array().unwrap_or(&vec![]) {
-            if let (Some(symbol), Some(rate)) =
-                (item["symbol"].as_str(), parse(&item["fundingRate"]))
+            if let (Some(symbol), Some(mark_price)) =
+                (item["symbol"].as_str(), parse(&item["markPrice"]))
             {
-                rates.insert(format!("Bybit:{symbol}"), rate);
+                quotes.push(PositionQuote {
+                    exchange: "Bybit".into(),
+                    symbol: symbol.into(),
+                    mark_price,
+                    funding_rate: parse(&item["fundingRate"]).unwrap_or(0.0),
+                });
             }
         }
-        Ok(rates)
+        Ok(quotes)
     }
 
     pub async fn trading_legs(&self) -> Result<Vec<Leg>> {

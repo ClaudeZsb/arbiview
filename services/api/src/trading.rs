@@ -8,11 +8,17 @@ use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
+type FundingTotals = HashMap<String, f64>;
+type FundingCache = Option<(Instant, FundingTotals, FundingTotals)>;
 
 const MAX_RECONCILIATION_ATTEMPTS: u8 = 3;
 
@@ -37,6 +43,7 @@ pub struct TradingService {
     client: Client,
     market: MarketService,
     paper_positions: Arc<RwLock<HashMap<String, Position>>>,
+    funding_cache: Arc<RwLock<FundingCache>>,
 }
 
 impl TradingService {
@@ -46,6 +53,7 @@ impl TradingService {
             market,
             client: Client::builder().timeout(Duration::from_secs(15)).build()?,
             paper_positions: Arc::new(RwLock::new(HashMap::new())),
+            funding_cache: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -156,25 +164,26 @@ impl TradingService {
         }
     }
 
-    pub async fn position_quotes(&self) -> Result<Vec<PositionLeg>> {
+    pub async fn position_quotes(&self) -> Result<Vec<PositionQuote>> {
         match self.config.trading_mode {
             TradingMode::Paper => Ok(self
                 .paper_positions
                 .read()
                 .await
                 .values()
-                .flat_map(|position| [position.long.clone(), position.short.clone()])
+                .flat_map(|position| [&position.long, &position.short])
+                .map(|leg| PositionQuote {
+                    exchange: leg.exchange.clone(),
+                    symbol: leg.symbol.clone(),
+                    mark_price: leg.mark_price,
+                    funding_rate: leg.funding_rate,
+                })
                 .collect()),
-            TradingMode::Live => {
-                let (binance, bybit) =
-                    tokio::try_join!(self.binance_positions(), self.bybit_positions())?;
-                Ok(binance.into_iter().chain(bybit).collect())
-            }
+            TradingMode::Live => self.market.position_quotes().await,
         }
     }
 
     pub async fn account_summary(&self) -> Result<AccountSummary> {
-        let positions = self.positions().await?;
         let configured_exchanges = [
             self.config.binance.as_ref().map(|_| "Binance".to_string()),
             self.config.bybit.as_ref().map(|_| "Bybit".to_string()),
@@ -183,6 +192,7 @@ impl TradingService {
         .flatten()
         .collect();
         if self.config.trading_mode == TradingMode::Paper {
+            let positions = self.positions().await?;
             let unrealized_pnl = positions.iter().map(|x| x.unrealized_pnl).sum();
             return Ok(AccountSummary {
                 mode: "paper".into(),
@@ -206,6 +216,18 @@ impl TradingService {
             self.bybit_positions()
         )?;
         let all_legs: Vec<PositionLeg> = binance_legs.into_iter().chain(bybit_legs).collect();
+        let active_positions = all_legs
+            .iter()
+            .filter(|leg| leg.side == "long")
+            .filter(|leg| {
+                all_legs.iter().any(|other| {
+                    other.symbol == leg.symbol
+                        && other.side == "short"
+                        && other.exchange != leg.exchange
+                })
+            })
+            .count();
+        let unrealized_pnl = all_legs.iter().map(|leg| leg.unrealized_pnl).sum();
         let unhedged_legs = all_legs
             .iter()
             .filter(|leg| {
@@ -240,8 +262,8 @@ impl TradingService {
             ],
             equity_usdt: binance.0 + bybit.0,
             available_usdt: binance.1 + bybit.1,
-            unrealized_pnl: positions.iter().map(|x| x.unrealized_pnl).sum(),
-            active_positions: positions.len(),
+            unrealized_pnl,
+            active_positions,
             unhedged_legs,
         })
     }
@@ -1212,11 +1234,10 @@ impl TradingService {
     }
 
     async fn live_positions(&self) -> Result<Vec<Position>> {
-        let (mut binance, mut bybit, binance_funding, bybit_funding, funding_rates) = tokio::try_join!(
+        let (mut binance, mut bybit, (binance_funding, bybit_funding), funding_rates) = tokio::try_join!(
             self.binance_positions(),
             self.bybit_positions(),
-            self.binance_funding_income(),
-            self.bybit_funding_income(),
+            self.funding_income(),
             self.market.funding_rates()
         )?;
         for leg in &mut binance {
@@ -1353,6 +1374,18 @@ impl TradingService {
         Ok(totals)
     }
 
+    async fn funding_income(&self) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
+        if let Some((updated_at, binance, bybit)) = self.funding_cache.read().await.as_ref() {
+            if updated_at.elapsed() < Duration::from_secs(60 * 60) {
+                return Ok((binance.clone(), bybit.clone()));
+            }
+        }
+        let (binance, bybit) =
+            tokio::try_join!(self.binance_funding_income(), self.bybit_funding_income())?;
+        *self.funding_cache.write().await = Some((Instant::now(), binance.clone(), bybit.clone()));
+        Ok((binance, bybit))
+    }
+
     async fn bybit_funding_income(&self) -> Result<HashMap<String, f64>> {
         let now = chrono::Utc::now().timestamp_millis();
         let start = now - 7 * 24 * 60 * 60 * 1000;
@@ -1433,15 +1466,23 @@ impl TradingService {
     ) -> Result<Value> {
         let signature = sign(&creds.api_secret, query);
         let url = format!("https://fapi.binance.com{path}?{query}&signature={signature}");
-        self.client
+        let response = self
+            .client
             .request(method, url)
             .header("X-MBX-APIKEY", &creds.api_key)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await
-            .map_err(Into::into)
+            .map_err(|error| anyhow!("Binance request failed: {}", error.without_url()))?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            let detail = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|json| json["msg"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "request rejected".into());
+            bail!("Binance API HTTP {status}: {detail}");
+        }
+        serde_json::from_str(&body).context("invalid Binance API response")
     }
 
     async fn bybit_signed(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
@@ -1474,13 +1515,20 @@ impl TradingService {
                 .header("Content-Type", "application/json")
                 .body(payload);
         }
-        request
+        let response = request
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await
-            .map_err(Into::into)
+            .map_err(|error| anyhow!("Bybit request failed: {}", error.without_url()))?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            let detail = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|json| json["retMsg"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "request rejected".into());
+            bail!("Bybit API HTTP {status}: {detail}");
+        }
+        serde_json::from_str(&body).context("invalid Bybit API response")
     }
 }
 

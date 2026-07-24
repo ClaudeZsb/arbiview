@@ -71,6 +71,15 @@ pub struct PositionLeg {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PositionQuote {
+    pub exchange: String,
+    pub symbol: String,
+    pub mark_price: f64,
+    pub funding_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Position {
     pub id: String,
     pub token: String,

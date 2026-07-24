@@ -102,8 +102,9 @@ h1 em { color: var(--green); font-style: normal; }
 .state.error { color: #a84622; }
 .state button { border: 0; background: var(--ink); color: white; padding: 8px 13px; border-radius: 3px; }
 .state.compact { min-height: 100px; }
-.notice { position: fixed; z-index: 30; right: 24px; top: 84px; max-width: 420px; background: var(--ink); color: white; padding: 13px 14px; box-shadow: 0 12px 35px rgba(0,0,0,.2); display: flex; align-items: center; gap: 20px; font-size: 12px; }
-.notice button { border: 0; background: transparent; color: white; padding: 0; display: grid; }
+.notice { position: fixed; z-index: 30; right: 24px; top: 84px; width: min(620px, calc(100vw - 48px)); max-height: min(50vh, 360px); overflow: auto; background: var(--ink); color: white; padding: 13px 14px; box-shadow: 0 12px 35px rgba(0,0,0,.2); display: flex; align-items: flex-start; gap: 20px; font-size: 12px; line-height: 1.55; }
+.notice span { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+.notice button { border: 0; background: transparent; color: white; padding: 2px 0 0; display: grid; flex: 0 0 auto; margin-left: auto; }
 .account-board { max-width: 1500px; margin: 0 auto; padding: 62px 4vw 8px; }
 .mode-badge { font: 500 9px DM Mono, monospace; text-transform: uppercase; letter-spacing: .08em; background: #edf1ef; color: var(--muted); padding: 5px 7px; vertical-align: middle; border-radius: 3px; }
 .mode-badge.paper { background: #fff2cf; color: #8a6410; }

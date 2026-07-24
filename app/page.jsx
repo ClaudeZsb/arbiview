@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownUp, ArrowRight, ChevronDown, Clock3, Info, RefreshCw,
   Search, ShieldCheck, SlidersHorizontal, Sparkles, TrendingUp,
@@ -263,8 +263,12 @@ export default function Dashboard() {
   const [adjustment, setAdjustment] = useState(null);
   const [closingId, setClosingId] = useState("");
   const [notice, setNotice] = useState("");
+  const quoteBackoffUntil = useRef(0);
+  const accountBackoffUntil = useRef(0);
+  const marketBackoffUntil = useRef(0);
 
   const load = useCallback(async () => {
+    if (Date.now() < marketBackoffUntil.current) return;
     setLoading(true);
     setError("");
     try {
@@ -272,7 +276,9 @@ export default function Dashboard() {
       const json = await response.json();
       if (!response.ok) throw new Error(json.detail || json.error);
       setData(json);
+      marketBackoffUntil.current = 0;
     } catch (e) {
+      marketBackoffUntil.current = Date.now() + 60_000;
       setError(e.message || "加载失败");
     } finally {
       setLoading(false);
@@ -280,6 +286,7 @@ export default function Dashboard() {
   }, []);
 
   const loadAccount = useCallback(async () => {
+    if (Date.now() < accountBackoffUntil.current) return;
     try {
       const [summaryResponse, positionsResponse] = await Promise.all([
         fetch("/backend/account/summary", { cache: "no-store" }),
@@ -291,12 +298,43 @@ export default function Dashboard() {
       if (!positionsResponse.ok) throw new Error(active.error);
       setAccount(summary);
       setPositions(active);
+      accountBackoffUntil.current = 0;
     } catch (e) {
+      accountBackoffUntil.current = Date.now() + 60_000;
       setNotice(`账户服务：${e.message}`);
     }
   }, []);
 
+  const loadAccountSummary = useCallback(async () => {
+    if (Date.now() < accountBackoffUntil.current) return;
+    try {
+      const response = await fetch("/backend/account/summary", { cache: "no-store" });
+      const summary = await response.json();
+      if (!response.ok) throw new Error(summary.error);
+      setAccount(summary);
+      accountBackoffUntil.current = 0;
+    } catch (e) {
+      accountBackoffUntil.current = Date.now() + 60_000;
+      setNotice(`账户服务：${e.message}`);
+    }
+  }, []);
+
+  const loadFullPositions = useCallback(async () => {
+    if (Date.now() < accountBackoffUntil.current) return;
+    try {
+      const response = await fetch("/backend/positions", { cache: "no-store" });
+      const active = await response.json();
+      if (!response.ok) throw new Error(active.error);
+      setPositions(active);
+      accountBackoffUntil.current = 0;
+    } catch (e) {
+      accountBackoffUntil.current = Date.now() + 60_000;
+      setNotice(`持仓服务：${e.message}`);
+    }
+  }, []);
+
   const loadPositionQuotes = useCallback(async () => {
+    if (Date.now() < quoteBackoffUntil.current) return;
     try {
       const response = await fetch("/backend/positions/quotes", { cache: "no-store" });
       const quotes = await response.json();
@@ -304,17 +342,20 @@ export default function Dashboard() {
       setPositions((current) => current.map((position) => {
         const updateLeg = (leg) => {
           const quote = quotes.find((item) =>
-            item.exchange === leg.exchange && item.symbol === leg.symbol && item.side === leg.side
+            item.exchange === leg.exchange && item.symbol === leg.symbol
           );
-          return quote
-            ? { ...leg, markPrice: quote.markPrice, unrealizedPnl: quote.unrealizedPnl }
-            : leg;
+          if (!quote) return leg;
+          const unrealizedPnl = leg.side === "long"
+            ? (quote.markPrice - leg.entryPrice) * leg.quantity
+            : (leg.entryPrice - quote.markPrice) * leg.quantity;
+          return { ...leg, markPrice: quote.markPrice, fundingRate: quote.fundingRate, unrealizedPnl };
         };
         const long = updateLeg(position.long);
         const short = updateLeg(position.short);
         return { ...position, long, short, unrealizedPnl: long.unrealizedPnl + short.unrealizedPnl };
       }));
     } catch (e) {
+      quoteBackoffUntil.current = Date.now() + 60_000;
       console.warn("持仓行情刷新失败", e);
     }
   }, []);
@@ -323,14 +364,22 @@ export default function Dashboard() {
     load();
     loadAccount();
     const opportunityTimer = window.setInterval(load, 20_000);
-    const accountTimer = window.setInterval(loadAccount, 20_000);
+    const accountTimer = window.setInterval(loadAccountSummary, 20_000);
     const positionTimer = window.setInterval(loadPositionQuotes, 2_000);
+    const fundingTimer = window.setInterval(loadFullPositions, 60 * 60_000);
     return () => {
       window.clearInterval(opportunityTimer);
       window.clearInterval(accountTimer);
       window.clearInterval(positionTimer);
+      window.clearInterval(fundingTimer);
     };
-  }, [load, loadAccount, loadPositionQuotes]);
+  }, [load, loadAccount, loadAccountSummary, loadFullPositions, loadPositionQuotes]);
+
+  useEffect(() => {
+    if (!notice) return undefined;
+    const timer = window.setTimeout(() => setNotice(""), 10_000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   async function openTrade(request) {
     setTradeBusy(true);
