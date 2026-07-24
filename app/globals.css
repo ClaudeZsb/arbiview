@@ -124,6 +124,9 @@ h1 em { color: var(--green); font-style: normal; }
 .exchange-balance-head .exchange-logo { grid-row: 1 / span 2; }
 .exchange-balance-head b { font-family: Manrope, sans-serif !important; font-size: 12px !important; }
 .balance-note { margin: -3px 2px 14px; color: var(--muted); font-size: 9px; line-height: 1.6; }
+.risk-alert { margin-bottom: 12px; border: 1px solid #e49a88; background: #fff0ec; color: #9f2f20; padding: 14px 17px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 10px; }
+.risk-alert b { font-size: 12px; }
+.risk-alert code { background: white; border: 1px solid #efc4bb; padding: 5px 7px; font: 500 9px DM Mono, monospace; }
 .position-list { display: flex; flex-direction: column; gap: 7px; }
 .position-row { display: grid; grid-template-columns: 145px 1fr 1fr 155px 130px 90px; gap: 15px; align-items: center; padding: 15px 18px; border: 1px solid var(--line); background: var(--white); }
 .position-row > div { display: flex; flex-direction: column; gap: 5px; min-width: 0; }

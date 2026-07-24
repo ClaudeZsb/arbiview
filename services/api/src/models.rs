@@ -100,6 +100,29 @@ pub struct TradeResponse {
     pub position: Position,
     pub mode: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderExecution {
+    pub exchange: String,
+    pub client_order_id: String,
+    pub order_id: String,
+    pub status: String,
+    pub executed_quantity: f64,
+    pub average_price: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionReport {
+    pub outcome: String,
+    pub naked_exposure: bool,
+    pub max_slippage_bps: u32,
+    pub orders: Vec<OrderExecution>,
+    pub compensation_orders: Vec<OrderExecution>,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,6 +135,7 @@ pub struct AccountSummary {
     pub available_usdt: f64,
     pub unrealized_pnl: f64,
     pub active_positions: usize,
+    pub unhedged_legs: Vec<PositionLeg>,
 }
 
 #[derive(Debug, Clone, Serialize)]

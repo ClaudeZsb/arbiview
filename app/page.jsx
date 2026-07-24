@@ -162,6 +162,17 @@ function AccountBoard({ account, positions, onClose, busyId }) {
         ))}
       </div>
       <p className="balance-note">Bybit 可用金额为 Unified Account 的 USD 口径，会从保证金余额中扣除初始保证金、订单占用与抵押品折扣，因此可能低于账户权益。</p>
+      {(account?.unhedgedLegs || []).length > 0 && (
+        <div className="risk-alert">
+          <b>检测到未对冲仓位</b>
+          <span>以下单腿没有在另一交易所找到反向仓位，请立即核查：</span>
+          {account.unhedgedLegs.map((leg) => (
+            <code key={`${leg.exchange}-${leg.symbol}-${leg.side}`}>
+              {leg.exchange} · {leg.symbol} · {leg.side.toUpperCase()} · {leg.quantity}
+            </code>
+          ))}
+        </div>
+      )}
       <div className="position-list">
         {positions.length === 0 && <div className="state compact">暂无持仓，可从下方机会列表建立模拟双腿仓位</div>}
         {positions.map((p) => (
@@ -235,7 +246,10 @@ export default function Dashboard() {
       });
       const json = await response.json();
       if (!response.ok) throw new Error(json.error);
-      setNotice(json.message);
+      const orderSummary = json.execution?.orders
+        ?.map((order) => `${order.exchange} ${order.status} #${order.orderId}`)
+        .join(" · ");
+      setNotice(orderSummary ? `${json.message} · ${orderSummary}` : json.message);
       setTradeItem(null);
       await loadAccount();
     } catch (e) { setNotice(`开仓失败：${e.message}`); }
@@ -248,7 +262,10 @@ export default function Dashboard() {
       const response = await fetch(`/backend/positions/${id}/close`, { method: "POST" });
       const json = await response.json();
       if (!response.ok) throw new Error(json.error);
-      setNotice(json.message);
+      const orderSummary = json.execution?.orders
+        ?.map((order) => `${order.exchange} ${order.status} #${order.orderId}`)
+        .join(" · ");
+      setNotice(orderSummary ? `${json.message} · ${orderSummary}` : json.message);
       await loadAccount();
     } catch (e) { setNotice(`平仓失败：${e.message}`); }
     finally { setClosingId(""); }

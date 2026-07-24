@@ -20,6 +20,7 @@ pub struct Config {
     pub bybit: Option<ExchangeCredentials>,
     pub trading_mode: TradingMode,
     pub web_origin: String,
+    pub max_slippage_bps: u32,
 }
 
 impl Config {
@@ -48,6 +49,10 @@ impl Config {
             trading_mode,
             web_origin: std::env::var("WEB_ORIGIN")
                 .unwrap_or_else(|_| "http://localhost:3000".into()),
+            max_slippage_bps: std::env::var("MAX_SLIPPAGE_BPS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(50),
         })
     }
 }

@@ -63,6 +63,7 @@ impl TradingService {
                     position,
                     mode: "paper".into(),
                     message: "模拟仓位已平仓".into(),
+                    execution: None,
                 })
             }
             TradingMode::Live => self.close_live(id).await,
@@ -105,9 +106,27 @@ impl TradingService {
                         .sum::<f64>(),
                 unrealized_pnl,
                 active_positions: positions.len(),
+                unhedged_legs: vec![],
             });
         }
-        let (binance, bybit) = tokio::try_join!(self.binance_balance(), self.bybit_balance())?;
+        let (binance, bybit, binance_legs, bybit_legs) = tokio::try_join!(
+            self.binance_balance(),
+            self.bybit_balance(),
+            self.binance_positions(),
+            self.bybit_positions()
+        )?;
+        let all_legs: Vec<PositionLeg> = binance_legs.into_iter().chain(bybit_legs).collect();
+        let unhedged_legs = all_legs
+            .iter()
+            .filter(|leg| {
+                !all_legs.iter().any(|other| {
+                    other.exchange != leg.exchange
+                        && other.symbol == leg.symbol
+                        && other.side != leg.side
+                })
+            })
+            .cloned()
+            .collect();
         Ok(AccountSummary {
             mode: "live".into(),
             configured_exchanges,
@@ -129,6 +148,7 @@ impl TradingService {
             available_usdt: binance.1 + bybit.1,
             unrealized_pnl: positions.iter().map(|x| x.unrealized_pnl).sum(),
             active_positions: positions.len(),
+            unhedged_legs,
         })
     }
 
@@ -181,7 +201,67 @@ impl TradingService {
             position,
             mode: "paper".into(),
             message: "模拟双腿仓位已建立，未发送真实订单".into(),
+            execution: None,
         })
+    }
+
+    async fn preflight_balance(
+        &self,
+        opportunity: &Opportunity,
+        request: &OpenTradeRequest,
+    ) -> Result<()> {
+        let (binance, bybit) = tokio::try_join!(self.binance_balance(), self.bybit_balance())
+            .context("balance preflight failed; no orders were sent")?;
+        let required = request.notional_usdt / request.leverage as f64 * 1.05;
+        for exchange in [&opportunity.long.exchange, &opportunity.short.exchange] {
+            let available = if exchange == "Binance" {
+                binance.1
+            } else if exchange == "Bybit" {
+                bybit.1
+            } else {
+                bail!("unsupported exchange {exchange}");
+            };
+            if available < required {
+                bail!(
+                    "{exchange} available balance {:.2} is below required safety amount {:.2}; no orders were sent",
+                    available,
+                    required
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_slippage(
+        &self,
+        order: &OrderExecution,
+        expected_price: f64,
+        is_buy: bool,
+    ) -> Result<()> {
+        if order.executed_quantity <= 0.0 || order.average_price <= 0.0 {
+            bail!(
+                "{} order returned invalid fill data; clientOrderId={}",
+                order.exchange,
+                order.client_order_id
+            );
+        }
+        let adverse = if is_buy {
+            (order.average_price - expected_price) / expected_price
+        } else {
+            (expected_price - order.average_price) / expected_price
+        }
+        .max(0.0);
+        let actual_bps = adverse * 10_000.0;
+        if actual_bps > self.config.max_slippage_bps as f64 {
+            bail!(
+                "{} fill slippage {:.1}bps exceeded limit {}bps; clientOrderId={}",
+                order.exchange,
+                actual_bps,
+                self.config.max_slippage_bps,
+                order.client_order_id
+            );
+        }
+        Ok(())
     }
 
     async fn open_live(
@@ -201,6 +281,7 @@ impl TradingService {
             bail!("calculated order quantity is zero");
         }
 
+        self.preflight_balance(&opportunity, &request).await?;
         tokio::try_join!(
             self.set_leverage(
                 &opportunity.long.exchange,
@@ -214,42 +295,119 @@ impl TradingService {
             )
         )
         .context("failed to configure leverage; no orders were sent")?;
-        self.place(
-            &opportunity.long.exchange,
-            &opportunity.long.symbol,
-            "Buy",
-            long_qty,
-            false,
-        )
-        .await
-        .context("long leg failed; no short order was sent")?;
-        if let Err(error) = self
+
+        let mut report = ExecutionReport {
+            outcome: "executing".into(),
+            naked_exposure: false,
+            max_slippage_bps: self.config.max_slippage_bps,
+            orders: vec![],
+            compensation_orders: vec![],
+        };
+        let long_order = self
             .place(
-                &opportunity.short.exchange,
-                &opportunity.short.symbol,
-                "Sell",
-                short_qty,
+                &opportunity.long.exchange,
+                &opportunity.long.symbol,
+                "Buy",
+                long_qty,
                 false,
+                opportunity.long.ask,
             )
             .await
-        {
-            let _ = self
+            .context("long leg failed; no short order was sent")?;
+        if let Err(slippage_error) = self.ensure_slippage(&long_order, opportunity.long.ask, true) {
+            let client_id = long_order.client_order_id.clone();
+            match self
                 .place(
                     &opportunity.long.exchange,
                     &opportunity.long.symbol,
                     "Sell",
                     long_qty,
                     true,
+                    0.0,
+                )
+                .await
+            {
+                Ok(_) => return Err(slippage_error.context("long leg was compensated")),
+                Err(compensation_error) => {
+                    return Err(anyhow!(
+                        "NAKED_EXPOSURE: {slippage_error:#}; compensating close failed ({compensation_error:#}); longClientOrderId={client_id}"
+                    ));
+                }
+            }
+        }
+        report.orders.push(long_order);
+
+        let short_order = match self
+            .place(
+                &opportunity.short.exchange,
+                &opportunity.short.symbol,
+                "Sell",
+                short_qty,
+                false,
+                opportunity.short.bid,
+            )
+            .await
+        {
+            Ok(order) => order,
+            Err(error) => {
+                match self
+                    .place(
+                        &opportunity.long.exchange,
+                        &opportunity.long.symbol,
+                        "Sell",
+                        long_qty,
+                        true,
+                        0.0,
+                    )
+                    .await
+                {
+                    Ok(order) => report.compensation_orders.push(order),
+                    Err(compensation_error) => {
+                        return Err(anyhow!(
+                            "NAKED_EXPOSURE: short leg failed ({error:#}); compensating long close failed ({compensation_error:#}); longClientOrderId={}",
+                            report.orders[0].client_order_id
+                        ));
+                    }
+                }
+                return Err(error.context("short leg failed; long leg compensation was confirmed"));
+            }
+        };
+        if let Err(slippage_error) =
+            self.ensure_slippage(&short_order, opportunity.short.bid, false)
+        {
+            let long_compensation = self
+                .place(
+                    &opportunity.long.exchange,
+                    &opportunity.long.symbol,
+                    "Sell",
+                    long_qty,
+                    true,
+                    0.0,
                 )
                 .await;
-            return Err(error.context("short leg failed; attempted to compensate the long leg"));
+            let short_compensation = self
+                .place(
+                    &opportunity.short.exchange,
+                    &opportunity.short.symbol,
+                    "Buy",
+                    short_qty,
+                    true,
+                    0.0,
+                )
+                .await;
+            if long_compensation.is_err() || short_compensation.is_err() {
+                return Err(anyhow!(
+                    "NAKED_EXPOSURE: {slippage_error:#}; one or more compensation orders failed; longClientOrderId={}; shortClientOrderId={}",
+                    report.orders[0].client_order_id,
+                    short_order.client_order_id
+                ));
+            }
+            return Err(slippage_error.context("both filled legs were compensated"));
         }
+        report.orders.push(short_order);
+        report.outcome = "filled".into();
         let position = Position {
-            id: format!(
-                "live-{}-{}",
-                opportunity.token.symbol,
-                chrono::Utc::now().timestamp_millis()
-            ),
+            id: format!("live-{}", opportunity.token.symbol),
             token: opportunity.token.symbol,
             status: "open".into(),
             opened_at: chrono::Utc::now().timestamp_millis(),
@@ -260,7 +418,7 @@ impl TradingService {
                 symbol: opportunity.long.symbol,
                 side: "long".into(),
                 quantity: long_qty,
-                entry_price: opportunity.long.ask,
+                entry_price: report.orders[0].average_price,
                 mark_price: opportunity.long.mark,
                 unrealized_pnl: 0.0,
             },
@@ -269,7 +427,7 @@ impl TradingService {
                 symbol: opportunity.short.symbol,
                 side: "short".into(),
                 quantity: short_qty,
-                entry_price: opportunity.short.bid,
+                entry_price: report.orders[1].average_price,
                 mark_price: opportunity.short.mark,
                 unrealized_pnl: 0.0,
             },
@@ -279,7 +437,8 @@ impl TradingService {
         Ok(TradeResponse {
             position,
             mode: "live".into(),
-            message: "双腿市价单已提交".into(),
+            message: "双腿市价单已确认成交".into(),
+            execution: Some(report),
         })
     }
 
@@ -289,34 +448,50 @@ impl TradingService {
             .into_iter()
             .find(|p| p.id == id)
             .ok_or_else(|| anyhow!("position not found"))?;
-        self.place(
-            &position.long.exchange,
-            &position.long.symbol,
-            "Sell",
-            position.long.quantity,
-            true,
-        )
-        .await?;
-        if let Err(error) = self
+        let mut report = ExecutionReport {
+            outcome: "closing".into(),
+            naked_exposure: false,
+            max_slippage_bps: self.config.max_slippage_bps,
+            orders: vec![],
+            compensation_orders: vec![],
+        };
+        let long_close = self
+            .place(
+                &position.long.exchange,
+                &position.long.symbol,
+                "Sell",
+                position.long.quantity,
+                true,
+                0.0,
+            )
+            .await?;
+        report.orders.push(long_close);
+        match self
             .place(
                 &position.short.exchange,
                 &position.short.symbol,
                 "Buy",
                 position.short.quantity,
                 true,
+                0.0,
             )
             .await
         {
-            return Err(error.context(
-                "long leg closed, but short leg close failed; manual intervention required",
-            ));
+            Ok(order) => report.orders.push(order),
+            Err(error) => {
+                return Err(error.context(
+                    "NAKED_EXPOSURE: long leg close confirmed, short leg close failed; manual intervention required",
+                ));
+            }
         }
+        report.outcome = "closed".into();
         let mut closed = position;
         closed.status = "closed".into();
         Ok(TradeResponse {
             position: closed,
             mode: "live".into(),
-            message: "双腿平仓单已提交".into(),
+            message: "双腿平仓单已确认成交".into(),
+            execution: Some(report),
         })
     }
 
@@ -327,7 +502,9 @@ impl TradingService {
         side: &str,
         quantity: f64,
         reduce_only: bool,
-    ) -> Result<()> {
+        _expected_price: f64,
+    ) -> Result<OrderExecution> {
+        let client_order_id = format!("av{}", Uuid::new_v4().simple());
         match exchange {
             "Binance" => {
                 self.binance_order(
@@ -335,10 +512,14 @@ impl TradingService {
                     if side == "Buy" { "BUY" } else { "SELL" },
                     quantity,
                     reduce_only,
+                    &client_order_id,
                 )
                 .await
             }
-            "Bybit" => self.bybit_order(symbol, side, quantity, reduce_only).await,
+            "Bybit" => {
+                self.bybit_order(symbol, side, quantity, reduce_only, &client_order_id)
+                    .await
+            }
             _ => bail!("unsupported exchange {exchange}"),
         }
     }
@@ -386,19 +567,76 @@ impl TradingService {
         side: &str,
         qty: f64,
         reduce_only: bool,
-    ) -> Result<()> {
+        client_order_id: &str,
+    ) -> Result<OrderExecution> {
         let creds = self
             .config
             .binance
             .as_ref()
             .ok_or_else(|| anyhow!("Binance credentials missing"))?;
-        let query = format!(
-            "symbol={symbol}&side={side}&type=MARKET&quantity={}&reduceOnly={reduce_only}&timestamp={}",
-            format_qty(qty), chrono::Utc::now().timestamp_millis()
-        );
-        self.binance_signed(Method::POST, "/fapi/v1/order", &query, creds)
+        let mode_query = format!("timestamp={}", chrono::Utc::now().timestamp_millis());
+        let mode = self
+            .binance_signed(
+                Method::GET,
+                "/fapi/v1/positionSide/dual",
+                &mode_query,
+                creds,
+            )
             .await?;
-        Ok(())
+        let hedge_mode = mode["dualSidePosition"].as_bool().unwrap_or(false);
+        let position_side = if (!reduce_only && side == "BUY") || (reduce_only && side == "SELL") {
+            "LONG"
+        } else {
+            "SHORT"
+        };
+        let mode_params = if hedge_mode {
+            format!("&positionSide={position_side}")
+        } else {
+            format!("&reduceOnly={reduce_only}")
+        };
+        let query = format!(
+            "symbol={symbol}&side={side}&type=MARKET&quantity={}&newClientOrderId={client_order_id}&newOrderRespType=RESULT{mode_params}&timestamp={}",
+            format_qty(qty),
+            chrono::Utc::now().timestamp_millis()
+        );
+        let response = match self
+            .binance_signed(Method::POST, "/fapi/v1/order", &query, creds)
+            .await
+        {
+            Ok(response) => response,
+            Err(submit_error) => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let status_query = format!(
+                    "symbol={symbol}&origClientOrderId={client_order_id}&timestamp={}",
+                    chrono::Utc::now().timestamp_millis()
+                );
+                self.binance_signed(Method::GET, "/fapi/v1/order", &status_query, creds)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Binance submit result unknown ({submit_error:#}); query clientOrderId={client_order_id} before any retry"
+                        )
+                    })?
+            }
+        };
+        let status = response["status"].as_str().unwrap_or("UNKNOWN");
+        if status != "FILLED" {
+            let executed = number(&response["executedQty"]).unwrap_or(0.0);
+            if executed > 0.0 {
+                bail!(
+                    "NAKED_EXPOSURE: Binance order partially filled {executed}; status={status}; clientOrderId={client_order_id}"
+                );
+            }
+            bail!("Binance order not filled: status={status}, clientOrderId={client_order_id}");
+        }
+        Ok(OrderExecution {
+            exchange: "Binance".into(),
+            client_order_id: client_order_id.into(),
+            order_id: response["orderId"].to_string().trim_matches('"').into(),
+            status: status.into(),
+            executed_quantity: number(&response["executedQty"]).unwrap_or(0.0),
+            average_price: number(&response["avgPrice"]).unwrap_or(0.0),
+        })
     }
 
     async fn bybit_order(
@@ -407,19 +645,92 @@ impl TradingService {
         side: &str,
         qty: f64,
         reduce_only: bool,
-    ) -> Result<()> {
+        client_order_id: &str,
+    ) -> Result<OrderExecution> {
+        let position_idx = self.bybit_position_idx(symbol, side, reduce_only).await?;
         let body = json!({
             "category": "linear", "symbol": symbol, "side": side,
             "orderType": "Market", "qty": format_qty(qty),
             "reduceOnly": reduce_only,
+            "orderLinkId": client_order_id,
+            "positionIdx": position_idx,
         });
-        let response = self
+        let submit = self
             .bybit_signed(Method::POST, "/v5/order/create", Some(body))
-            .await?;
-        if response["retCode"].as_i64().unwrap_or(-1) != 0 {
-            bail!("Bybit order rejected: {}", response["retMsg"]);
+            .await;
+        if let Ok(response) = &submit {
+            if response["retCode"].as_i64().unwrap_or(-1) != 0 {
+                bail!("Bybit order rejected: {}", response["retMsg"]);
+            }
         }
-        Ok(())
+        let order_id = submit
+            .as_ref()
+            .ok()
+            .and_then(|response| response["result"]["orderId"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut partial_quantity = 0.0;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let path = format!(
+                "/v5/order/realtime?category=linear&symbol={symbol}&orderLinkId={client_order_id}"
+            );
+            let status_response = self.bybit_signed(Method::GET, &path, None).await?;
+            if status_response["retCode"].as_i64().unwrap_or(-1) != 0 {
+                bail!("Bybit order status failed: {}", status_response["retMsg"]);
+            }
+            if let Some(order) = status_response["result"]["list"]
+                .as_array()
+                .and_then(|orders| orders.first())
+            {
+                let status = order["orderStatus"].as_str().unwrap_or("Unknown");
+                partial_quantity = number(&order["cumExecQty"]).unwrap_or(0.0);
+                if status == "Filled" {
+                    return Ok(OrderExecution {
+                        exchange: "Bybit".into(),
+                        client_order_id: client_order_id.into(),
+                        order_id,
+                        status: status.into(),
+                        executed_quantity: number(&order["cumExecQty"]).unwrap_or(0.0),
+                        average_price: number(&order["avgPrice"]).unwrap_or(0.0),
+                    });
+                }
+                if matches!(status, "Rejected" | "Cancelled" | "Deactivated") {
+                    bail!(
+                        "Bybit order ended with status={status}, clientOrderId={client_order_id}"
+                    );
+                }
+            }
+        }
+        if let Err(submit_error) = submit {
+            bail!(
+                "Bybit submit result unknown ({submit_error:#}); confirmation timed out; query orderLinkId={client_order_id} before any retry"
+            );
+        }
+        if partial_quantity > 0.0 {
+            bail!(
+                "NAKED_EXPOSURE: Bybit order partially filled {partial_quantity}; confirmation timed out; orderLinkId={client_order_id}"
+            );
+        }
+        bail!("Bybit order confirmation timed out; query orderLinkId={client_order_id} before any retry")
+    }
+
+    async fn bybit_position_idx(&self, symbol: &str, side: &str, reduce_only: bool) -> Result<i64> {
+        let path = format!("/v5/position/list?category=linear&symbol={symbol}");
+        let response = self.bybit_signed(Method::GET, &path, None).await?;
+        if response["retCode"].as_i64().unwrap_or(-1) != 0 {
+            bail!("Bybit position mode query failed: {}", response["retMsg"]);
+        }
+        let hedge_mode = response["result"]["list"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["positionIdx"].as_i64().unwrap_or(0) > 0)
+        });
+        if !hedge_mode {
+            return Ok(0);
+        }
+        let is_long = (!reduce_only && side == "Buy") || (reduce_only && side == "Sell");
+        Ok(if is_long { 1 } else { 2 })
     }
 
     async fn live_positions(&self) -> Result<Vec<Position>> {

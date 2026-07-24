@@ -100,10 +100,16 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         tracing::error!("{:#}", self.0);
+        let message = self.0.to_string();
+        let status = if message.contains("NAKED_EXPOSURE") {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::BAD_REQUEST
+        };
         (
-            StatusCode::BAD_REQUEST,
+            status,
             Json(json!({
-                "error": self.0.to_string()
+                "error": message
             })),
         )
             .into_response()
