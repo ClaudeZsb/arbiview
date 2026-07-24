@@ -291,6 +291,7 @@ export default function Dashboard() {
   const [adjustment, setAdjustment] = useState(null);
   const [closingId, setClosingId] = useState("");
   const [notice, setNotice] = useState("");
+  const [streamStatus, setStreamStatus] = useState({ Binance: "idle", Bybit: "idle" });
   const accountBackoffUntil = useRef(0);
   const marketBackoffUntil = useRef(0);
 
@@ -392,6 +393,7 @@ export default function Dashboard() {
         return { exchange, symbol };
       });
     if (subscriptions.length === 0) return undefined;
+    setStreamStatus({ Binance: "connecting", Bybit: "connecting" });
 
     let stopped = false;
     const sockets = [];
@@ -426,15 +428,23 @@ export default function Dashboard() {
       if (stopped || binanceSymbols.length === 0) return;
       const streams = binanceSymbols
         .map((item) => `${item.symbol.toLowerCase()}@markPrice@1s`)
-        .join("/");
-      const socket = new WebSocket(`wss://fstream.binance.com/stream?streams=${streams}`);
+      const socket = new WebSocket("wss://fstream.binance.com/ws");
       sockets.push(socket);
+      socket.onopen = () => {
+        setStreamStatus((current) => ({ ...current, Binance: "connected" }));
+        socket.send(JSON.stringify({ method: "SUBSCRIBE", params: streams, id: Date.now() }));
+      };
       socket.onmessage = (event) => {
         const message = JSON.parse(event.data);
+        if (message.result !== undefined) return;
         const quote = message.data || message;
+        setStreamStatus((current) => ({ ...current, Binance: "live" }));
         updateQuote("Binance", quote.s, Number(quote.p), Number(quote.r));
       };
-      socket.onclose = () => reconnect(connectBinance);
+      socket.onclose = () => {
+        setStreamStatus((current) => ({ ...current, Binance: "reconnecting" }));
+        reconnect(connectBinance);
+      };
       socket.onerror = () => socket.close();
     };
 
@@ -445,6 +455,7 @@ export default function Dashboard() {
       sockets.push(socket);
       let pingTimer;
       socket.onopen = () => {
+        setStreamStatus((current) => ({ ...current, Bybit: "connected" }));
         socket.send(JSON.stringify({
           op: "subscribe",
           args: bybitSymbols.map((item) => `tickers.${item.symbol}`)
@@ -459,9 +470,11 @@ export default function Dashboard() {
         if (!message.topic?.startsWith("tickers.")) return;
         const quote = Array.isArray(message.data) ? message.data[0] : message.data;
         const symbol = quote?.symbol || message.topic.slice("tickers.".length);
+        setStreamStatus((current) => ({ ...current, Bybit: "live" }));
         updateQuote("Bybit", symbol, Number(quote?.markPrice), Number(quote?.fundingRate));
       };
       socket.onclose = () => {
+        setStreamStatus((current) => ({ ...current, Bybit: "reconnecting" }));
         if (pingTimer) window.clearInterval(pingTimer);
         reconnect(connectBybit);
       };
@@ -591,7 +604,7 @@ export default function Dashboard() {
           <a href="#spread-arbitrage">价差套利</a>
           <a href="#methodology">计算说明</a>
         </nav>
-        <div className="live-status"><i /> LIVE <span>机会 20s · 持仓 WebSocket</span></div>
+        <div className="live-status"><i /> LIVE <span>机会 20s · WS B:{streamStatus.Binance.toUpperCase()} Y:{streamStatus.Bybit.toUpperCase()}</span></div>
       </header>
 
       <section className="hero">
