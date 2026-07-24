@@ -165,25 +165,6 @@ impl TradingService {
         }
     }
 
-    pub async fn position_quotes(&self) -> Result<Vec<PositionQuote>> {
-        match self.config.trading_mode {
-            TradingMode::Paper => Ok(self
-                .paper_positions
-                .read()
-                .await
-                .values()
-                .flat_map(|position| [&position.long, &position.short])
-                .map(|leg| PositionQuote {
-                    exchange: leg.exchange.clone(),
-                    symbol: leg.symbol.clone(),
-                    mark_price: leg.mark_price,
-                    funding_rate: leg.funding_rate,
-                })
-                .collect()),
-            TradingMode::Live => self.market.position_quotes().await,
-        }
-    }
-
     pub async fn account_summary(&self) -> Result<AccountSummary> {
         let configured_exchanges = [
             self.config.binance.as_ref().map(|_| "Binance".to_string()),

@@ -290,7 +290,6 @@ export default function Dashboard() {
   const [adjustment, setAdjustment] = useState(null);
   const [closingId, setClosingId] = useState("");
   const [notice, setNotice] = useState("");
-  const quoteBackoffUntil = useRef(0);
   const accountBackoffUntil = useRef(0);
   const marketBackoffUntil = useRef(0);
 
@@ -360,47 +359,122 @@ export default function Dashboard() {
     }
   }, []);
 
-  const loadPositionQuotes = useCallback(async () => {
-    if (Date.now() < quoteBackoffUntil.current) return;
-    try {
-      const response = await fetch("/backend/positions/quotes", { cache: "no-store" });
-      const quotes = await response.json();
-      if (!response.ok) throw new Error(quotes.error);
-      setPositions((current) => current.map((position) => {
-        const updateLeg = (leg) => {
-          const quote = quotes.find((item) =>
-            item.exchange === leg.exchange && item.symbol === leg.symbol
-          );
-          if (!quote) return leg;
-          const unrealizedPnl = leg.side === "long"
-            ? (quote.markPrice - leg.entryPrice) * leg.quantity
-            : (leg.entryPrice - quote.markPrice) * leg.quantity;
-          return { ...leg, markPrice: quote.markPrice, fundingRate: quote.fundingRate, unrealizedPnl };
-        };
-        const long = updateLeg(position.long);
-        const short = updateLeg(position.short);
-        return { ...position, long, short, unrealizedPnl: long.unrealizedPnl + short.unrealizedPnl };
-      }));
-    } catch (e) {
-      quoteBackoffUntil.current = Date.now() + 60_000;
-      console.warn("持仓行情刷新失败", e);
-    }
-  }, []);
-
   useEffect(() => {
     load();
     loadAccount();
     const opportunityTimer = window.setInterval(load, 20_000);
     const accountTimer = window.setInterval(loadAccountSummary, 20_000);
-    const positionTimer = window.setInterval(loadPositionQuotes, 2_000);
     const fundingTimer = window.setInterval(loadFullPositions, 60 * 60_000);
     return () => {
       window.clearInterval(opportunityTimer);
       window.clearInterval(accountTimer);
-      window.clearInterval(positionTimer);
       window.clearInterval(fundingTimer);
     };
-  }, [load, loadAccount, loadAccountSummary, loadFullPositions, loadPositionQuotes]);
+  }, [load, loadAccount, loadAccountSummary, loadFullPositions]);
+
+  const positionSubscriptionKey = useMemo(
+    () => account?.mode === "live" ? positions
+      .flatMap((position) => [position.long, position.short])
+      .map((leg) => `${leg.exchange}:${leg.symbol}`)
+      .sort()
+      .join("|") : "",
+    [account?.mode, positions]
+  );
+
+  useEffect(() => {
+    const subscriptions = positionSubscriptionKey
+      .split("|")
+      .filter(Boolean)
+      .map((item) => {
+        const [exchange, symbol] = item.split(":");
+        return { exchange, symbol };
+      });
+    if (subscriptions.length === 0) return undefined;
+
+    let stopped = false;
+    const sockets = [];
+    const reconnectTimers = [];
+    const pingTimers = [];
+    const updateQuote = (exchange, symbol, markPrice, fundingRate) => {
+      if (!Number.isFinite(markPrice)) return;
+      setPositions((current) => current.map((position) => {
+        const updateLeg = (leg) => {
+          if (leg.exchange !== exchange || leg.symbol !== symbol) return leg;
+          const unrealizedPnl = leg.side === "long"
+            ? (markPrice - leg.entryPrice) * leg.quantity
+            : (leg.entryPrice - markPrice) * leg.quantity;
+          return {
+            ...leg,
+            markPrice,
+            fundingRate: Number.isFinite(fundingRate) ? fundingRate : leg.fundingRate,
+            unrealizedPnl
+          };
+        };
+        const long = updateLeg(position.long);
+        const short = updateLeg(position.short);
+        return { ...position, long, short, unrealizedPnl: long.unrealizedPnl + short.unrealizedPnl };
+      }));
+    };
+    const reconnect = (connect) => {
+      if (!stopped) reconnectTimers.push(window.setTimeout(connect, 3_000));
+    };
+
+    const binanceSymbols = subscriptions.filter((item) => item.exchange === "Binance");
+    const connectBinance = () => {
+      if (stopped || binanceSymbols.length === 0) return;
+      const streams = binanceSymbols
+        .map((item) => `${item.symbol.toLowerCase()}@markPrice@1s`)
+        .join("/");
+      const socket = new WebSocket(`wss://fstream.binance.com/stream?streams=${streams}`);
+      sockets.push(socket);
+      socket.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        const quote = message.data || message;
+        updateQuote("Binance", quote.s, Number(quote.p), Number(quote.r));
+      };
+      socket.onclose = () => reconnect(connectBinance);
+      socket.onerror = () => socket.close();
+    };
+
+    const bybitSymbols = subscriptions.filter((item) => item.exchange === "Bybit");
+    const connectBybit = () => {
+      if (stopped || bybitSymbols.length === 0) return;
+      const socket = new WebSocket("wss://stream.bybit.com/v5/public/linear");
+      sockets.push(socket);
+      let pingTimer;
+      socket.onopen = () => {
+        socket.send(JSON.stringify({
+          op: "subscribe",
+          args: bybitSymbols.map((item) => `tickers.${item.symbol}`)
+        }));
+        pingTimer = window.setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ op: "ping" }));
+        }, 20_000);
+        pingTimers.push(pingTimer);
+      };
+      socket.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        if (!message.topic?.startsWith("tickers.")) return;
+        const quote = Array.isArray(message.data) ? message.data[0] : message.data;
+        const symbol = quote?.symbol || message.topic.slice("tickers.".length);
+        updateQuote("Bybit", symbol, Number(quote?.markPrice), Number(quote?.fundingRate));
+      };
+      socket.onclose = () => {
+        if (pingTimer) window.clearInterval(pingTimer);
+        reconnect(connectBybit);
+      };
+      socket.onerror = () => socket.close();
+    };
+
+    connectBinance();
+    connectBybit();
+    return () => {
+      stopped = true;
+      reconnectTimers.forEach(window.clearTimeout);
+      pingTimers.forEach(window.clearInterval);
+      sockets.forEach((socket) => socket.close());
+    };
+  }, [positionSubscriptionKey]);
 
   useEffect(() => {
     if (!notice) return undefined;
@@ -515,7 +589,7 @@ export default function Dashboard() {
           <a href="#spread-arbitrage">价差套利</a>
           <a href="#methodology">计算说明</a>
         </nav>
-        <div className="live-status"><i /> LIVE <span>机会 20s · 持仓 2s</span></div>
+        <div className="live-status"><i /> LIVE <span>机会 20s · 持仓 WebSocket</span></div>
       </header>
 
       <section className="hero">
