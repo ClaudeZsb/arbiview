@@ -96,6 +96,23 @@ h1 em { color: var(--green); font-style: normal; }
 .metric small { color: #96a49f; font-size: 8px; margin-top: 6px; white-space: nowrap; }
 .trade-button { height: 36px; border: 0; background: var(--green); color: white; border-radius: 4px; display: flex; gap: 5px; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
 .trade-button:hover { background: var(--green-dark); }
+.spread-workspace { padding: 42px 4vw 30px; max-width: 1500px; margin: 0 auto; }
+.spread-workspace h2 span { color: var(--green); font: 500 14px DM Mono, monospace; vertical-align: middle; }
+.spread-column-head { display: grid; grid-template-columns: 205px 1fr 150px 225px 180px 78px; gap: 14px; padding: 10px 20px 10px 58px; color: #8a9994; font: 500 9px DM Mono, monospace; letter-spacing: .08em; text-transform: uppercase; }
+.spread-column-head span:nth-child(n+3) { text-align: right; }
+.spread-list { display: flex; flex-direction: column; gap: 7px; }
+.spread-card { min-height: 96px; display: grid; grid-template-columns: 28px 166px 1fr 150px 225px 180px 78px; gap: 14px; align-items: center; border: 1px solid var(--line); background: var(--white); padding: 14px 18px 14px 10px; }
+.spread-route { display: grid; grid-template-columns: 1fr 22px 1fr; gap: 7px; align-items: center; min-width: 0; }
+.spread-route > div { display: grid; grid-template-columns: 12px 1fr; gap: 5px 8px; align-items: center; min-width: 0; }
+.spread-route > div b { grid-column: 2; font: 500 11px DM Mono, monospace; }
+.spread-route > div span { color: var(--muted); font-size: 9px; white-space: nowrap; }
+.spread-route > svg { color: var(--muted); }
+.spread-route .side-dot { width: 9px; height: 9px; grid-row: 1 / span 2; }
+.spread-stat { min-width: 0; text-align: right; display: flex; flex-direction: column; gap: 5px; }
+.spread-stat > span { color: var(--muted); font-size: 9px; }
+.spread-stat strong { font: 600 12px DM Mono, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spread-stat small { color: var(--muted); font-size: 8px; line-height: 1.35; }
+.spread-note { color: var(--muted); font-size: 9px; line-height: 1.6; margin: 11px 2px 0; }
 .positive { color: var(--green) !important; }
 .negative { color: var(--orange) !important; }
 .state { min-height: 180px; display: flex; gap: 12px; align-items: center; justify-content: center; color: var(--muted); border: 1px solid var(--line); background: var(--white); font-size: 13px; }
@@ -197,7 +214,10 @@ footer span { display: flex; align-items: center; gap: 7px; }
   .hero { grid-template-columns: 1fr; }
   .hero-stats { max-width: 650px; }
   .column-head { display: none; }
+  .spread-column-head { display: none; }
   .opportunity-card { grid-template-columns: 28px 160px 1fr 120px; }
+  .spread-card { grid-template-columns: 28px 160px 1fr 150px; }
+  .spread-stat:nth-of-type(n+2), .spread-card > .trade-button { grid-column: span 1; }
   .metric.spread, .metric.breakeven { grid-column: span 1; }
   .methodology { grid-template-columns: 1fr 1fr; margin-left: 4vw; margin-right: 4vw; }
   .trade-button { grid-column: 4; }
@@ -210,9 +230,13 @@ footer span { display: flex; align-items: center; gap: 7px; }
   .topbar { padding: 0 18px; } nav { display: none; } .live-status span { display: none; }
   .hero { padding: 55px 20px 38px; gap: 45px; } h1 { font-size: 51px; }
   .workspace { padding: 45px 16px; }
+  .spread-workspace { padding: 35px 16px; }
   .section-head { align-items: flex-start; gap: 20px; } .updated { flex-wrap: wrap; justify-content: flex-end; }
   .toolbar { flex-wrap: wrap; } .search { flex-basis: 100%; } .sorter { flex: 1; }
   .opportunity-card { grid-template-columns: 20px 1fr; padding: 18px 16px 18px 5px; gap: 15px 10px; }
+  .spread-card { grid-template-columns: 20px 1fr; padding: 18px 16px 18px 5px; gap: 15px 10px; }
+  .spread-card > .asset, .spread-route, .spread-stat, .spread-card > .trade-button { grid-column: 2; }
+  .spread-stat { text-align: left; display: grid; grid-template-columns: 110px 1fr; }
   .rank { grid-row: 1 / span 4; }
   .asset, .legs, .metric, .trade-button { grid-column: 2; }
   .legs { margin-top: 4px; }

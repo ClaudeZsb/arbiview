@@ -95,6 +95,33 @@ function OpportunityCard({ item, index, onTrade }) {
   );
 }
 
+function SpreadOpportunityCard({ item, index, onTrade }) {
+  const fundingCostPerHour = Math.max(0, -item.fundingPerHour);
+  const fundingImpact8h = item.fundingPerHour * 8;
+  const edgeAfterFees = item.spread - item.fees;
+  const costLimitHours = fundingCostPerHour > 0
+    ? Math.max(0, edgeAfterFees) / fundingCostPerHour
+    : null;
+  return (
+    <article className="spread-card">
+      <div className="rank">#{String(index + 1).padStart(2, "0")}</div>
+      <div className="asset">
+        <div className="asset-icon">{item.token.symbol.slice(0, 2)}</div>
+        <div><div className="asset-symbol">{item.token.symbol}<span>/USDT</span></div><div className="asset-name">CMC #{item.token.rank}</div></div>
+      </div>
+      <div className="spread-route">
+        <div><i className="side-dot long" /><span>LONG · {item.long.exchange}</span><b>{price(item.long.ask)}</b></div>
+        <ArrowRight size={15} />
+        <div><i className="side-dot short" /><span>SHORT · {item.short.exchange}</span><b>{price(item.short.bid)}</b></div>
+      </div>
+      <div className="spread-stat"><span>可执行价差</span><strong>{pct(item.spread)}</strong><small>扣往返费后 {pct(edgeAfterFees)}</small></div>
+      <div className="spread-stat"><span>Funding 影响</span><strong className={fundingImpact8h >= 0 ? "positive" : "negative"}>{fundingImpact8h >= 0 ? "预计收入 " : "预计成本 "}{pct(Math.abs(fundingImpact8h))} / 8h</strong><small>净值 {pct(item.fundingPerHour, 4)} / 小时</small></div>
+      <div className="spread-stat"><span>成本承受时间</span><strong>{costLimitHours === null ? "无 Funding 成本" : duration(costLimitHours)}</strong><small>{costLimitHours === null ? "当前 Funding 反而增厚收益" : "Funding 消耗净价差的估算时间"}</small></div>
+      <button className="trade-button" onClick={() => onTrade(item)}><Zap size={13} />开仓</button>
+    </article>
+  );
+}
+
 function TradeModal({ item, mode, onClose, onSubmit, busy }) {
   const [notional, setNotional] = useState(1000);
   const [leverage, setLeverage] = useState(1);
@@ -469,6 +496,12 @@ export default function Dashboard() {
       sort === "apy" ? b.apy - a.apy : a.breakEvenHours - b.breakEvenHours
     );
   }, [data, query, minApy, sort]);
+  const spreadRows = useMemo(
+    () => (data?.spreadOpportunities || [])
+      .filter((item) => item.token.symbol.toLowerCase().includes(query.toLowerCase()))
+      .sort((a, b) => b.spread - a.spread),
+    [data, query]
+  );
 
   const best = data?.opportunities?.[0];
 
@@ -479,6 +512,7 @@ export default function Dashboard() {
         <nav>
           <a href="#account">账户持仓</a>
           <a className="active" href="#opportunities">套利机会</a>
+          <a href="#spread-arbitrage">价差套利</a>
           <a href="#methodology">计算说明</a>
         </nav>
         <div className="live-status"><i /> LIVE <span>机会 20s · 持仓 2s</span></div>
@@ -538,6 +572,22 @@ export default function Dashboard() {
           {!loading && !error && rows.length === 0 && <div className="state">当前筛选条件下暂无套利机会</div>}
           {rows.map((item, i) => <OpportunityCard key={item.id} item={item} index={i} onTrade={setTradeItem} />)}
         </div>
+      </section>
+
+      <section className="spread-workspace" id="spread-arbitrage">
+        <div className="section-head">
+          <div>
+            <div className="section-kicker"><ArrowDownUp size={15} /> PRICE SPREAD ARBITRAGE</div>
+            <h2>价差套利 <span>{spreadRows.length}</span></h2>
+          </div>
+          <div className="configured">仅展示可执行价差 &gt; 0.5% · Funding 成本按当前费率估算</div>
+        </div>
+        <div className="spread-column-head"><span>资产</span><span>执行路径</span><span>价差</span><span>Funding 成本</span><span>成本承受时间</span></div>
+        <div className="spread-list">
+          {!loading && !error && spreadRows.length === 0 && <div className="state compact">当前没有价差超过 0.5% 的共同合约</div>}
+          {spreadRows.map((item, index) => <SpreadOpportunityCard key={`spread-${item.id}`} item={item} index={index} onTrade={setTradeItem} />)}
+        </div>
+        <p className="spread-note">价差收益依赖两所价格最终收敛；Funding 成本按当前费率和结算周期线性估算，实际费率可能在持仓期间变化。</p>
       </section>
 
       <section className="methodology" id="methodology">

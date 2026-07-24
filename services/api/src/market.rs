@@ -7,17 +7,21 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 const BINANCE_FEE: f64 = 0.0005;
 const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
+type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 
 #[derive(Clone)]
 pub struct MarketService {
     client: Client,
     config: Config,
     cache: Arc<RwLock<Option<(Instant, OpportunitiesResponse)>>>,
+    scan_lock: Arc<Mutex<()>>,
+    quote_cache: Arc<RwLock<QuoteCache>>,
+    quote_lock: Arc<Mutex<()>>,
 }
 
 impl MarketService {
@@ -30,6 +34,9 @@ impl MarketService {
             client,
             config,
             cache: Arc::new(RwLock::new(None)),
+            scan_lock: Arc::new(Mutex::new(())),
+            quote_cache: Arc::new(RwLock::new(None)),
+            quote_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -37,6 +44,12 @@ impl MarketService {
         if let Some((at, value)) = self.cache.read().await.as_ref() {
             // Keep the cache slightly shorter than the UI's 20-second polling
             // interval so each scheduled scan receives a fresh snapshot.
+            if at.elapsed() < Duration::from_secs(15) {
+                return Ok(value.clone());
+            }
+        }
+        let _scan_guard = self.scan_lock.lock().await;
+        if let Some((at, value)) = self.cache.read().await.as_ref() {
             if at.elapsed() < Duration::from_secs(15) {
                 return Ok(value.clone());
             }
@@ -55,6 +68,7 @@ impl MarketService {
             binance.into_iter().map(|x| (x.base.clone(), x)).collect();
         let y_map: HashMap<String, Leg> = bybit.into_iter().map(|x| (x.base.clone(), x)).collect();
         let mut opportunities = vec![];
+        let mut spread_opportunities = vec![];
         let mut matched = HashSet::new();
         for (symbol, token) in &allowed {
             if let (Some(b), Some(y)) = (b_map.get(symbol), y_map.get(symbol)) {
@@ -65,11 +79,24 @@ impl MarketService {
                 if let Some(x) = make_opportunity(token, y, b) {
                     opportunities.push(x);
                 }
+                let mut spread_candidates = [
+                    make_spread_opportunity(token, b, y),
+                    make_spread_opportunity(token, y, b),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                spread_candidates.sort_by(|a, b| b.spread.total_cmp(&a.spread));
+                if let Some(best) = spread_candidates.into_iter().next() {
+                    spread_opportunities.push(best);
+                }
             }
         }
         opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
+        spread_opportunities.sort_by(|a, b| b.spread.total_cmp(&a.spread));
         let result = OpportunitiesResponse {
             opportunities,
+            spread_opportunities,
             updated_at: chrono::Utc::now().timestamp_millis(),
             universe_size: tokens.len(),
             matched_pairs: matched.len(),
@@ -97,6 +124,17 @@ impl MarketService {
     }
 
     pub async fn position_quotes(&self) -> Result<Vec<PositionQuote>> {
+        if let Some((at, quotes)) = self.quote_cache.read().await.as_ref() {
+            if at.elapsed() < Duration::from_millis(1500) {
+                return Ok(quotes.clone());
+            }
+        }
+        let _quote_guard = self.quote_lock.lock().await;
+        if let Some((at, quotes)) = self.quote_cache.read().await.as_ref() {
+            if at.elapsed() < Duration::from_millis(1500) {
+                return Ok(quotes.clone());
+            }
+        }
         let (binance, bybit): (Value, Value) = tokio::try_join!(
             self.get_json("https://fapi.binance.com/fapi/v1/premiumIndex".into()),
             self.get_json("https://api.bybit.com/v5/market/tickers?category=linear".into())
@@ -126,6 +164,7 @@ impl MarketService {
                 });
             }
         }
+        *self.quote_cache.write().await = Some((Instant::now(), quotes.clone()));
         Ok(quotes)
     }
 
@@ -301,6 +340,19 @@ fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunit
     if funding_per_hour <= 0.0 {
         return None;
     }
+    Some(build_opportunity(token, long, short, funding_per_hour))
+}
+
+fn make_spread_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunity> {
+    let spread = (short.bid - long.ask) / long.ask;
+    if spread <= 0.005 {
+        return None;
+    }
+    let funding_per_hour = short.rate / short.interval_hours - long.rate / long.interval_hours;
+    Some(build_opportunity(token, long, short, funding_per_hour))
+}
+
+fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f64) -> Opportunity {
     let spread = (short.bid - long.ask) / long.ask;
     let fee = |exchange: &str| {
         if exchange == "Binance" {
@@ -310,7 +362,7 @@ fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunit
         }
     };
     let fees = 2.0 * (fee(&long.exchange) + fee(&short.exchange));
-    Some(Opportunity {
+    Opportunity {
         id: format!("{}-{}-{}", token.symbol, long.exchange, short.exchange),
         token: token.clone(),
         long: long.clone(),
@@ -319,8 +371,12 @@ fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunit
         apy: funding_per_hour * YEAR_HOURS,
         spread,
         fees,
-        break_even_hours: (fees - spread).max(0.0) / funding_per_hour,
-    })
+        break_even_hours: if funding_per_hour > 0.0 {
+            (fees - spread).max(0.0) / funding_per_hour
+        } else {
+            0.0
+        },
+    }
 }
 
 fn parse(value: &Value) -> Option<f64> {

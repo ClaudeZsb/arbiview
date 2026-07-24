@@ -68,6 +68,7 @@ impl TradingService {
         let opportunity = snapshot
             .opportunities
             .into_iter()
+            .chain(snapshot.spread_opportunities)
             .find(|x| x.id == request.opportunity_id)
             .ok_or_else(|| anyhow!("opportunity is no longer available"))?;
         match self.config.trading_mode {

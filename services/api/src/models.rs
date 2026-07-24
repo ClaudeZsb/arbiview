@@ -41,6 +41,7 @@ pub struct Opportunity {
 #[serde(rename_all = "camelCase")]
 pub struct OpportunitiesResponse {
     pub opportunities: Vec<Opportunity>,
+    pub spread_opportunities: Vec<Opportunity>,
     pub updated_at: i64,
     pub universe_size: usize,
     pub matched_pairs: usize,
