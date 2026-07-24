@@ -194,6 +194,46 @@ h1 em { color: var(--green); font-style: normal; }
 .confirm-trade { width: 100%; height: 45px; margin-top: 12px; border: 0; background: var(--ink); color: white; font-weight: 700; }
 .confirm-trade.live { background: #bd3e29; }
 .confirm-trade:disabled { opacity: .5; cursor: not-allowed; }
+.batch-panel { position: fixed; z-index: 45; right: 18px; top: 76px; bottom: 18px; width: min(440px, calc(100vw - 36px)); overflow: auto; background: #fbfdfc; border: 1px solid #a8bbb4; box-shadow: 0 24px 70px rgba(12,35,27,.22); padding: 22px; }
+.batch-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+.batch-panel-head h3 { margin: 8px 0 0; font-size: 21px; letter-spacing: -.035em; }
+.batch-close { border: 0; background: transparent; color: var(--muted); padding: 2px; }
+.batch-close:disabled { opacity: .3; cursor: not-allowed; }
+.batch-route { display: grid; grid-template-columns: 1fr 20px 1fr; align-items: center; gap: 8px; padding: 14px; margin: 15px 0; background: #edf3ef; }
+.batch-route span { display: flex; align-items: center; gap: 7px; color: var(--ink); font: 500 9px DM Mono, monospace; white-space: nowrap; }
+.batch-route svg { color: var(--muted); }
+.batch-panel > label { display: grid; grid-template-columns: 1fr 145px; gap: 12px; align-items: center; margin-top: 11px; color: var(--muted); font-size: 10px; }
+.batch-panel input { height: 39px; width: 100%; border: 1px solid var(--line); background: white; padding: 0 10px; color: var(--ink); font: 500 11px DM Mono, monospace; outline: 0; }
+.batch-estimate { margin-top: 15px; padding: 11px 12px; background: #fff5d9; color: #78611e; font-size: 9px; line-height: 1.5; }
+.batch-start { width: 100%; height: 44px; margin-top: 11px; border: 0; background: var(--green-dark); color: white; font-weight: 700; }
+.batch-start:disabled { opacity: .45; }
+.batch-summary { display: grid; grid-template-columns: .8fr 1.35fr .75fr; border: 1px solid var(--line); background: white; }
+.batch-summary > div { min-width: 0; padding: 11px; display: flex; flex-direction: column; gap: 6px; border-right: 1px solid var(--line); }
+.batch-summary > div:last-child { border-right: 0; }
+.batch-summary span { color: var(--muted); font-size: 8px; }
+.batch-summary b { overflow: hidden; text-overflow: ellipsis; font: 500 10px DM Mono, monospace; white-space: nowrap; }
+.batch-status { text-transform: uppercase; color: #a36b12; }
+.batch-status.completed { color: var(--green); }
+.batch-status.failed, .batch-status.cancelled { color: var(--orange); }
+.batch-progress { height: 13px; background: #dfe8e4; margin-top: 16px; overflow: hidden; }
+.batch-progress i { display: block; height: 100%; min-width: 0; background: linear-gradient(90deg, var(--green-dark), #37d59d); transition: width .35s ease; }
+.batch-progress-label { display: flex; justify-content: space-between; align-items: center; margin: 7px 0 14px; }
+.batch-progress-label b { color: var(--green-dark); font: 600 12px DM Mono, monospace; }
+.batch-progress-label span { color: var(--muted); font-size: 8px; }
+.batch-error { background: #fff0ec; border: 1px solid #e9a995; color: #a63320; padding: 10px; font-size: 9px; line-height: 1.55; overflow-wrap: anywhere; margin-bottom: 10px; }
+.batch-log { height: min(42vh, 350px); overflow-y: auto; border: 1px solid var(--line); background: #10231d; scroll-behavior: smooth; }
+.batch-log-empty { height: 100%; display: grid; place-items: center; color: #789087; font: 400 9px DM Mono, monospace; }
+.batch-log-row { display: grid; grid-template-columns: 58px 12px 1fr; gap: 8px; align-items: start; padding: 10px; border-bottom: 1px solid rgba(255,255,255,.08); color: white; }
+.batch-log-row:last-child { border-bottom: 0; }
+.batch-log-row time { color: #789087; font: 400 8px DM Mono, monospace; padding-top: 2px; }
+.batch-log-row .side-dot { width: 8px; height: 8px; margin-top: 2px; }
+.batch-log-row .side-dot.error, .batch-log-row .side-dot.unknown { background: #d39b34; }
+.batch-log-row > div { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.batch-log-row b { font: 500 9px DM Mono, monospace; overflow-wrap: anywhere; }
+.batch-log-row span { color: #9bb0a8; font-size: 8px; line-height: 1.45; }
+.batch-log-row.failed { background: rgba(190,62,41,.18); }
+.batch-cancel { width: 100%; height: 38px; margin-top: 10px; border: 1px solid #dc9e8b; color: #a63b25; background: #fff4f0; font-size: 10px; }
+.batch-cancel:disabled { opacity: .5; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -250,5 +290,7 @@ footer span { display: flex; align-items: center; gap: 7px; }
   .position-row { grid-template-columns: 1fr; }
   .position-row > div, .position-row > div:nth-child(4), .position-row > div:nth-child(5), .position-row button { display: flex; }
   .trade-modal > label { grid-template-columns: 1fr; gap: 7px; }
+  .batch-panel { inset: 62px 8px 8px auto; width: calc(100vw - 16px); }
+  .batch-panel > label { grid-template-columns: 1fr; gap: 6px; }
   .methodology > div { border-right: 0; border-bottom: 1px solid var(--line); }
 }

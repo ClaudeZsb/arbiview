@@ -44,6 +44,7 @@ pub struct TradingService {
     market: MarketService,
     paper_positions: Arc<RwLock<HashMap<String, Position>>>,
     funding_cache: Arc<RwLock<FundingCache>>,
+    batch_tasks: Arc<RwLock<HashMap<String, BatchIncreaseTask>>>,
 }
 
 impl TradingService {
@@ -54,26 +55,212 @@ impl TradingService {
             client: Client::builder().timeout(Duration::from_secs(15)).build()?,
             paper_positions: Arc::new(RwLock::new(HashMap::new())),
             funding_cache: Arc::new(RwLock::new(None)),
+            batch_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     pub async fn open(&self, request: OpenTradeRequest) -> Result<TradeResponse> {
+        let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
+        self.open_opportunity(opportunity, request).await
+    }
+
+    async fn resolve_opportunity(&self, opportunity_id: &str) -> Result<Opportunity> {
+        let snapshot = self.market.opportunities().await?;
+        snapshot
+            .opportunities
+            .into_iter()
+            .chain(snapshot.spread_opportunities)
+            .find(|x| x.id == opportunity_id)
+            .ok_or_else(|| anyhow!("opportunity is no longer available"))
+    }
+
+    async fn open_opportunity(
+        &self,
+        opportunity: Opportunity,
+        request: OpenTradeRequest,
+    ) -> Result<TradeResponse> {
         if !(10.0..=1_000_000.0).contains(&request.notional_usdt) {
             bail!("notionalUsdt must be between 10 and 1,000,000");
         }
         if !(1..=20).contains(&request.leverage) {
             bail!("leverage must be between 1 and 20");
         }
-        let snapshot = self.market.opportunities().await?;
-        let opportunity = snapshot
-            .opportunities
-            .into_iter()
-            .chain(snapshot.spread_opportunities)
-            .find(|x| x.id == request.opportunity_id)
-            .ok_or_else(|| anyhow!("opportunity is no longer available"))?;
         match self.config.trading_mode {
             TradingMode::Paper => self.open_paper(opportunity, request).await,
             TradingMode::Live => self.open_live(opportunity, request).await,
+        }
+    }
+
+    pub async fn start_batch_increase(
+        &self,
+        request: BatchIncreaseRequest,
+    ) -> Result<BatchIncreaseTask> {
+        if !(10.0..=1_000_000.0).contains(&request.target_notional_usdt) {
+            bail!("targetNotionalUsdt must be between 10 and 1,000,000");
+        }
+        if !(10.0..=request.target_notional_usdt).contains(&request.order_notional_usdt) {
+            bail!("orderNotionalUsdt must be between 10 and targetNotionalUsdt");
+        }
+        if !(0.5..=3_600.0).contains(&request.interval_seconds) {
+            bail!("intervalSeconds must be between 0.5 and 3,600");
+        }
+        if !(1..=20).contains(&request.leverage) {
+            bail!("leverage must be between 1 and 20");
+        }
+        let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
+        let mut tasks = self.batch_tasks.write().await;
+        if tasks
+            .values()
+            .any(|task| matches!(task.status.as_str(), "queued" | "running" | "cancelling"))
+        {
+            bail!("another batch increase task is already active");
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let total_batches =
+            (request.target_notional_usdt / request.order_notional_usdt).ceil() as usize;
+        let task = BatchIncreaseTask {
+            id: Uuid::new_v4().to_string(),
+            status: "queued".into(),
+            token: opportunity.token.symbol.clone(),
+            long_exchange: opportunity.long.exchange.clone(),
+            short_exchange: opportunity.short.exchange.clone(),
+            target_notional_usdt: request.target_notional_usdt,
+            order_notional_usdt: request.order_notional_usdt,
+            interval_seconds: request.interval_seconds,
+            completed_notional_usdt: 0.0,
+            completed_batches: 0,
+            total_batches,
+            started_at: now,
+            updated_at: now,
+            cancel_requested: false,
+            error: None,
+            logs: vec![],
+        };
+        tasks.insert(task.id.clone(), task.clone());
+        drop(tasks);
+
+        let service = self.clone();
+        let task_id = task.id.clone();
+        tokio::spawn(async move {
+            service
+                .run_batch_increase(task_id, opportunity, request)
+                .await;
+        });
+        Ok(task)
+    }
+
+    pub async fn batch_task(&self, id: &str) -> Result<BatchIncreaseTask> {
+        self.batch_tasks
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("batch task not found"))
+    }
+
+    pub async fn cancel_batch_task(&self, id: &str) -> Result<BatchIncreaseTask> {
+        let mut tasks = self.batch_tasks.write().await;
+        let task = tasks
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("batch task not found"))?;
+        if matches!(task.status.as_str(), "queued" | "running") {
+            task.cancel_requested = true;
+            task.status = "cancelling".into();
+            task.updated_at = chrono::Utc::now().timestamp_millis();
+        }
+        Ok(task.clone())
+    }
+
+    async fn run_batch_increase(
+        &self,
+        task_id: String,
+        opportunity: Opportunity,
+        request: BatchIncreaseRequest,
+    ) {
+        self.update_batch(&task_id, |task| task.status = "running".into())
+            .await;
+        let mut completed = 0.0;
+        let mut batch = 0usize;
+        while completed + 0.001 < request.target_notional_usdt {
+            let cancelled = self
+                .batch_tasks
+                .read()
+                .await
+                .get(&task_id)
+                .map(|task| task.cancel_requested)
+                .unwrap_or(true);
+            if cancelled {
+                self.update_batch(&task_id, |task| {
+                    task.status = "cancelled".into();
+                })
+                .await;
+                return;
+            }
+            batch += 1;
+            let batch_notional = request
+                .order_notional_usdt
+                .min(request.target_notional_usdt - completed);
+            let open_request = OpenTradeRequest {
+                opportunity_id: request.opportunity_id.clone(),
+                notional_usdt: batch_notional,
+                leverage: request.leverage,
+            };
+            match self
+                .open_opportunity(opportunity.clone(), open_request)
+                .await
+            {
+                Ok(response) => {
+                    completed += batch_notional;
+                    let logs = batch_logs(&opportunity, batch, &response, batch_notional);
+                    self.update_batch(&task_id, |task| {
+                        task.completed_notional_usdt = completed.min(task.target_notional_usdt);
+                        task.completed_batches = batch;
+                        for mut log in logs {
+                            log.sequence = task.logs.len() + 1;
+                            task.logs.push(log);
+                        }
+                    })
+                    .await;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    self.update_batch(&task_id, |task| {
+                        task.status = "failed".into();
+                        task.error = Some(message.clone());
+                        task.logs.push(BatchExecutionLog {
+                            sequence: task.logs.len() + 1,
+                            batch,
+                            timestamp: chrono::Utc::now().timestamp_millis(),
+                            exchange: "System".into(),
+                            side: "error".into(),
+                            token: task.token.clone(),
+                            notional_usdt: 0.0,
+                            executed_quantity: 0.0,
+                            average_price: 0.0,
+                            status: "failed".into(),
+                            order_id: String::new(),
+                            message: message.clone(),
+                        });
+                    })
+                    .await;
+                    return;
+                }
+            }
+            if completed + 0.001 < request.target_notional_usdt {
+                tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds)).await;
+            }
+        }
+        self.update_batch(&task_id, |task| task.status = "completed".into())
+            .await;
+    }
+
+    async fn update_batch<F>(&self, id: &str, update: F)
+    where
+        F: FnOnce(&mut BatchIncreaseTask),
+    {
+        if let Some(task) = self.batch_tasks.write().await.get_mut(id) {
+            update(task);
+            task.updated_at = chrono::Utc::now().timestamp_millis();
         }
     }
 
@@ -1517,6 +1704,81 @@ impl TradingService {
         }
         serde_json::from_str(&body).context("invalid Bybit API response")
     }
+}
+
+fn batch_logs(
+    opportunity: &Opportunity,
+    batch: usize,
+    response: &TradeResponse,
+    batch_notional: f64,
+) -> Vec<BatchExecutionLog> {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    if let Some(report) = &response.execution {
+        return report
+            .orders
+            .iter()
+            .chain(&report.supplement_orders)
+            .chain(&report.rebalance_orders)
+            .chain(&report.compensation_orders)
+            .map(|order| {
+                let side = if order.exchange == opportunity.long.exchange {
+                    "long"
+                } else if order.exchange == opportunity.short.exchange {
+                    "short"
+                } else {
+                    "unknown"
+                };
+                BatchExecutionLog {
+                    sequence: 0,
+                    batch,
+                    timestamp,
+                    exchange: order.exchange.clone(),
+                    side: side.into(),
+                    token: opportunity.token.symbol.clone(),
+                    notional_usdt: order.executed_quantity * order.average_price,
+                    executed_quantity: order.executed_quantity,
+                    average_price: order.average_price,
+                    status: order.status.clone(),
+                    order_id: order.order_id.clone(),
+                    message: if report
+                        .orders
+                        .iter()
+                        .any(|item| item.client_order_id == order.client_order_id)
+                    {
+                        "批次市价单成交".into()
+                    } else if report
+                        .supplement_orders
+                        .iter()
+                        .any(|item| item.client_order_id == order.client_order_id)
+                    {
+                        "目标仓位补单".into()
+                    } else {
+                        "双腿差额对齐".into()
+                    },
+                }
+            })
+            .collect();
+    }
+    [
+        (&opportunity.long.exchange, "long", opportunity.long.ask),
+        (&opportunity.short.exchange, "short", opportunity.short.bid),
+    ]
+    .into_iter()
+    .map(|(exchange, side, price)| BatchExecutionLog {
+        sequence: 0,
+        batch,
+        timestamp,
+        exchange: exchange.clone(),
+        side: side.into(),
+        token: opportunity.token.symbol.clone(),
+        notional_usdt: batch_notional,
+        executed_quantity: batch_notional / price,
+        average_price: price,
+        status: "FILLED".into(),
+        order_id: format!("paper-{batch}-{side}"),
+        message: "模拟批次成交".into(),
+    })
+    .collect()
 }
 
 fn paper_exchange_balances(positions: &[Position]) -> Vec<ExchangeBalance> {

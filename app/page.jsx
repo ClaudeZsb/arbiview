@@ -192,6 +192,76 @@ function AdjustModal({ position, type, onClose, onSubmit, busy }) {
   );
 }
 
+function BatchIncreasePanel({ position, task, onClose, onStart, onCancel, busy }) {
+  const [target, setTarget] = useState(1000);
+  const [orderNotional, setOrderNotional] = useState(100);
+  const [intervalSeconds, setIntervalSeconds] = useState(2);
+  const logRef = useRef(null);
+  const progress = task
+    ? Math.min(100, task.completedNotionalUsdt / task.targetNotionalUsdt * 100)
+    : 0;
+  const active = task && ["queued", "running", "cancelling"].includes(task.status);
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [task?.logs?.length]);
+  return (
+    <aside className="batch-panel">
+      <div className="batch-panel-head">
+        <div>
+          <div className="section-kicker"><Zap size={14} /> BATCH INCREASE</div>
+          <h3>{position.token} 双腿批量加仓</h3>
+        </div>
+        <button className="batch-close" disabled={active} title={active ? "任务运行中，请先停止或等待完成" : "关闭"} onClick={onClose}><X size={18} /></button>
+      </div>
+      <div className="batch-route">
+        <span><i className="side-dot long" />LONG · {position.long.exchange}</span>
+        <ArrowRight size={14} />
+        <span><i className="side-dot short" />SHORT · {position.short.exchange}</span>
+      </div>
+      {!task && <>
+        <label>每腿目标加仓金额（USDT）<input type="number" min="10" step="100" value={target} onChange={(event) => setTarget(Number(event.target.value))} /></label>
+        <label>单次每腿下单金额（USDT）<input type="number" min="10" step="10" value={orderNotional} onChange={(event) => setOrderNotional(Number(event.target.value))} /></label>
+        <label>批次间隔（秒）<input type="number" min="0.5" max="3600" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /></label>
+        <div className="batch-estimate">
+          预计 {Math.ceil(target / Math.max(orderNotional, 1))} 批，
+          约 {duration(Math.max(0, Math.ceil(target / Math.max(orderNotional, 1)) - 1) * intervalSeconds / 3600)}
+        </div>
+        <button
+          className="batch-start"
+          disabled={busy || target < 10 || orderNotional < 10 || orderNotional > target || intervalSeconds < 0.5}
+          onClick={() => onStart({ targetNotionalUsdt: target, orderNotionalUsdt: orderNotional, intervalSeconds })}
+        >
+          {busy ? "正在创建任务…" : "启动批量加仓"}
+        </button>
+      </>}
+      {task && <>
+        <div className="batch-summary">
+          <div><span>状态</span><b className={`batch-status ${task.status}`}>{task.status}</b></div>
+          <div><span>完成金额</span><b>{money(task.completedNotionalUsdt)} / {money(task.targetNotionalUsdt)}</b></div>
+          <div><span>批次</span><b>{task.completedBatches} / {task.totalBatches}</b></div>
+        </div>
+        <div className="batch-progress"><i style={{ width: `${progress}%` }} /></div>
+        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>单笔 {money(task.orderNotionalUsdt)} · 间隔 {task.intervalSeconds}s</span></div>
+        {task.error && <div className="batch-error">{task.error}</div>}
+        <div className="batch-log" ref={logRef}>
+          {task.logs.length === 0 && <div className="batch-log-empty">等待第一批成交…</div>}
+          {task.logs.map((log) => (
+            <div className={`batch-log-row ${log.status === "failed" ? "failed" : ""}`} key={`${log.sequence}-${log.orderId}`}>
+              <time>{new Date(log.timestamp).toLocaleTimeString("zh-CN", { hour12: false })}</time>
+              <i className={`side-dot ${log.side}`} />
+              <div>
+                <b>#{log.batch} {log.exchange} · {log.side.toUpperCase()} {log.token}</b>
+                <span>{money(log.notionalUsdt)} @ {price(log.averagePrice)} · {log.message}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        {active && <button className="batch-cancel" disabled={task.status === "cancelling"} onClick={onCancel}>{task.status === "cancelling" ? "正在停止…" : "完成当前订单后停止"}</button>}
+      </>}
+    </aside>
+  );
+}
+
 function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
   return (
     <section className="account-board" id="account">
@@ -289,6 +359,8 @@ export default function Dashboard() {
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
   const [adjustment, setAdjustment] = useState(null);
+  const [batchPanel, setBatchPanel] = useState(null);
+  const [batchTask, setBatchTask] = useState(null);
   const [closingId, setClosingId] = useState("");
   const [notice, setNotice] = useState("");
   const [streamStatus, setStreamStatus] = useState({ Binance: "idle", Bybit: "idle" });
@@ -573,6 +645,65 @@ export default function Dashboard() {
     }
   }
 
+  async function startBatchIncrease(settings) {
+    if (!batchPanel) return;
+    setTradeBusy(true);
+    try {
+      const opportunity = data?.opportunities?.find((item) =>
+        item.token.symbol === batchPanel.token &&
+        item.long.exchange === batchPanel.long.exchange &&
+        item.short.exchange === batchPanel.short.exchange
+      );
+      if (!opportunity) throw new Error("当前机会列表中没有与该持仓方向一致的机会，无法安全加仓");
+      const response = await fetch("/backend/trades/batch-increase", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          opportunityId: opportunity.id,
+          leverage: batchPanel.leverage,
+          ...settings
+        })
+      });
+      const task = await response.json();
+      if (!response.ok) throw new Error(task.error);
+      setBatchTask(task);
+    } catch (error) {
+      setNotice(`批量加仓启动失败：${error.message}`);
+    } finally {
+      setTradeBusy(false);
+    }
+  }
+
+  const refreshBatchTask = useCallback(async (taskId) => {
+    try {
+      const response = await fetch(`/backend/trades/batch-increase/${taskId}`, { cache: "no-store" });
+      const task = await response.json();
+      if (!response.ok) throw new Error(task.error);
+      setBatchTask(task);
+      if (["completed", "failed", "cancelled"].includes(task.status)) await loadAccount();
+    } catch (error) {
+      setNotice(`批量加仓进度读取失败：${error.message}`);
+    }
+  }, [loadAccount]);
+
+  useEffect(() => {
+    if (!batchTask?.id || !["queued", "running", "cancelling"].includes(batchTask.status)) return undefined;
+    const timer = window.setInterval(() => refreshBatchTask(batchTask.id), 1000);
+    return () => window.clearInterval(timer);
+  }, [batchTask?.id, batchTask?.status, refreshBatchTask]);
+
+  async function cancelBatchIncrease() {
+    if (!batchTask?.id) return;
+    try {
+      const response = await fetch(`/backend/trades/batch-increase/${batchTask.id}/cancel`, { method: "POST" });
+      const task = await response.json();
+      if (!response.ok) throw new Error(task.error);
+      setBatchTask(task);
+    } catch (error) {
+      setNotice(`停止批量加仓失败：${error.message}`);
+    }
+  }
+
   const rows = useMemo(() => {
     const list = (data?.opportunities || []).filter((x) =>
       x.token.symbol.toLowerCase().includes(query.toLowerCase()) &&
@@ -619,7 +750,18 @@ export default function Dashboard() {
 
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
 
-      <AccountBoard account={account} positions={positions} onClose={closePosition} onAdjust={(position, type) => setAdjustment({ position, type })} busyId={closingId} />
+      <AccountBoard account={account} positions={positions} onClose={closePosition} onAdjust={(position, type) => {
+        if (type === "increase") {
+          if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {
+            setNotice("已有批量加仓任务正在执行，请先等待完成或停止任务");
+            return;
+          }
+          setBatchPanel(position);
+          setBatchTask(null);
+        } else {
+          setAdjustment({ position, type });
+        }
+      }} busyId={closingId} />
 
       <section className="workspace" id="opportunities">
         <div className="section-head">
@@ -686,6 +828,14 @@ export default function Dashboard() {
       <footer><span><ShieldCheck size={15} />数据仅供研究，不构成投资建议</span><span>ARBIVIEW / 2026</span></footer>
       {tradeItem && <TradeModal item={tradeItem} mode={account?.mode} onClose={() => setTradeItem(null)} onSubmit={openTrade} busy={tradeBusy} />}
       {adjustment && <AdjustModal position={adjustment.position} type={adjustment.type} onClose={() => setAdjustment(null)} onSubmit={adjustPosition} busy={tradeBusy} />}
+      {batchPanel && <BatchIncreasePanel
+        position={batchPanel}
+        task={batchTask}
+        busy={tradeBusy}
+        onStart={startBatchIncrease}
+        onCancel={cancelBatchIncrease}
+        onClose={() => setBatchPanel(null)}
+      />}
     </main>
   );
 }

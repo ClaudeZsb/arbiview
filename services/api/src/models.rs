@@ -94,13 +94,62 @@ pub struct Position {
     pub unrealized_pnl: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenTradeRequest {
     pub opportunity_id: String,
     pub notional_usdt: f64,
     #[serde(default = "default_leverage")]
     pub leverage: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchIncreaseRequest {
+    pub opportunity_id: String,
+    pub target_notional_usdt: f64,
+    pub order_notional_usdt: f64,
+    pub interval_seconds: f64,
+    #[serde(default = "default_leverage")]
+    pub leverage: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchExecutionLog {
+    pub sequence: usize,
+    pub batch: usize,
+    pub timestamp: i64,
+    pub exchange: String,
+    pub side: String,
+    pub token: String,
+    pub notional_usdt: f64,
+    pub executed_quantity: f64,
+    pub average_price: f64,
+    pub status: String,
+    pub order_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchIncreaseTask {
+    pub id: String,
+    pub status: String,
+    pub token: String,
+    pub long_exchange: String,
+    pub short_exchange: String,
+    pub target_notional_usdt: f64,
+    pub order_notional_usdt: f64,
+    pub interval_seconds: f64,
+    pub completed_notional_usdt: f64,
+    pub completed_batches: usize,
+    pub total_batches: usize,
+    pub started_at: i64,
+    pub updated_at: i64,
+    pub cancel_requested: bool,
+    pub error: Option<String>,
+    pub logs: Vec<BatchExecutionLog>,
 }
 
 #[derive(Debug, Deserialize)]

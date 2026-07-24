@@ -12,7 +12,9 @@ use axum::{
 };
 use config::Config;
 use market::MarketService;
-use models::{AdjustLeverageRequest, AdjustPositionRequest, OpenTradeRequest};
+use models::{
+    AdjustLeverageRequest, AdjustPositionRequest, BatchIncreaseRequest, OpenTradeRequest,
+};
 use serde_json::json;
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -48,6 +50,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/account/summary", get(account_summary))
         .route("/api/positions", get(positions))
         .route("/api/trades/open", post(open_trade))
+        .route("/api/trades/batch-increase", post(start_batch_increase))
+        .route("/api/trades/batch-increase/:id", get(batch_increase))
+        .route(
+            "/api/trades/batch-increase/:id/cancel",
+            post(cancel_batch_increase),
+        )
         .route("/api/positions/:id/close", post(close_position))
         .route("/api/positions/:id/reduce", post(reduce_position))
         .route("/api/positions/:id/leverage", post(adjust_leverage))
@@ -82,6 +90,27 @@ async fn open_trade(
     Json(request): Json<OpenTradeRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.open(request).await?))
+}
+
+async fn start_batch_increase(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchIncreaseRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.start_batch_increase(request).await?))
+}
+
+async fn batch_increase(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.batch_task(&id).await?))
+}
+
+async fn cancel_batch_increase(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.cancel_batch_task(&id).await?))
 }
 
 async fn close_position(
