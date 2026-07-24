@@ -278,6 +278,7 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
         <div><span>账户权益</span><strong>{money(account?.equityUsdt)}</strong></div>
         <div><span>可用余额</span><strong>{money(account?.availableUsdt)}</strong></div>
         <div><span>未实现盈亏</span><strong className={(account?.unrealizedPnl || 0) >= 0 ? "positive" : "negative"}>{money(account?.unrealizedPnl)}</strong></div>
+        <div><span>近 {account?.realizedPeriodDays || 7} 日已实现盈亏</span><strong className={(account?.realizedPnl || 0) >= 0 ? "positive" : "negative"}>{money(account?.realizedPnl)}</strong></div>
         <div><span>活跃套利仓位</span><strong>{account ? account.activePositions : "—"}</strong></div>
       </div>
       <div className="exchange-balances">
@@ -287,10 +288,11 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
             <div><span>可用金额</span><strong>{money(item.availableUsdt)}</strong></div>
             <div><span>账户权益</span><b>{money(item.equityUsdt)}</b></div>
             <div><span>未实现盈亏</span><b className={item.unrealizedPnl >= 0 ? "positive" : "negative"}>{money(item.unrealizedPnl)}</b></div>
+            <div><span>近 {account?.realizedPeriodDays || 7} 日已实现盈亏</span><b className={item.realizedPnl >= 0 ? "positive" : "negative"}>{money(item.realizedPnl)}</b><small>Funding {money(item.fundingIncome)} − 手续费 {money(item.tradingFees)}</small></div>
           </article>
         ))}
       </div>
-      <p className="balance-note">Bybit 可用金额为 Unified Account 的 USD 口径，会从保证金余额中扣除初始保证金、订单占用与抵押品折扣，因此可能低于账户权益。</p>
+      <p className="balance-note">未实现盈亏仅统计当前未平仓仓位；已实现盈亏按近 {account?.realizedPeriodDays || 7} 日资金费净收入减交易手续费计算，不包含平仓价格损益。Bybit 可用金额为 Unified Account 的 USD 口径，可能低于账户权益。</p>
       {(account?.unhedgedLegs || []).length > 0 && (
         <div className="risk-alert">
           <b>检测到未对冲仓位</b>

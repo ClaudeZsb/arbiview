@@ -127,17 +127,18 @@ h1 em { color: var(--green); font-style: normal; }
 .mode-badge.paper { background: #fff2cf; color: #8a6410; }
 .mode-badge.live { background: #ffe5df; color: #b64029; }
 .configured { font-size: 11px; color: var(--muted); }
-.account-stats { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--line); background: var(--white); margin-bottom: 12px; }
+.account-stats { display: grid; grid-template-columns: repeat(5, 1fr); border: 1px solid var(--line); background: var(--white); margin-bottom: 12px; }
 .account-stats > div { min-height: 95px; padding: 19px 22px; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
 .account-stats > div:last-child { border-right: 0; }
 .account-stats span { color: var(--muted); font-size: 10px; margin-bottom: 11px; }
 .account-stats strong { font: 500 20px DM Mono, monospace; }
 .exchange-balances { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
-.exchange-balances article { display: grid; grid-template-columns: minmax(160px, 1.2fr) minmax(180px, 1fr) minmax(150px, .85fr) minmax(120px, .7fr); align-items: center; gap: 24px; border: 1px solid var(--line); background: var(--white); padding: 17px 20px; overflow: hidden; }
+.exchange-balances article { display: grid; grid-template-columns: minmax(135px, 1.1fr) repeat(4, minmax(115px, 1fr)); align-items: center; gap: 18px; border: 1px solid var(--line); background: var(--white); padding: 17px 20px; overflow: hidden; }
 .exchange-balances article > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .exchange-balances article > div > span { font-size: 9px; color: var(--muted); }
 .exchange-balances article > div > strong { font: 600 18px DM Mono, monospace; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .exchange-balances article > div > b { font: 500 11px DM Mono, monospace; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.exchange-balances article > div > small { color: var(--muted); font-size: 8px; line-height: 1.4; white-space: nowrap; }
 .exchange-balance-head { display: grid !important; grid-template-columns: 20px 1fr; column-gap: 5px !important; }
 .exchange-balance-head .exchange-logo { grid-row: 1 / span 2; }
 .exchange-balance-head b { font-family: Manrope, sans-serif !important; font-size: 12px !important; }

@@ -232,6 +232,10 @@ pub struct AccountSummary {
     pub equity_usdt: f64,
     pub available_usdt: f64,
     pub unrealized_pnl: f64,
+    pub realized_pnl: f64,
+    pub funding_income: f64,
+    pub trading_fees: f64,
+    pub realized_period_days: u8,
     pub active_positions: usize,
     pub unhedged_legs: Vec<PositionLeg>,
 }
@@ -243,6 +247,9 @@ pub struct ExchangeBalance {
     pub equity_usdt: f64,
     pub available_usdt: f64,
     pub unrealized_pnl: f64,
+    pub realized_pnl: f64,
+    pub funding_income: f64,
+    pub trading_fees: f64,
 }
 
 #[derive(Debug, Deserialize)]

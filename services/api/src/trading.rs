@@ -13,12 +13,25 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 type FundingTotals = HashMap<String, f64>;
-type FundingCache = Option<(Instant, FundingTotals, FundingTotals)>;
+type FundingCache = Option<(Instant, IncomeSummary, IncomeSummary)>;
+
+#[derive(Clone, Default)]
+struct IncomeSummary {
+    funding_by_symbol: FundingTotals,
+    funding_income: f64,
+    trading_fees: f64,
+}
+
+impl IncomeSummary {
+    fn realized_pnl(&self) -> f64 {
+        self.funding_income - self.trading_fees
+    }
+}
 
 const MAX_RECONCILIATION_ATTEMPTS: u8 = 3;
 
@@ -44,6 +57,7 @@ pub struct TradingService {
     market: MarketService,
     paper_positions: Arc<RwLock<HashMap<String, Position>>>,
     funding_cache: Arc<RwLock<FundingCache>>,
+    income_refresh_lock: Arc<Mutex<()>>,
     batch_tasks: Arc<RwLock<HashMap<String, BatchIncreaseTask>>>,
 }
 
@@ -55,6 +69,7 @@ impl TradingService {
             client: Client::builder().timeout(Duration::from_secs(15)).build()?,
             paper_positions: Arc::new(RwLock::new(HashMap::new())),
             funding_cache: Arc::new(RwLock::new(None)),
+            income_refresh_lock: Arc::new(Mutex::new(())),
             batch_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -523,15 +538,20 @@ impl TradingService {
                         .map(|x| x.notional_usdt * 2.0 / x.leverage as f64)
                         .sum::<f64>(),
                 unrealized_pnl,
+                realized_pnl: 0.0,
+                funding_income: 0.0,
+                trading_fees: 0.0,
+                realized_period_days: 7,
                 active_positions: positions.len(),
                 unhedged_legs: vec![],
             });
         }
-        let (binance, bybit, binance_legs, bybit_legs) = tokio::try_join!(
+        let (binance, bybit, binance_legs, bybit_legs, (binance_income, bybit_income)) = tokio::try_join!(
             self.binance_balance(),
             self.bybit_balance(),
             self.binance_positions(),
-            self.bybit_positions()
+            self.bybit_positions(),
+            self.income_summary()
         )?;
         let all_legs: Vec<PositionLeg> = binance_legs.into_iter().chain(bybit_legs).collect();
         let active_positions = all_legs
@@ -570,17 +590,27 @@ impl TradingService {
                     equity_usdt: binance.0,
                     available_usdt: binance.1,
                     unrealized_pnl: binance.2,
+                    realized_pnl: binance_income.realized_pnl(),
+                    funding_income: binance_income.funding_income,
+                    trading_fees: binance_income.trading_fees,
                 },
                 ExchangeBalance {
                     exchange: "Bybit".into(),
                     equity_usdt: bybit.0,
                     available_usdt: bybit.1,
                     unrealized_pnl: bybit.2,
+                    realized_pnl: bybit_income.realized_pnl(),
+                    funding_income: bybit_income.funding_income,
+                    trading_fees: bybit_income.trading_fees,
                 },
             ],
             equity_usdt: binance.0 + bybit.0,
             available_usdt: binance.1 + bybit.1,
             unrealized_pnl,
+            realized_pnl: binance_income.realized_pnl() + bybit_income.realized_pnl(),
+            funding_income: binance_income.funding_income + bybit_income.funding_income,
+            trading_fees: binance_income.trading_fees + bybit_income.trading_fees,
+            realized_period_days: 7,
             active_positions,
             unhedged_legs,
         })
@@ -1572,20 +1602,26 @@ impl TradingService {
     }
 
     async fn live_positions(&self) -> Result<Vec<Position>> {
-        let (mut binance, mut bybit, (binance_funding, bybit_funding), funding_rates) = tokio::try_join!(
+        let (mut binance, mut bybit, (binance_income, bybit_income), funding_rates) = tokio::try_join!(
             self.binance_positions(),
             self.bybit_positions(),
-            self.funding_income(),
+            self.income_summary(),
             self.market.funding_rates()
         )?;
         for leg in &mut binance {
-            leg.funding_earned = *binance_funding.get(&leg.symbol).unwrap_or(&0.0);
+            leg.funding_earned = *binance_income
+                .funding_by_symbol
+                .get(&leg.symbol)
+                .unwrap_or(&0.0);
             leg.funding_rate = *funding_rates
                 .get(&format!("Binance:{}", leg.symbol))
                 .unwrap_or(&0.0);
         }
         for leg in &mut bybit {
-            leg.funding_earned = *bybit_funding.get(&leg.symbol).unwrap_or(&0.0);
+            leg.funding_earned = *bybit_income
+                .funding_by_symbol
+                .get(&leg.symbol)
+                .unwrap_or(&0.0);
             leg.funding_rate = *funding_rates
                 .get(&format!("Bybit:{}", leg.symbol))
                 .unwrap_or(&0.0);
@@ -1688,7 +1724,7 @@ impl TradingService {
             .collect())
     }
 
-    async fn binance_funding_income(&self) -> Result<HashMap<String, f64>> {
+    async fn binance_income_summary(&self) -> Result<IncomeSummary> {
         let creds = self
             .config
             .binance
@@ -1696,42 +1732,61 @@ impl TradingService {
             .ok_or_else(|| anyhow!("Binance credentials missing"))?;
         let now = chrono::Utc::now().timestamp_millis();
         let start = now - 7 * 24 * 60 * 60 * 1000;
-        let query = format!(
+        let funding_query = format!(
             "incomeType=FUNDING_FEE&startTime={start}&endTime={now}&limit=1000&timestamp={now}"
         );
-        let json = self
-            .binance_signed(Method::GET, "/fapi/v1/income", &query, creds)
-            .await?;
-        let mut totals = HashMap::new();
-        for item in json.as_array().unwrap_or(&vec![]) {
+        let commission_query = format!(
+            "incomeType=COMMISSION&startTime={start}&endTime={now}&limit=1000&timestamp={now}"
+        );
+        let (funding, commissions) = tokio::try_join!(
+            self.binance_signed(Method::GET, "/fapi/v1/income", &funding_query, creds),
+            self.binance_signed(Method::GET, "/fapi/v1/income", &commission_query, creds)
+        )?;
+        let mut summary = IncomeSummary::default();
+        for item in funding.as_array().unwrap_or(&vec![]) {
             if let (Some(symbol), Some(income)) = (item["symbol"].as_str(), number(&item["income"]))
             {
-                *totals.entry(symbol.to_string()).or_insert(0.0) += income;
+                *summary
+                    .funding_by_symbol
+                    .entry(symbol.to_string())
+                    .or_insert(0.0) += income;
+                summary.funding_income += income;
             }
         }
-        Ok(totals)
+        for item in commissions.as_array().unwrap_or(&vec![]) {
+            if let Some(commission) = number(&item["income"]) {
+                summary.trading_fees -= commission;
+            }
+        }
+        Ok(summary)
     }
 
-    async fn funding_income(&self) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
+    async fn income_summary(&self) -> Result<(IncomeSummary, IncomeSummary)> {
+        if let Some((updated_at, binance, bybit)) = self.funding_cache.read().await.as_ref() {
+            if updated_at.elapsed() < Duration::from_secs(60 * 60) {
+                return Ok((binance.clone(), bybit.clone()));
+            }
+        }
+        let _refresh_guard = self.income_refresh_lock.lock().await;
         if let Some((updated_at, binance, bybit)) = self.funding_cache.read().await.as_ref() {
             if updated_at.elapsed() < Duration::from_secs(60 * 60) {
                 return Ok((binance.clone(), bybit.clone()));
             }
         }
         let (binance, bybit) =
-            tokio::try_join!(self.binance_funding_income(), self.bybit_funding_income())?;
+            tokio::try_join!(self.binance_income_summary(), self.bybit_income_summary())?;
         *self.funding_cache.write().await = Some((Instant::now(), binance.clone(), bybit.clone()));
         Ok((binance, bybit))
     }
 
-    async fn bybit_funding_income(&self) -> Result<HashMap<String, f64>> {
+    async fn bybit_income_summary(&self) -> Result<IncomeSummary> {
         let now = chrono::Utc::now().timestamp_millis();
         let start = now - 7 * 24 * 60 * 60 * 1000;
         let mut cursor = None;
-        let mut totals = HashMap::new();
+        let mut summary = IncomeSummary::default();
         for _ in 0..20 {
             let mut path = format!(
-                "/v5/account/transaction-log?accountType=UNIFIED&category=linear&currency=USDT&type=SETTLEMENT&startTime={start}&endTime={now}&limit=50"
+                "/v5/account/transaction-log?accountType=UNIFIED&category=linear&currency=USDT&startTime={start}&endTime={now}&limit=50"
             );
             if let Some(value) = cursor.as_deref() {
                 path.push_str("&cursor=");
@@ -1745,7 +1800,14 @@ impl TradingService {
                 if let (Some(symbol), Some(funding)) =
                     (item["symbol"].as_str(), number(&item["funding"]))
                 {
-                    *totals.entry(symbol.to_string()).or_insert(0.0) += funding;
+                    *summary
+                        .funding_by_symbol
+                        .entry(symbol.to_string())
+                        .or_insert(0.0) += funding;
+                    summary.funding_income += funding;
+                }
+                if let Some(fee) = number(&item["fee"]) {
+                    summary.trading_fees += fee;
                 }
             }
             cursor = json["result"]["nextPageCursor"]
@@ -1756,7 +1818,7 @@ impl TradingService {
                 break;
             }
         }
-        Ok(totals)
+        Ok(summary)
     }
 
     async fn binance_balance(&self) -> Result<(f64, f64, f64)> {
@@ -2041,6 +2103,9 @@ fn paper_exchange_balances(positions: &[Position]) -> Vec<ExchangeBalance> {
                 equity_usdt: 50_000.0 + unrealized_pnl,
                 available_usdt: 50_000.0 - used_margin,
                 unrealized_pnl,
+                realized_pnl: 0.0,
+                funding_income: 0.0,
+                trading_fees: 0.0,
             }
         })
         .collect()
@@ -2131,5 +2196,15 @@ mod tests {
         assert_eq!(status, "FILLED");
         assert!((quantity - 34.57).abs() < 1e-9);
         assert!((average_price - 2.887).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_pnl_is_funding_less_trading_fees() {
+        let summary = IncomeSummary {
+            funding_income: 12.5,
+            trading_fees: 3.25,
+            ..Default::default()
+        };
+        assert!((summary.realized_pnl() - 9.25).abs() < 1e-9);
     }
 }
