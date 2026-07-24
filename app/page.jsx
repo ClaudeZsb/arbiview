@@ -135,7 +135,30 @@ function TradeModal({ item, mode, onClose, onSubmit, busy }) {
   );
 }
 
-function AccountBoard({ account, positions, onClose, busyId }) {
+function AdjustModal({ position, type, onClose, onSubmit, busy }) {
+  const [notional, setNotional] = useState(20);
+  const isIncrease = type === "increase";
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="trade-modal">
+        <button className="modal-close" onClick={onClose}><X /></button>
+        <div className="section-kicker"><Zap size={15} /> ADJUST HEDGED POSITION</div>
+        <div className="trade-title"><h3>{isIncrease ? "增加" : "减少"} {position.token} 双腿仓位</h3></div>
+        <label>每腿调整金额（USDT）<input type="number" min="10" step="10" value={notional} onChange={(e) => setNotional(Number(e.target.value))} /></label>
+        <div className={`trade-warning ${isIncrease ? "live" : "paper"}`}><ShieldCheck size={16} />
+          {isIncrease
+            ? "两条腿将按该金额并发加仓，成交后根据交易所实际仓位补齐并对冲。"
+            : "两条腿将按该金额并发减仓，成交后只减少较大腿完成金额对齐；全量退出请使用双腿平仓。"}
+        </div>
+        <button className={`confirm-trade ${isIncrease ? "live" : ""}`} disabled={busy || notional < 10} onClick={() => onSubmit(notional)}>
+          {busy ? "正在调整双腿…" : `确认${isIncrease ? "加仓" : "减仓"}`}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
   return (
     <section className="account-board" id="account">
       <div className="section-head">
@@ -183,7 +206,11 @@ function AccountBoard({ account, positions, onClose, busyId }) {
               <div><span>SHORT · {p.short.exchange}</span><b>{p.short.quantity} @ {price(p.short.entryPrice)}</b></div>
               <div><span>名义价值 / 杠杆</span><b>{price(p.notionalUsdt)} · {p.leverage}×</b></div>
               <div><span>未实现盈亏</span><b className={p.unrealizedPnl >= 0 ? "positive" : "negative"}>{price(p.unrealizedPnl)}</b></div>
-              <button disabled={busyId === p.id} onClick={(event) => { event.preventDefault(); onClose(p.id); }}>{busyId === p.id ? "平仓中…" : "双腿平仓"}</button>
+              <div className="position-actions">
+                <button onClick={(event) => { event.preventDefault(); onAdjust(p, "increase"); }}>加仓</button>
+                <button onClick={(event) => { event.preventDefault(); onAdjust(p, "reduce"); }}>减仓</button>
+                <button disabled={busyId === p.id} onClick={(event) => { event.preventDefault(); onClose(p.id); }}>{busyId === p.id ? "平仓中…" : "平仓"}</button>
+              </div>
             </summary>
             <div className="position-details">
               <div className="position-detail-head">
@@ -226,6 +253,7 @@ export default function Dashboard() {
   const [positions, setPositions] = useState([]);
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
+  const [adjustment, setAdjustment] = useState(null);
   const [closingId, setClosingId] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -333,6 +361,42 @@ export default function Dashboard() {
     finally { setClosingId(""); }
   }
 
+  async function adjustPosition(notionalUsdt) {
+    if (!adjustment) return;
+    setTradeBusy(true);
+    try {
+      let response;
+      if (adjustment.type === "increase") {
+        const opportunity = data?.opportunities?.find((item) =>
+          item.token.symbol === adjustment.position.token &&
+          item.long.exchange === adjustment.position.long.exchange &&
+          item.short.exchange === adjustment.position.short.exchange
+        );
+        if (!opportunity) throw new Error("当前机会列表中没有与该持仓方向一致的机会，无法安全加仓");
+        response = await fetch("/backend/trades/open", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ opportunityId: opportunity.id, notionalUsdt, leverage: adjustment.position.leverage })
+        });
+      } else {
+        response = await fetch(`/backend/positions/${adjustment.position.id}/reduce`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ notionalUsdt })
+        });
+      }
+      const json = await response.json();
+      if (!response.ok) throw new Error(json.error);
+      setNotice(json.message);
+      setAdjustment(null);
+      await loadAccount();
+    } catch (e) {
+      setNotice(`${adjustment.type === "increase" ? "加仓" : "减仓"}失败：${e.message}`);
+    } finally {
+      setTradeBusy(false);
+    }
+  }
+
   const rows = useMemo(() => {
     const list = (data?.opportunities || []).filter((x) =>
       x.token.symbol.toLowerCase().includes(query.toLowerCase()) &&
@@ -372,7 +436,7 @@ export default function Dashboard() {
 
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
 
-      <AccountBoard account={account} positions={positions} onClose={closePosition} busyId={closingId} />
+      <AccountBoard account={account} positions={positions} onClose={closePosition} onAdjust={(position, type) => setAdjustment({ position, type })} busyId={closingId} />
 
       <section className="workspace" id="opportunities">
         <div className="section-head">
@@ -422,6 +486,7 @@ export default function Dashboard() {
 
       <footer><span><ShieldCheck size={15} />数据仅供研究，不构成投资建议</span><span>ARBIVIEW / 2026</span></footer>
       {tradeItem && <TradeModal item={tradeItem} mode={account?.mode} onClose={() => setTradeItem(null)} onSubmit={openTrade} busy={tradeBusy} />}
+      {adjustment && <AdjustModal position={adjustment.position} type={adjustment.type} onClose={() => setAdjustment(null)} onSubmit={adjustPosition} busy={tradeBusy} />}
     </main>
   );
 }

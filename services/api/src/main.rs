@@ -12,7 +12,7 @@ use axum::{
 };
 use config::Config;
 use market::MarketService;
-use models::OpenTradeRequest;
+use models::{AdjustPositionRequest, OpenTradeRequest};
 use serde_json::json;
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/positions/quotes", get(position_quotes))
         .route("/api/trades/open", post(open_trade))
         .route("/api/positions/:id/close", post(close_position))
+        .route("/api/positions/:id/reduce", post(reduce_position))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -94,6 +95,14 @@ async fn close_position(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.close(&id).await?))
+}
+
+async fn reduce_position(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<AdjustPositionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.reduce(&id, request).await?))
 }
 
 struct ApiError(anyhow::Error);

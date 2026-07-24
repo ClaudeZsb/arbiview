@@ -105,6 +105,11 @@ impl MarketService {
         Ok(rates)
     }
 
+    pub async fn trading_legs(&self) -> Result<Vec<Leg>> {
+        let (binance, bybit) = tokio::try_join!(self.binance_markets(), self.bybit_markets())?;
+        Ok(binance.into_iter().chain(bybit).collect())
+    }
+
     async fn top_tokens(&self) -> Result<Vec<Token>> {
         let base = if self.config.cmc_api_key.is_empty() {
             "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/listings/latest"

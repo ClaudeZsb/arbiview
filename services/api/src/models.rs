@@ -92,6 +92,12 @@ pub struct OpenTradeRequest {
     pub leverage: u8,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustPositionRequest {
+    pub notional_usdt: f64,
+}
+
 fn default_leverage() -> u8 {
     1
 }
