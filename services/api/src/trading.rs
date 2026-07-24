@@ -1255,7 +1255,7 @@ impl TradingService {
             format_qty(qty),
             chrono::Utc::now().timestamp_millis()
         );
-        let response = match self
+        let mut response = match self
             .binance_signed(Method::POST, "/fapi/v1/order", &query, creds)
             .await
         {
@@ -1275,18 +1275,38 @@ impl TradingService {
                     })?
             }
         };
-        let status = response["status"].as_str().unwrap_or("UNKNOWN");
-        let executed = number(&response["executedQty"]).unwrap_or(0.0);
-        if status != "FILLED" && executed <= 0.0 {
-            bail!("Binance order not filled: status={status}, clientOrderId={client_order_id}");
+        let status_query = || {
+            format!(
+                "symbol={symbol}&origClientOrderId={client_order_id}&timestamp={}",
+                chrono::Utc::now().timestamp_millis()
+            )
+        };
+        let mut fill = binance_fill(&response);
+        if fill.1 <= 0.0 || fill.2 <= 0.0 {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                response = self
+                    .binance_signed(Method::GET, "/fapi/v1/order", &status_query(), creds)
+                    .await?;
+                fill = binance_fill(&response);
+                if fill.0 == "FILLED" && fill.1 > 0.0 && fill.2 > 0.0 {
+                    break;
+                }
+            }
+        }
+        if fill.1 <= 0.0 || fill.2 <= 0.0 {
+            bail!(
+                "Binance order fill data unavailable after status polling: status={}, clientOrderId={client_order_id}",
+                fill.0
+            );
         }
         Ok(OrderExecution {
             exchange: "Binance".into(),
             client_order_id: client_order_id.into(),
             order_id: response["orderId"].to_string().trim_matches('"').into(),
-            status: status.into(),
-            executed_quantity: executed,
-            average_price: number(&response["avgPrice"]).unwrap_or(0.0),
+            status: fill.0,
+            executed_quantity: fill.1,
+            average_price: fill.2,
         })
     }
 
@@ -1837,6 +1857,21 @@ fn number(value: &Value) -> Option<f64> {
         .or_else(|| value.as_f64())
 }
 
+fn binance_fill(response: &Value) -> (String, f64, f64) {
+    let status = response["status"].as_str().unwrap_or("UNKNOWN").to_string();
+    let quantity = number(&response["executedQty"])
+        .or_else(|| number(&response["cumQty"]))
+        .unwrap_or(0.0);
+    let average_price = number(&response["avgPrice"])
+        .filter(|price| *price > 0.0)
+        .or_else(|| {
+            let quote = number(&response["cumQuote"])?;
+            (quantity > 0.0).then_some(quote / quantity)
+        })
+        .unwrap_or(0.0);
+    (status, quantity, average_price)
+}
+
 fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
 }
@@ -1864,5 +1899,19 @@ mod tests {
         let quantity = floor_step(12.3456, 0.01);
         assert!(quantity <= 12.3456);
         assert!((quantity - 12.34).abs() < 1e-9);
+    }
+
+    #[test]
+    fn binance_fill_uses_cumulative_quote_when_average_price_is_zero() {
+        let response = json!({
+            "status": "FILLED",
+            "executedQty": "34.57",
+            "cumQuote": "99.80359000",
+            "avgPrice": "0"
+        });
+        let (status, quantity, average_price) = binance_fill(&response);
+        assert_eq!(status, "FILLED");
+        assert!((quantity - 34.57).abs() < 1e-9);
+        assert!((average_price - 2.887).abs() < 1e-9);
     }
 }
