@@ -186,14 +186,24 @@ function AccountBoard({ account, positions, onClose, busyId }) {
               <button disabled={busyId === p.id} onClick={(event) => { event.preventDefault(); onClose(p.id); }}>{busyId === p.id ? "平仓中…" : "双腿平仓"}</button>
             </summary>
             <div className="position-details">
+              <div className="position-detail-head">
+                <span>方向 / 交易所</span>
+                <span>合约</span>
+                <span>当前价格</span>
+                <span>开仓均价</span>
+                <span>仓位数量</span>
+                <span>未实现收益</span>
+                <span>累计 Funding</span>
+              </div>
               {[p.long, p.short].map((leg) => (
                 <div className="position-leg-detail" key={`${leg.exchange}-${leg.side}`}>
-                  <div className="leg-detail-title"><ExchangeLogo name={leg.exchange} /><b>{leg.side.toUpperCase()} · {leg.exchange}</b><span>{leg.symbol}</span></div>
-                  <div><span>当前价格</span><b>{price(leg.markPrice)}</b></div>
-                  <div><span>开仓均价</span><b>{price(leg.entryPrice)}</b></div>
-                  <div><span>仓位数量</span><b>{formatter.format(leg.quantity)}</b></div>
-                  <div><span>未实现收益</span><b className={leg.unrealizedPnl >= 0 ? "positive" : "negative"}>{money(leg.unrealizedPnl)}</b></div>
-                  <div><span>累计 Funding</span><b className={leg.fundingEarned >= 0 ? "positive" : "negative"}>{money(leg.fundingEarned)}</b></div>
+                  <div className="leg-detail-title"><i className={`side-dot ${leg.side}`} /><b>{leg.side.toUpperCase()} · {leg.exchange}</b></div>
+                  <b>{leg.symbol}</b>
+                  <b>{price(leg.markPrice)}</b>
+                  <b>{price(leg.entryPrice)}</b>
+                  <b>{formatter.format(leg.quantity)}</b>
+                  <b className={leg.unrealizedPnl >= 0 ? "positive" : "negative"}>{money(leg.unrealizedPnl)}</b>
+                  <b className={leg.fundingEarned >= 0 ? "positive" : "negative"}>{money(leg.fundingEarned)}</b>
                 </div>
               ))}
               <p>Funding 为交易所账户近 7 日该合约资金费净额；正数表示收到，负数表示支付。</p>
