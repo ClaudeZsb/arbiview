@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowDownUp, ArrowRight, ChevronDown, Clock3, Info, RefreshCw,
-  Search, ShieldCheck, SlidersHorizontal, Sparkles, TrendingUp
+  Search, ShieldCheck, SlidersHorizontal, Sparkles, TrendingUp,
+  WalletCards, X, Zap
 } from "lucide-react";
 
 const formatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 });
@@ -51,7 +52,7 @@ function Leg({ type, leg }) {
   );
 }
 
-function OpportunityCard({ item, index }) {
+function OpportunityCard({ item, index, onTrade }) {
   return (
     <article className="opportunity-card">
       <div className="rank">#{String(index + 1).padStart(2, "0")}</div>
@@ -82,7 +83,68 @@ function OpportunityCard({ item, index }) {
         <strong>{duration(item.breakEvenHours)}</strong>
         <small>含双边开平仓费</small>
       </div>
+      <button className="trade-button" onClick={() => onTrade(item)}><Zap size={13} />开仓</button>
     </article>
+  );
+}
+
+function TradeModal({ item, onClose, onSubmit, busy }) {
+  const [notional, setNotional] = useState(1000);
+  const [leverage, setLeverage] = useState(1);
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="trade-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        <div className="section-kicker"><Zap size={14} /> OPEN HEDGED POSITION</div>
+        <h3>建立 {item.token.symbol} 双腿仓位</h3>
+        <div className="trade-route">
+          <div><span>LONG · {item.long.exchange}</span><b>{price(item.long.ask)}</b></div>
+          <ArrowRight />
+          <div><span>SHORT · {item.short.exchange}</span><b>{price(item.short.bid)}</b></div>
+        </div>
+        <label>单腿名义价值（USDT）<input type="number" min="10" value={notional} onChange={(e) => setNotional(Number(e.target.value))} /></label>
+        <label>杠杆<select value={leverage} onChange={(e) => setLeverage(Number(e.target.value))}>
+          {[1, 2, 3, 5, 10, 20].map((x) => <option key={x} value={x}>{x}×</option>)}
+        </select></label>
+        <div className="trade-warning"><ShieldCheck size={16} />后端当前模式决定是否发送真实订单；paper 模式只记录模拟仓位。</div>
+        <button className="confirm-trade" disabled={busy} onClick={() => onSubmit({ opportunityId: item.id, notionalUsdt: notional, leverage })}>
+          {busy ? "正在建立双腿…" : "确认建立仓位"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AccountBoard({ account, positions, onClose, busyId }) {
+  return (
+    <section className="account-board" id="account">
+      <div className="section-head">
+        <div>
+          <div className="section-kicker"><WalletCards size={15} /> ACCOUNT & POSITIONS</div>
+          <h2>账户与持仓 <span className={`mode-badge ${account?.mode}`}>{account?.mode || "offline"}</span></h2>
+        </div>
+        <div className="configured">{account?.configuredExchanges?.length ? `已连接 ${account.configuredExchanges.join(" · ")}` : "未配置交易所账户"}</div>
+      </div>
+      <div className="account-stats">
+        <div><span>账户权益</span><strong>{price(account?.equityUsdt || 0)}</strong></div>
+        <div><span>可用余额</span><strong>{price(account?.availableUsdt || 0)}</strong></div>
+        <div><span>未实现盈亏</span><strong className={(account?.unrealizedPnl || 0) >= 0 ? "positive" : "negative"}>{price(account?.unrealizedPnl || 0)}</strong></div>
+        <div><span>活跃套利仓位</span><strong>{account?.activePositions || 0}</strong></div>
+      </div>
+      <div className="position-list">
+        {positions.length === 0 && <div className="state compact">暂无持仓，可从下方机会列表建立模拟双腿仓位</div>}
+        {positions.map((p) => (
+          <article className="position-row" key={p.id}>
+            <div><b>{p.token}/USDT</b><span>{new Date(p.openedAt).toLocaleString("zh-CN")}</span></div>
+            <div><span>LONG · {p.long.exchange}</span><b>{p.long.quantity} @ {price(p.long.entryPrice)}</b></div>
+            <div><span>SHORT · {p.short.exchange}</span><b>{p.short.quantity} @ {price(p.short.entryPrice)}</b></div>
+            <div><span>名义价值 / 杠杆</span><b>{price(p.notionalUsdt)} · {p.leverage}×</b></div>
+            <div><span>未实现盈亏</span><b className={p.unrealizedPnl >= 0 ? "positive" : "negative"}>{price(p.unrealizedPnl)}</b></div>
+            <button disabled={busyId === p.id} onClick={() => onClose(p.id)}>{busyId === p.id ? "平仓中…" : "双腿平仓"}</button>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -93,12 +155,18 @@ export default function Dashboard() {
   const [sort, setSort] = useState("apy");
   const [query, setQuery] = useState("");
   const [minApy, setMinApy] = useState(0);
+  const [account, setAccount] = useState(null);
+  const [positions, setPositions] = useState([]);
+  const [tradeItem, setTradeItem] = useState(null);
+  const [tradeBusy, setTradeBusy] = useState(false);
+  const [closingId, setClosingId] = useState("");
+  const [notice, setNotice] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch("/api/opportunities", { cache: "no-store" });
+      const response = await fetch("/backend/opportunities", { cache: "no-store" });
       const json = await response.json();
       if (!response.ok) throw new Error(json.detail || json.error);
       setData(json);
@@ -109,7 +177,51 @@ export default function Dashboard() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  const loadAccount = useCallback(async () => {
+    try {
+      const [summaryResponse, positionsResponse] = await Promise.all([
+        fetch("/backend/account/summary", { cache: "no-store" }),
+        fetch("/backend/positions", { cache: "no-store" })
+      ]);
+      const summary = await summaryResponse.json();
+      const active = await positionsResponse.json();
+      if (!summaryResponse.ok) throw new Error(summary.error);
+      if (!positionsResponse.ok) throw new Error(active.error);
+      setAccount(summary);
+      setPositions(active);
+    } catch (e) {
+      setNotice(`账户服务：${e.message}`);
+    }
+  }, []);
+
+  useEffect(() => { load(); loadAccount(); }, [load, loadAccount]);
+
+  async function openTrade(request) {
+    setTradeBusy(true);
+    try {
+      const response = await fetch("/backend/trades/open", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request)
+      });
+      const json = await response.json();
+      if (!response.ok) throw new Error(json.error);
+      setNotice(json.message);
+      setTradeItem(null);
+      await loadAccount();
+    } catch (e) { setNotice(`开仓失败：${e.message}`); }
+    finally { setTradeBusy(false); }
+  }
+
+  async function closePosition(id) {
+    setClosingId(id);
+    try {
+      const response = await fetch(`/backend/positions/${id}/close`, { method: "POST" });
+      const json = await response.json();
+      if (!response.ok) throw new Error(json.error);
+      setNotice(json.message);
+      await loadAccount();
+    } catch (e) { setNotice(`平仓失败：${e.message}`); }
+    finally { setClosingId(""); }
+  }
 
   const rows = useMemo(() => {
     const list = (data?.opportunities || []).filter((x) =>
@@ -128,6 +240,7 @@ export default function Dashboard() {
       <header className="topbar">
         <a className="brand" href="#"><span className="brand-mark">A</span>ARBIVIEW</a>
         <nav>
+          <a href="#account">账户持仓</a>
           <a className="active" href="#opportunities">套利机会</a>
           <a href="#methodology">计算说明</a>
         </nav>
@@ -146,6 +259,10 @@ export default function Dashboard() {
           <div className="highlight"><span>最高资金 APY</span><strong>{best ? pct(best.apy, 1) : "—"}</strong><small>{best ? `${best.token.symbol} · ${best.long.exchange} → ${best.short.exchange}` : "正在扫描"}</small></div>
         </div>
       </section>
+
+      {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
+
+      <AccountBoard account={account} positions={positions} onClose={closePosition} busyId={closingId} />
 
       <section className="workspace" id="opportunities">
         <div className="section-head">
@@ -182,7 +299,7 @@ export default function Dashboard() {
           {loading && !data && <div className="state"><RefreshCw className="spin" />正在扫描两个交易所的永续合约…</div>}
           {error && <div className="state error">行情连接失败：{error}<button onClick={load}>重试</button></div>}
           {!loading && !error && rows.length === 0 && <div className="state">当前筛选条件下暂无套利机会</div>}
-          {rows.map((item, i) => <OpportunityCard key={item.id} item={item} index={i} />)}
+          {rows.map((item, i) => <OpportunityCard key={item.id} item={item} index={i} onTrade={setTradeItem} />)}
         </div>
       </section>
 
@@ -194,6 +311,7 @@ export default function Dashboard() {
       </section>
 
       <footer><span><ShieldCheck size={15} />数据仅供研究，不构成投资建议</span><span>ARBIVIEW / 2026</span></footer>
+      {tradeItem && <TradeModal item={tradeItem} onClose={() => setTradeItem(null)} onSubmit={openTrade} busy={tradeBusy} />}
     </main>
   );
 }

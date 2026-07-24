@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "concurrently --kill-others --names api,web --prefix-colors cyan,green \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:web": "NODE_OPTIONS='--require ./scripts/dev-proxy.cjs' next dev --port 3000",
+    "dev:api": "cargo run -p arbiview-api",
     "build": "next build",
+    "build:api": "cargo build --release -p arbiview-api",
     "build:cloudflare": "opennextjs-cloudflare build",
     "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
     "start": "next start",
@@ -14,9 +17,11 @@
     "lucide-react": "^0.468.0",
     "next": "^15.5.21",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "undici": "^6.21.3"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^1.20.2"
+    "@opennextjs/cloudflare": "^1.20.2",
+    "concurrently": "^9.2.1"
   }
 }
