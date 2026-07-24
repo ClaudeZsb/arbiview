@@ -427,7 +427,7 @@ export default function Dashboard() {
     const connectBinanceSymbol = (item) => {
       if (stopped) return;
       const stream = `${item.symbol.toLowerCase()}@markPrice@1s`;
-      const socket = new WebSocket(`wss://fstream.binance.com/ws/${stream}`);
+      const socket = new WebSocket(`wss://fstream.binancefuture.com/ws/${stream}`);
       sockets.push(socket);
       socket.onopen = () => {
         setStreamStatus((current) => ({ ...current, Binance: "connected" }));
