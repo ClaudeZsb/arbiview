@@ -64,6 +64,7 @@ pub struct PositionLeg {
     pub entry_price: f64,
     pub mark_price: f64,
     pub unrealized_pnl: f64,
+    pub funding_earned: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

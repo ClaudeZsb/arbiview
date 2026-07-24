@@ -176,14 +176,29 @@ function AccountBoard({ account, positions, onClose, busyId }) {
       <div className="position-list">
         {positions.length === 0 && <div className="state compact">暂无持仓，可从下方机会列表建立模拟双腿仓位</div>}
         {positions.map((p) => (
-          <article className="position-row" key={p.id}>
-            <div><b>{p.token}/USDT</b><span>{new Date(p.openedAt).toLocaleString("zh-CN")}</span></div>
-            <div><span>LONG · {p.long.exchange}</span><b>{p.long.quantity} @ {price(p.long.entryPrice)}</b></div>
-            <div><span>SHORT · {p.short.exchange}</span><b>{p.short.quantity} @ {price(p.short.entryPrice)}</b></div>
-            <div><span>名义价值 / 杠杆</span><b>{price(p.notionalUsdt)} · {p.leverage}×</b></div>
-            <div><span>未实现盈亏</span><b className={p.unrealizedPnl >= 0 ? "positive" : "negative"}>{price(p.unrealizedPnl)}</b></div>
-            <button disabled={busyId === p.id} onClick={() => onClose(p.id)}>{busyId === p.id ? "平仓中…" : "双腿平仓"}</button>
-          </article>
+          <details className="position-item" key={p.id}>
+            <summary className="position-row">
+              <div className="position-token"><ChevronDown size={14} /><div><b>{p.token}/USDT</b><span>{p.openedAt > 0 ? new Date(p.openedAt).toLocaleString("zh-CN") : "交易所实时仓位"}</span></div></div>
+              <div><span>LONG · {p.long.exchange}</span><b>{p.long.quantity} @ {price(p.long.entryPrice)}</b></div>
+              <div><span>SHORT · {p.short.exchange}</span><b>{p.short.quantity} @ {price(p.short.entryPrice)}</b></div>
+              <div><span>名义价值 / 杠杆</span><b>{price(p.notionalUsdt)} · {p.leverage}×</b></div>
+              <div><span>未实现盈亏</span><b className={p.unrealizedPnl >= 0 ? "positive" : "negative"}>{price(p.unrealizedPnl)}</b></div>
+              <button disabled={busyId === p.id} onClick={(event) => { event.preventDefault(); onClose(p.id); }}>{busyId === p.id ? "平仓中…" : "双腿平仓"}</button>
+            </summary>
+            <div className="position-details">
+              {[p.long, p.short].map((leg) => (
+                <div className="position-leg-detail" key={`${leg.exchange}-${leg.side}`}>
+                  <div className="leg-detail-title"><ExchangeLogo name={leg.exchange} /><b>{leg.side.toUpperCase()} · {leg.exchange}</b><span>{leg.symbol}</span></div>
+                  <div><span>当前价格</span><b>{price(leg.markPrice)}</b></div>
+                  <div><span>开仓均价</span><b>{price(leg.entryPrice)}</b></div>
+                  <div><span>仓位数量</span><b>{formatter.format(leg.quantity)}</b></div>
+                  <div><span>未实现收益</span><b className={leg.unrealizedPnl >= 0 ? "positive" : "negative"}>{money(leg.unrealizedPnl)}</b></div>
+                  <div><span>累计 Funding</span><b className={leg.fundingEarned >= 0 ? "positive" : "negative"}>{money(leg.fundingEarned)}</b></div>
+                </div>
+              ))}
+              <p>Funding 为交易所账户近 7 日该合约资金费净额；正数表示收到，负数表示支付。</p>
+            </div>
+          </details>
         ))}
       </div>
     </section>

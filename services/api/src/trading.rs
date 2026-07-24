@@ -201,6 +201,7 @@ impl TradingService {
                 entry_price: opportunity.long.ask,
                 mark_price: opportunity.long.mark,
                 unrealized_pnl: 0.0,
+                funding_earned: 0.0,
             },
             short: PositionLeg {
                 exchange: opportunity.short.exchange,
@@ -210,6 +211,7 @@ impl TradingService {
                 entry_price: opportunity.short.bid,
                 mark_price: opportunity.short.mark,
                 unrealized_pnl: 0.0,
+                funding_earned: 0.0,
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
@@ -938,7 +940,18 @@ impl TradingService {
     }
 
     async fn live_positions(&self) -> Result<Vec<Position>> {
-        let (binance, bybit) = tokio::try_join!(self.binance_positions(), self.bybit_positions())?;
+        let (mut binance, mut bybit, binance_funding, bybit_funding) = tokio::try_join!(
+            self.binance_positions(),
+            self.bybit_positions(),
+            self.binance_funding_income(),
+            self.bybit_funding_income()
+        )?;
+        for leg in &mut binance {
+            leg.funding_earned = *binance_funding.get(&leg.symbol).unwrap_or(&0.0);
+        }
+        for leg in &mut bybit {
+            leg.funding_earned = *bybit_funding.get(&leg.symbol).unwrap_or(&0.0);
+        }
         let mut grouped: HashMap<String, Vec<PositionLeg>> = HashMap::new();
         for leg in binance.into_iter().chain(bybit) {
             grouped
@@ -952,6 +965,7 @@ impl TradingService {
                 let long = legs.iter().find(|x| x.side == "long")?.clone();
                 let short = legs.iter().find(|x| x.side == "short")?.clone();
                 let pnl = long.unrealized_pnl + short.unrealized_pnl;
+                let funding_earned = long.funding_earned + short.funding_earned;
                 Some(Position {
                     id: format!("live-{token}"),
                     token,
@@ -961,7 +975,7 @@ impl TradingService {
                     leverage: 1,
                     long,
                     short,
-                    funding_earned: 0.0,
+                    funding_earned,
                     unrealized_pnl: pnl,
                 })
             })
@@ -995,6 +1009,7 @@ impl TradingService {
                     entry_price: number(&x["entryPrice"])?,
                     mark_price: number(&x["markPrice"])?,
                     unrealized_pnl: number(&x["unRealizedProfit"]).unwrap_or(0.0),
+                    funding_earned: 0.0,
                 })
             })
             .collect())
@@ -1025,9 +1040,69 @@ impl TradingService {
                     entry_price: number(&x["avgPrice"])?,
                     mark_price: number(&x["markPrice"])?,
                     unrealized_pnl: number(&x["unrealisedPnl"]).unwrap_or(0.0),
+                    funding_earned: 0.0,
                 })
             })
             .collect())
+    }
+
+    async fn binance_funding_income(&self) -> Result<HashMap<String, f64>> {
+        let creds = self
+            .config
+            .binance
+            .as_ref()
+            .ok_or_else(|| anyhow!("Binance credentials missing"))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let start = now - 7 * 24 * 60 * 60 * 1000;
+        let query = format!(
+            "incomeType=FUNDING_FEE&startTime={start}&endTime={now}&limit=1000&timestamp={now}"
+        );
+        let json = self
+            .binance_signed(Method::GET, "/fapi/v1/income", &query, creds)
+            .await?;
+        let mut totals = HashMap::new();
+        for item in json.as_array().unwrap_or(&vec![]) {
+            if let (Some(symbol), Some(income)) = (item["symbol"].as_str(), number(&item["income"]))
+            {
+                *totals.entry(symbol.to_string()).or_insert(0.0) += income;
+            }
+        }
+        Ok(totals)
+    }
+
+    async fn bybit_funding_income(&self) -> Result<HashMap<String, f64>> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let start = now - 7 * 24 * 60 * 60 * 1000;
+        let mut cursor = None;
+        let mut totals = HashMap::new();
+        for _ in 0..20 {
+            let mut path = format!(
+                "/v5/account/transaction-log?accountType=UNIFIED&category=linear&currency=USDT&type=SETTLEMENT&startTime={start}&endTime={now}&limit=50"
+            );
+            if let Some(value) = cursor.as_deref() {
+                path.push_str("&cursor=");
+                path.push_str(value);
+            }
+            let json = self.bybit_signed(Method::GET, &path, None).await?;
+            if json["retCode"].as_i64().unwrap_or(-1) != 0 {
+                bail!("Bybit transaction log rejected: {}", json["retMsg"]);
+            }
+            for item in json["result"]["list"].as_array().unwrap_or(&vec![]) {
+                if let (Some(symbol), Some(funding)) =
+                    (item["symbol"].as_str(), number(&item["funding"]))
+                {
+                    *totals.entry(symbol.to_string()).or_insert(0.0) += funding;
+                }
+            }
+            cursor = json["result"]["nextPageCursor"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(totals)
     }
 
     async fn binance_balance(&self) -> Result<(f64, f64, f64)> {
