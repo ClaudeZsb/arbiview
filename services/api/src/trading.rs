@@ -155,6 +155,7 @@ impl TradingService {
             interval_seconds,
             status: "armed".into(),
             current_apy_percent: None,
+            consecutive_low_readings: 0,
             completed_notional_usdt: 0.0,
             created_at: now,
             updated_at: now,
@@ -226,16 +227,40 @@ impl TradingService {
                     .await;
                 continue;
             };
-            // Funding opportunities only contain positive routes. If the held route
-            // disappears, its funding APY is non-positive and therefore below any
-            // normal positive exit threshold.
-            let current_apy_percent =
-                held_route_apy_percent(position, &opportunities.opportunities);
-            self.update_auto_close(&rule.id, |rule| {
-                rule.current_apy_percent = Some(current_apy_percent)
-            })
-            .await;
-            if current_apy_percent < rule.threshold_apy_percent {
+            let Some(current_apy_percent) =
+                held_route_apy_percent(position, &opportunities.opportunities)
+            else {
+                // Absence means the token/route was not present in a complete
+                // market scan. It is missing data, never evidence of a 0% APY.
+                self.update_auto_close(&rule.id, |rule| {
+                    rule.current_apy_percent = None;
+                    rule.consecutive_low_readings = 0;
+                })
+                .await;
+                tracing::warn!(
+                    token = %position.token,
+                    rule_id = %rule.id,
+                    "auto-close skipped because held-route APY is unavailable"
+                );
+                continue;
+            };
+            let consecutive_low_readings = {
+                let mut rules = self.auto_close_rules.write().await;
+                let Some(stored) = rules.get_mut(&rule.id) else {
+                    continue;
+                };
+                stored.current_apy_percent = Some(current_apy_percent);
+                if current_apy_percent < stored.threshold_apy_percent {
+                    stored.consecutive_low_readings =
+                        stored.consecutive_low_readings.saturating_add(1);
+                } else {
+                    stored.consecutive_low_readings = 0;
+                }
+                stored.updated_at = chrono::Utc::now().timestamp_millis();
+                stored.consecutive_low_readings
+            };
+            self.persist_auto_close_rules().await;
+            if consecutive_low_readings >= 3 {
                 let claimed = {
                     let mut rules = self.auto_close_rules.write().await;
                     let Some(stored) = rules.get_mut(&rule.id) else {
@@ -2579,16 +2604,24 @@ fn load_auto_close_rules(config: &Config) -> Result<HashMap<String, AutoCloseRul
         .collect())
 }
 
-fn held_route_apy_percent(position: &Position, opportunities: &[Opportunity]) -> f64 {
+fn held_route_apy_percent(position: &Position, opportunities: &[Opportunity]) -> Option<f64> {
+    if let Some(opportunity) = opportunities.iter().find(|opportunity| {
+        opportunity.token.symbol == position.token
+            && opportunity.long.exchange == position.long.exchange
+            && opportunity.short.exchange == position.short.exchange
+    }) {
+        return Some(opportunity.apy * 100.0);
+    }
+    // The scanner only emits positive funding routes. If the reverse route is
+    // present, the held route has the exact negative APY.
     opportunities
         .iter()
         .find(|opportunity| {
             opportunity.token.symbol == position.token
-                && opportunity.long.exchange == position.long.exchange
-                && opportunity.short.exchange == position.short.exchange
+                && opportunity.long.exchange == position.short.exchange
+                && opportunity.short.exchange == position.long.exchange
         })
-        .map(|opportunity| opportunity.apy * 100.0)
-        .unwrap_or(0.0)
+        .map(|opportunity| -opportunity.apy * 100.0)
 }
 
 fn auto_close_reduction(remaining: f64, order_notional: f64, tolerance: f64) -> Option<f64> {
@@ -2630,6 +2663,81 @@ mod tests {
         // Preserve the normal 10 USDT tolerance before the final full-close order.
         assert_eq!(auto_close_reduction(105.0, 100.0, 10.0), Some(95.0));
         assert_eq!(auto_close_reduction(10.0, 100.0, 10.0), None);
+    }
+
+    #[test]
+    fn auto_close_never_treats_missing_market_data_as_zero_apy() {
+        let position = test_position();
+        assert_eq!(held_route_apy_percent(&position, &[]), None);
+
+        let reverse = Opportunity {
+            id: "DEXE-Bybit-Binance".into(),
+            token: Token {
+                symbol: "DEXE".into(),
+                name: "DeXe".into(),
+                rank: 100,
+            },
+            long: test_market_leg("Bybit"),
+            short: test_market_leg("Binance"),
+            funding_per_hour: 0.001,
+            apy: 4.0,
+            spread: 0.0,
+            fees: 0.0,
+            break_even_hours: 0.0,
+        };
+        assert_eq!(held_route_apy_percent(&position, &[reverse]), Some(-400.0));
+    }
+
+    fn test_position() -> Position {
+        Position {
+            id: "live-DEXE".into(),
+            token: "DEXE".into(),
+            status: "open".into(),
+            opened_at: 0,
+            notional_usdt: 100.0,
+            leverage: 1,
+            long: PositionLeg {
+                exchange: "Binance".into(),
+                symbol: "DEXEUSDT".into(),
+                side: "long".into(),
+                quantity: 10.0,
+                entry_price: 10.0,
+                mark_price: 10.0,
+                unrealized_pnl: 0.0,
+                funding_earned: 0.0,
+                funding_rate: 0.0,
+                leverage: 1,
+            },
+            short: PositionLeg {
+                exchange: "Bybit".into(),
+                symbol: "DEXEUSDT".into(),
+                side: "short".into(),
+                quantity: 10.0,
+                entry_price: 10.0,
+                mark_price: 10.0,
+                unrealized_pnl: 0.0,
+                funding_earned: 0.0,
+                funding_rate: 0.0,
+                leverage: 1,
+            },
+            funding_earned: 0.0,
+            unrealized_pnl: 0.0,
+        }
+    }
+
+    fn test_market_leg(exchange: &str) -> Leg {
+        Leg {
+            exchange: exchange.into(),
+            base: "DEXE".into(),
+            symbol: "DEXEUSDT".into(),
+            bid: 10.0,
+            ask: 10.0,
+            mark: 10.0,
+            rate: 0.0,
+            interval_hours: 8.0,
+            next_funding_time: 0,
+            qty_step: 0.01,
+        }
     }
 
     #[test]

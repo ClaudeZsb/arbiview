@@ -176,6 +176,8 @@ pub struct AutoCloseRule {
     pub interval_seconds: f64,
     pub status: String,
     pub current_apy_percent: Option<f64>,
+    #[serde(default)]
+    pub consecutive_low_readings: u8,
     pub completed_notional_usdt: f64,
     pub created_at: i64,
     pub updated_at: i64,
