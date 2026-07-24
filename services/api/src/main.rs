@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/opportunities", get(opportunities))
         .route("/api/account/summary", get(account_summary))
         .route("/api/positions", get(positions))
+        .route("/api/positions/quotes", get(position_quotes))
         .route("/api/trades/open", post(open_trade))
         .route("/api/positions/:id/close", post(close_position))
         .layer(cors)
@@ -73,6 +74,12 @@ async fn account_summary(
 
 async fn positions(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.positions().await?))
+}
+
+async fn position_quotes(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.position_quotes().await?))
 }
 
 async fn open_trade(

@@ -35,7 +35,9 @@ impl MarketService {
 
     pub async fn opportunities(&self) -> Result<OpportunitiesResponse> {
         if let Some((at, value)) = self.cache.read().await.as_ref() {
-            if at.elapsed() < Duration::from_secs(20) {
+            // Keep the cache slightly shorter than the UI's 20-second polling
+            // interval so each scheduled scan receives a fresh snapshot.
+            if at.elapsed() < Duration::from_secs(15) {
                 return Ok(value.clone());
             }
         }

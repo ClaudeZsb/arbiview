@@ -100,6 +100,23 @@ impl TradingService {
         }
     }
 
+    pub async fn position_quotes(&self) -> Result<Vec<PositionLeg>> {
+        match self.config.trading_mode {
+            TradingMode::Paper => Ok(self
+                .paper_positions
+                .read()
+                .await
+                .values()
+                .flat_map(|position| [position.long.clone(), position.short.clone()])
+                .collect()),
+            TradingMode::Live => {
+                let (binance, bybit) =
+                    tokio::try_join!(self.binance_positions(), self.bybit_positions())?;
+                Ok(binance.into_iter().chain(bybit).collect())
+            }
+        }
+    }
+
     pub async fn account_summary(&self) -> Result<AccountSummary> {
         let positions = self.positions().await?;
         let configured_exchanges = [

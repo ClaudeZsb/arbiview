@@ -261,7 +261,41 @@ export default function Dashboard() {
     }
   }, []);
 
-  useEffect(() => { load(); loadAccount(); }, [load, loadAccount]);
+  const loadPositionQuotes = useCallback(async () => {
+    try {
+      const response = await fetch("/backend/positions/quotes", { cache: "no-store" });
+      const quotes = await response.json();
+      if (!response.ok) throw new Error(quotes.error);
+      setPositions((current) => current.map((position) => {
+        const updateLeg = (leg) => {
+          const quote = quotes.find((item) =>
+            item.exchange === leg.exchange && item.symbol === leg.symbol && item.side === leg.side
+          );
+          return quote
+            ? { ...leg, markPrice: quote.markPrice, unrealizedPnl: quote.unrealizedPnl }
+            : leg;
+        };
+        const long = updateLeg(position.long);
+        const short = updateLeg(position.short);
+        return { ...position, long, short, unrealizedPnl: long.unrealizedPnl + short.unrealizedPnl };
+      }));
+    } catch (e) {
+      console.warn("持仓行情刷新失败", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    loadAccount();
+    const opportunityTimer = window.setInterval(load, 20_000);
+    const accountTimer = window.setInterval(loadAccount, 20_000);
+    const positionTimer = window.setInterval(loadPositionQuotes, 2_000);
+    return () => {
+      window.clearInterval(opportunityTimer);
+      window.clearInterval(accountTimer);
+      window.clearInterval(positionTimer);
+    };
+  }, [load, loadAccount, loadPositionQuotes]);
 
   async function openTrade(request) {
     setTradeBusy(true);
@@ -320,7 +354,7 @@ export default function Dashboard() {
           <a className="active" href="#opportunities">套利机会</a>
           <a href="#methodology">计算说明</a>
         </nav>
-        <div className="live-status"><i /> LIVE <span>20s refresh</span></div>
+        <div className="live-status"><i /> LIVE <span>机会 20s · 持仓 2s</span></div>
       </header>
 
       <section className="hero">
