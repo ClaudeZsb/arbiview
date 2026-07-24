@@ -15,6 +15,13 @@ function price(value) {
   return `$${value.toLocaleString("en-US", { maximumSignificantDigits: 6 })}`;
 }
 
+function money(value) {
+  return `$${Number(value || 0).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  })}`;
+}
+
 function pct(value, digits = 3) {
   return `${value >= 0 ? "+" : ""}${(value * 100).toFixed(digits)}%`;
 }
@@ -126,21 +133,22 @@ function AccountBoard({ account, positions, onClose, busyId }) {
         <div className="configured">{account?.configuredExchanges?.length ? `已连接 ${account.configuredExchanges.join(" · ")}` : "未配置交易所账户"}</div>
       </div>
       <div className="account-stats">
-        <div><span>账户权益</span><strong>{price(account?.equityUsdt || 0)}</strong></div>
-        <div><span>可用余额</span><strong>{price(account?.availableUsdt || 0)}</strong></div>
-        <div><span>未实现盈亏</span><strong className={(account?.unrealizedPnl || 0) >= 0 ? "positive" : "negative"}>{price(account?.unrealizedPnl || 0)}</strong></div>
+        <div><span>账户权益</span><strong>{money(account?.equityUsdt)}</strong></div>
+        <div><span>可用余额</span><strong>{money(account?.availableUsdt)}</strong></div>
+        <div><span>未实现盈亏</span><strong className={(account?.unrealizedPnl || 0) >= 0 ? "positive" : "negative"}>{money(account?.unrealizedPnl)}</strong></div>
         <div><span>活跃套利仓位</span><strong>{account?.activePositions || 0}</strong></div>
       </div>
       <div className="exchange-balances">
         {(account?.exchanges || []).map((item) => (
           <article key={item.exchange}>
-            <div className="exchange-balance-head"><ExchangeLogo name={item.exchange} /><b>{item.exchange}</b><span>USDT 永续账户</span></div>
-            <div><span>可用金额</span><strong>{price(item.availableUsdt)}</strong></div>
-            <div><span>账户权益</span><b>{price(item.equityUsdt)}</b></div>
-            <div><span>未实现盈亏</span><b className={item.unrealizedPnl >= 0 ? "positive" : "negative"}>{price(item.unrealizedPnl)}</b></div>
+            <div className="exchange-balance-head"><ExchangeLogo name={item.exchange} /><b>{item.exchange}</b><span>{item.exchange === "Bybit" ? "统一交易账户" : "USDT-M 永续账户"}</span></div>
+            <div><span>可用金额</span><strong>{money(item.availableUsdt)}</strong></div>
+            <div><span>账户权益</span><b>{money(item.equityUsdt)}</b></div>
+            <div><span>未实现盈亏</span><b className={item.unrealizedPnl >= 0 ? "positive" : "negative"}>{money(item.unrealizedPnl)}</b></div>
           </article>
         ))}
       </div>
+      <p className="balance-note">Bybit 可用金额为 Unified Account 的 USD 口径，会从保证金余额中扣除初始保证金、订单占用与抵押品折扣，因此可能低于账户权益。</p>
       <div className="position-list">
         {positions.length === 0 && <div className="state compact">暂无持仓，可从下方机会列表建立模拟双腿仓位</div>}
         {positions.map((p) => (
