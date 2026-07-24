@@ -66,6 +66,7 @@ pub struct PositionLeg {
     pub unrealized_pnl: f64,
     pub funding_earned: f64,
     pub funding_rate: f64,
+    pub leverage: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +97,12 @@ pub struct OpenTradeRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AdjustPositionRequest {
     pub notional_usdt: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustLeverageRequest {
+    pub leverage: u8,
 }
 
 fn default_leverage() -> u8 {

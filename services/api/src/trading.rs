@@ -97,6 +97,52 @@ impl TradingService {
         }
     }
 
+    pub async fn adjust_leverage(&self, id: &str, leverage: u8) -> Result<TradeResponse> {
+        if !(1..=20).contains(&leverage) {
+            bail!("leverage must be between 1 and 20");
+        }
+        match self.config.trading_mode {
+            TradingMode::Paper => {
+                let mut positions = self.paper_positions.write().await;
+                let position = positions
+                    .get_mut(id)
+                    .ok_or_else(|| anyhow!("position not found"))?;
+                position.leverage = leverage;
+                position.long.leverage = leverage;
+                position.short.leverage = leverage;
+                Ok(TradeResponse {
+                    position: position.clone(),
+                    mode: "paper".into(),
+                    message: format!("模拟双腿杠杆已调整为 {leverage}×"),
+                    execution: None,
+                })
+            }
+            TradingMode::Live => {
+                let position = self
+                    .live_positions()
+                    .await?
+                    .into_iter()
+                    .find(|position| position.id == id)
+                    .ok_or_else(|| anyhow!("position not found"))?;
+                tokio::try_join!(
+                    self.set_leverage(&position.long.exchange, &position.long.symbol, leverage),
+                    self.set_leverage(&position.short.exchange, &position.short.symbol, leverage)
+                )
+                .context("failed to adjust both legs' leverage")?;
+                let mut adjusted = position;
+                adjusted.leverage = leverage;
+                adjusted.long.leverage = leverage;
+                adjusted.short.leverage = leverage;
+                Ok(TradeResponse {
+                    position: adjusted,
+                    mode: "live".into(),
+                    message: format!("两家交易所杠杆已调整为 {leverage}×"),
+                    execution: None,
+                })
+            }
+        }
+    }
+
     pub async fn positions(&self) -> Result<Vec<Position>> {
         match self.config.trading_mode {
             TradingMode::Paper => Ok(self
@@ -260,6 +306,7 @@ impl TradingService {
                 unrealized_pnl: 0.0,
                 funding_earned: 0.0,
                 funding_rate: opportunity.long.rate,
+                leverage: request.leverage,
             },
             short: PositionLeg {
                 exchange: opportunity.short.exchange,
@@ -271,6 +318,7 @@ impl TradingService {
                 unrealized_pnl: 0.0,
                 funding_earned: 0.0,
                 funding_rate: opportunity.short.rate,
+                leverage: request.leverage,
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
@@ -1203,7 +1251,7 @@ impl TradingService {
                     status: "open".into(),
                     opened_at: 0,
                     notional_usdt: long.quantity * long.entry_price,
-                    leverage: 1,
+                    leverage: long.leverage,
                     long,
                     short,
                     funding_earned,
@@ -1242,6 +1290,7 @@ impl TradingService {
                     unrealized_pnl: number(&x["unRealizedProfit"]).unwrap_or(0.0),
                     funding_earned: 0.0,
                     funding_rate: 0.0,
+                    leverage: number(&x["leverage"]).unwrap_or(1.0) as u8,
                 })
             })
             .collect())
@@ -1274,6 +1323,7 @@ impl TradingService {
                     unrealized_pnl: number(&x["unrealisedPnl"]).unwrap_or(0.0),
                     funding_earned: 0.0,
                     funding_rate: 0.0,
+                    leverage: number(&x["leverage"]).unwrap_or(1.0) as u8,
                 })
             })
             .collect())

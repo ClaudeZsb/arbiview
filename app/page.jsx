@@ -137,21 +137,27 @@ function TradeModal({ item, mode, onClose, onSubmit, busy }) {
 
 function AdjustModal({ position, type, onClose, onSubmit, busy }) {
   const [notional, setNotional] = useState(20);
+  const [leverage, setLeverage] = useState(position.leverage || 1);
   const isIncrease = type === "increase";
+  const isLeverage = type === "leverage";
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="trade-modal">
         <button className="modal-close" onClick={onClose}><X /></button>
         <div className="section-kicker"><Zap size={15} /> ADJUST HEDGED POSITION</div>
-        <div className="trade-title"><h3>{isIncrease ? "增加" : "减少"} {position.token} 双腿仓位</h3></div>
-        <label>每腿调整金额（USDT）<input type="number" min="10" step="10" value={notional} onChange={(e) => setNotional(Number(e.target.value))} /></label>
-        <div className={`trade-warning ${isIncrease ? "live" : "paper"}`}><ShieldCheck size={16} />
-          {isIncrease
+        <div className="trade-title"><h3>{isLeverage ? "调整" : isIncrease ? "增加" : "减少"} {position.token} {isLeverage ? "杠杆" : "双腿仓位"}</h3></div>
+        {isLeverage
+          ? <label>目标杠杆<select value={leverage} onChange={(e) => setLeverage(Number(e.target.value))}>{[1, 2, 3, 5, 10, 20].map((value) => <option key={value} value={value}>{value}×</option>)}</select></label>
+          : <label>每腿调整金额（USDT）<input type="number" min="10" step="10" value={notional} onChange={(e) => setNotional(Number(e.target.value))} /></label>}
+        <div className={`trade-warning ${isIncrease || isLeverage ? "live" : "paper"}`}><ShieldCheck size={16} />
+          {isLeverage
+            ? "将同时修改 Binance 与 Bybit 对应合约的杠杆，不会改变当前仓位数量。提高杠杆会降低可用保证金缓冲。"
+            : isIncrease
             ? "两条腿将按该金额并发加仓，成交后根据交易所实际仓位补齐并对冲。"
             : "两条腿将按该金额并发减仓，成交后只减少较大腿完成金额对齐；全量退出请使用双腿平仓。"}
         </div>
-        <button className={`confirm-trade ${isIncrease ? "live" : ""}`} disabled={busy || notional < 10} onClick={() => onSubmit(notional)}>
-          {busy ? "正在调整双腿…" : `确认${isIncrease ? "加仓" : "减仓"}`}
+        <button className={`confirm-trade ${isIncrease || isLeverage ? "live" : ""}`} disabled={busy || (!isLeverage && notional < 10)} onClick={() => onSubmit(isLeverage ? leverage : notional)}>
+          {busy ? "正在调整双腿…" : `确认${isLeverage ? "调整杠杆" : isIncrease ? "加仓" : "减仓"}`}
         </button>
       </div>
     </div>
@@ -204,11 +210,12 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
               <div className="position-token"><ChevronDown size={14} /><div><b>{p.token}/USDT</b><span>{p.openedAt > 0 ? new Date(p.openedAt).toLocaleString("zh-CN") : "交易所实时仓位"}</span></div></div>
               <div><span>LONG · {p.long.exchange}</span><b>{p.long.quantity} @ {price(p.long.entryPrice)}</b></div>
               <div><span>SHORT · {p.short.exchange}</span><b>{p.short.quantity} @ {price(p.short.entryPrice)}</b></div>
-              <div><span>名义价值 / 杠杆</span><b>{price(p.notionalUsdt)} · {p.leverage}×</b></div>
+              <div><span>名义价值 / 杠杆</span><b>{price(p.notionalUsdt)} · {p.long.leverage === p.short.leverage ? `${p.long.leverage}×` : `${p.long.leverage}× / ${p.short.leverage}×`}</b></div>
               <div><span>未实现盈亏</span><b className={p.unrealizedPnl >= 0 ? "positive" : "negative"}>{price(p.unrealizedPnl)}</b></div>
               <div className="position-actions">
                 <button onClick={(event) => { event.preventDefault(); onAdjust(p, "increase"); }}>加仓</button>
                 <button onClick={(event) => { event.preventDefault(); onAdjust(p, "reduce"); }}>减仓</button>
+                <button onClick={(event) => { event.preventDefault(); onAdjust(p, "leverage"); }}>杠杆</button>
                 <button disabled={busyId === p.id} onClick={(event) => { event.preventDefault(); onClose(p.id); }}>{busyId === p.id ? "平仓中…" : "平仓"}</button>
               </div>
             </summary>
@@ -378,11 +385,17 @@ export default function Dashboard() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ opportunityId: opportunity.id, notionalUsdt, leverage: adjustment.position.leverage })
         });
-      } else {
+      } else if (adjustment.type === "reduce") {
         response = await fetch(`/backend/positions/${adjustment.position.id}/reduce`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ notionalUsdt })
+        });
+      } else {
+        response = await fetch(`/backend/positions/${adjustment.position.id}/leverage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ leverage: notionalUsdt })
         });
       }
       const json = await response.json();
@@ -391,7 +404,8 @@ export default function Dashboard() {
       setAdjustment(null);
       await loadAccount();
     } catch (e) {
-      setNotice(`${adjustment.type === "increase" ? "加仓" : "减仓"}失败：${e.message}`);
+      const action = adjustment.type === "increase" ? "加仓" : adjustment.type === "reduce" ? "减仓" : "调整杠杆";
+      setNotice(`${action}失败：${e.message}`);
     } finally {
       setTradeBusy(false);
     }
