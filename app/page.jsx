@@ -95,15 +95,22 @@ function OpportunityCard({ item, index, onTrade }) {
   );
 }
 
-function TradeModal({ item, onClose, onSubmit, busy }) {
+function TradeModal({ item, mode, onClose, onSubmit, busy }) {
   const [notional, setNotional] = useState(1000);
   const [leverage, setLeverage] = useState(1);
+  const isLive = mode === "live";
+  const modeKnown = mode === "live" || mode === "paper";
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="trade-modal" onMouseDown={(e) => e.stopPropagation()}>
         <button className="modal-close" onClick={onClose}><X size={18} /></button>
         <div className="section-kicker"><Zap size={14} /> OPEN HEDGED POSITION</div>
-        <h3>建立 {item.token.symbol} 双腿仓位</h3>
+        <div className="trade-title">
+          <h3>建立 {item.token.symbol} 双腿仓位</h3>
+          <span className={`execution-mode ${mode || "unknown"}`}>
+            {isLive ? "LIVE · 真实下单" : mode === "paper" ? "PAPER · 模拟交易" : "模式读取中"}
+          </span>
+        </div>
         <div className="trade-route">
           <div><span>LONG · {item.long.exchange}</span><b>{price(item.long.ask)}</b></div>
           <ArrowRight />
@@ -113,9 +120,15 @@ function TradeModal({ item, onClose, onSubmit, busy }) {
         <label>杠杆<select value={leverage} onChange={(e) => setLeverage(Number(e.target.value))}>
           {[1, 2, 3, 5, 10, 20].map((x) => <option key={x} value={x}>{x}×</option>)}
         </select></label>
-        <div className="trade-warning"><ShieldCheck size={16} />后端当前模式决定是否发送真实订单；paper 模式只记录模拟仓位。</div>
-        <button className="confirm-trade" disabled={busy} onClick={() => onSubmit({ opportunityId: item.id, notionalUsdt: notional, leverage })}>
-          {busy ? "正在建立双腿…" : "确认建立仓位"}
+        <div className={`trade-warning ${isLive ? "live" : "paper"}`}><ShieldCheck size={16} />
+          {isLive
+            ? "真实交易模式：确认后将立即向 Binance 与 Bybit 提交真实市价单。"
+            : mode === "paper"
+              ? "模拟交易模式：只在后端记录模拟仓位，不会向交易所发送订单。"
+              : "尚未读取后端交易模式，暂时禁止提交。"}
+        </div>
+        <button className={`confirm-trade ${isLive ? "live" : ""}`} disabled={busy || !modeKnown} onClick={() => onSubmit({ opportunityId: item.id, notionalUsdt: notional, leverage })}>
+          {busy ? "正在建立双腿…" : isLive ? "确认真实下单" : "确认模拟开仓"}
         </button>
       </div>
     </div>
@@ -329,7 +342,7 @@ export default function Dashboard() {
       </section>
 
       <footer><span><ShieldCheck size={15} />数据仅供研究，不构成投资建议</span><span>ARBIVIEW / 2026</span></footer>
-      {tradeItem && <TradeModal item={tradeItem} onClose={() => setTradeItem(null)} onSubmit={openTrade} busy={tradeBusy} />}
+      {tradeItem && <TradeModal item={tradeItem} mode={account?.mode} onClose={() => setTradeItem(null)} onSubmit={openTrade} busy={tradeBusy} />}
     </main>
   );
 }

@@ -134,7 +134,12 @@ h1 em { color: var(--green); font-style: normal; }
 .modal-backdrop { position: fixed; z-index: 50; inset: 0; background: rgba(12,26,22,.6); backdrop-filter: blur(5px); display: grid; place-items: center; padding: 20px; }
 .trade-modal { width: min(510px, 100%); background: var(--white); padding: 31px; box-shadow: 0 30px 80px rgba(0,0,0,.28); position: relative; }
 .modal-close { position: absolute; right: 18px; top: 18px; border: 0; background: transparent; color: var(--muted); }
-.trade-modal h3 { font-size: 25px; letter-spacing: -.04em; margin: 12px 0 22px; }
+.trade-title { display: flex; align-items: center; gap: 13px; margin: 12px 0 22px; flex-wrap: wrap; }
+.trade-modal h3 { font-size: 25px; letter-spacing: -.04em; margin: 0; }
+.execution-mode { font: 600 9px DM Mono, monospace; letter-spacing: .07em; padding: 6px 8px; border-radius: 3px; }
+.execution-mode.live { color: #b72f20; background: #ffe5df; border: 1px solid #f2b5aa; }
+.execution-mode.paper { color: #84600d; background: #fff1c7; border: 1px solid #ead184; }
+.execution-mode.unknown { color: var(--muted); background: #edf1ef; border: 1px solid var(--line); }
 .trade-route { display: grid; grid-template-columns: 1fr 30px 1fr; gap: 10px; align-items: center; background: #edf3ef; padding: 15px; margin-bottom: 20px; }
 .trade-route > div { display: flex; flex-direction: column; gap: 6px; }
 .trade-route span { color: var(--muted); font-size: 9px; }
@@ -143,7 +148,10 @@ h1 em { color: var(--green); font-style: normal; }
 .trade-modal > label { display: grid; grid-template-columns: 1fr 180px; align-items: center; font-size: 11px; margin-top: 11px; }
 .trade-modal input, .trade-modal select { height: 40px; border: 1px solid var(--line); padding: 0 11px; background: white; outline: 0; }
 .trade-warning { display: flex; gap: 8px; color: #78611e; background: #fff5d9; padding: 12px; font-size: 9px; line-height: 1.5; margin-top: 18px; }
+.trade-warning.live { color: #9f2f20; background: #ffe9e4; border: 1px solid #efb9af; }
 .confirm-trade { width: 100%; height: 45px; margin-top: 12px; border: 0; background: var(--ink); color: white; font-weight: 700; }
+.confirm-trade.live { background: #bd3e29; }
+.confirm-trade:disabled { opacity: .5; cursor: not-allowed; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
