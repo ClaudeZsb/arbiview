@@ -106,6 +106,9 @@ impl TelegramBot {
                     {"command": "reduce", "description": "减仓：TOKEN 金额"},
                     {"command": "leverage", "description": "调整杠杆：TOKEN 杠杆"},
                     {"command": "close", "description": "完全平仓：TOKEN"},
+                    {"command": "autoclose", "description": "设置 APY 自动平仓"},
+                    {"command": "autoclose_list", "description": "查询自动平仓规则"},
+                    {"command": "autoclose_cancel", "description": "取消自动平仓规则"},
                     {"command": "help", "description": "显示使用帮助"}
                 ]
             }),
@@ -265,6 +268,29 @@ impl TelegramBot {
                 )
                 .await
             }
+            "/autoclose" => {
+                let token = parts.next().ok_or_else(|| {
+                    anyhow!("用法：/autoclose TOKEN APY阈值 [单笔金额] [间隔秒数]")
+                })?;
+                let threshold = parse_f64(parts.next(), "APY 阈值")?;
+                let order_notional = parts.next().unwrap_or("100").parse::<f64>()?;
+                let interval = parts.next().unwrap_or("2").parse::<f64>()?;
+                let position = self.find_position_by_token(token).await?;
+                self.confirm_auto_close(&position, threshold, order_notional, interval)
+                    .await
+            }
+            "/autoclose_list" => self.show_auto_close_rules().await,
+            "/autoclose_cancel" => {
+                let id = parts
+                    .next()
+                    .ok_or_else(|| anyhow!("用法：/autoclose_cancel RULE_ID"))?;
+                let rule = self.state.trading.cancel_auto_close(id).await?;
+                self.send(
+                    &format!("✅ 已取消 <b>{}</b> 的自动平仓规则", html(&rule.token)),
+                    vec![vec![button("查看规则", "al")]],
+                )
+                .await
+            }
             _ => {
                 self.send("未知命令。使用 /help 查看可用命令。", vec![])
                     .await
@@ -278,6 +304,7 @@ impl TelegramBot {
             ["opps"] => self.show_opportunities().await,
             ["pos"] => self.show_positions().await,
             ["acct"] => self.show_account().await,
+            ["al"] => self.show_auto_close_rules().await,
             ["o", token, long, short] => {
                 let opportunity = self
                     .find_opportunity(token, Some(long), Some(short))
@@ -426,6 +453,45 @@ impl TelegramBot {
                         html(&response.position.token)
                     ),
                     vec![vec![button("查看持仓", "pos")]],
+                )
+                .await
+            }
+            ["auc", id, threshold, amount, interval] => {
+                let position = self.find_position(id).await?;
+                self.confirm_auto_close(
+                    &position,
+                    threshold.parse()?,
+                    amount.parse()?,
+                    interval.parse()?,
+                )
+                .await
+            }
+            ["aux", id, threshold, amount, interval] => {
+                let rule = self
+                    .state
+                    .trading
+                    .set_auto_close(id, threshold.parse()?, amount.parse()?, interval.parse()?)
+                    .await?;
+                self.send(
+                    &format!(
+                        "✅ 自动平仓已启用\n<b>{}</b> APY 低于 {:.1}% 时触发\n每单 ${:.2} · 间隔 {:.1}s · 直到全部平仓",
+                        html(&rule.token),
+                        rule.threshold_apy_percent,
+                        rule.order_notional_usdt,
+                        rule.interval_seconds
+                    ),
+                    vec![vec![
+                        button("查看规则", "al"),
+                        button("返回持仓", &format!("p|{}", rule.position_id)),
+                    ]],
+                )
+                .await
+            }
+            ["ax", id] => {
+                let rule = self.state.trading.cancel_auto_close(id).await?;
+                self.send(
+                    &format!("✅ 已取消 <b>{}</b> 的自动平仓规则", html(&rule.token)),
+                    vec![vec![button("查看规则", "al")]],
                 )
                 .await
             }
@@ -616,10 +682,79 @@ impl TelegramBot {
         .await
     }
 
+    async fn confirm_auto_close(
+        &self,
+        position: &Position,
+        threshold: f64,
+        order_notional: f64,
+        interval: f64,
+    ) -> Result<()> {
+        if order_notional < 10.0 || interval < 0.5 {
+            return Err(anyhow!("单笔金额至少 10 USDT，间隔至少 0.5 秒"));
+        }
+        self.send(
+            &format!(
+                "⚠️ 确认启用自动平仓？\n<b>{}</b>\nAPY 低于 {:.1}% 时触发\n每单 ${:.2} · 间隔 {:.1}s · 直到全部平仓",
+                html(&position.token),
+                threshold,
+                order_notional,
+                interval
+            ),
+            vec![vec![
+                button(
+                    "确认启用",
+                    &format!(
+                        "aux|{}|{}|{}|{}",
+                        position.id, threshold, order_notional, interval
+                    ),
+                ),
+                button("取消", &format!("p|{}", position.id)),
+            ]],
+        )
+        .await
+    }
+
+    async fn show_auto_close_rules(&self) -> Result<()> {
+        let rules = self.state.trading.auto_close_rules().await;
+        let active = rules
+            .iter()
+            .filter(|rule| matches!(rule.status.as_str(), "armed" | "triggered" | "closing"))
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            return self.send("当前没有生效中的自动平仓规则。", vec![]).await;
+        }
+        let mut text = String::from("<b>自动平仓规则</b>\n\n");
+        let mut keyboard = vec![];
+        for rule in active {
+            let current = rule
+                .current_apy_percent
+                .map(|value| format!("{value:.1}%"))
+                .unwrap_or_else(|| "等待检查".into());
+            text.push_str(&format!(
+                "<b>{}</b> · {}\n当前 APY {} / 阈值 {:.1}%\n每单 ${:.2} · {:.1}s · 已执行 ${:.2}\n\n",
+                html(&rule.token),
+                html(&rule.status),
+                current,
+                rule.threshold_apy_percent,
+                rule.order_notional_usdt,
+                rule.interval_seconds,
+                rule.completed_notional_usdt
+            ));
+            if rule.status == "armed" {
+                keyboard.push(vec![button(
+                    &format!("取消 {}", rule.token),
+                    &format!("ax|{}", rule.id),
+                )]);
+            }
+        }
+        keyboard.push(vec![button("刷新", "al"), button("持仓", "pos")]);
+        self.send(&text, keyboard).await
+    }
+
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/open TOKEN 金额 [杠杆] — 开仓或加仓\n/reduce TOKEN 金额 — 减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/open TOKEN 金额 [杠杆] — 开仓或加仓\n/reduce TOKEN 金额 — 减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/autoclose DEXE 300 100 2</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![
@@ -749,6 +884,7 @@ fn position_keyboard(position: &Position) -> Keyboard {
             button("加仓 $100", &format!("ac|{id}|100")),
             button("加仓 $500", &format!("ac|{id}|500")),
         ],
+        vec![button("APY<300% 自动全平", &format!("auc|{id}|300|100|2"))],
         vec![
             button("减仓 $100", &format!("rc|{id}|100")),
             button("减仓 $500", &format!("rc|{id}|500")),

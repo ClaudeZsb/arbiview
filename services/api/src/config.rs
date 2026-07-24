@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct ExchangeCredentials {
@@ -31,6 +32,7 @@ pub struct Config {
     pub max_slippage_bps: u32,
     pub position_tolerance_usdt: f64,
     pub telegram: Option<TelegramConfig>,
+    pub auto_close_state_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -68,6 +70,10 @@ impl Config {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(10.0),
             telegram: telegram_config()?,
+            auto_close_state_path: std::env::var("AUTO_CLOSE_STATE_PATH")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from),
         })
     }
 }

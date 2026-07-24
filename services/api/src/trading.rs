@@ -91,10 +91,12 @@ pub struct TradingService {
     funding_cache: Arc<RwLock<FundingCache>>,
     income_refresh_lock: Arc<Mutex<()>>,
     batch_tasks: Arc<RwLock<HashMap<String, BatchIncreaseTask>>>,
+    auto_close_rules: Arc<RwLock<HashMap<String, AutoCloseRule>>>,
 }
 
 impl TradingService {
     pub fn new(config: Config, market: MarketService) -> Result<Self> {
+        let auto_close_rules = load_auto_close_rules(&config)?;
         Ok(Self {
             config,
             market,
@@ -103,7 +105,269 @@ impl TradingService {
             funding_cache: Arc::new(RwLock::new(None)),
             income_refresh_lock: Arc::new(Mutex::new(())),
             batch_tasks: Arc::new(RwLock::new(HashMap::new())),
+            auto_close_rules: Arc::new(RwLock::new(auto_close_rules)),
         })
+    }
+
+    pub fn spawn_auto_close_monitor(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            // Give market/account services time to warm up before the first evaluation.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            loop {
+                if let Err(error) = service.evaluate_auto_close_rules().await {
+                    tracing::warn!("auto-close evaluation failed: {error:#}");
+                }
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
+    }
+
+    pub async fn set_auto_close(
+        &self,
+        position_id: &str,
+        threshold_apy_percent: f64,
+        order_notional_usdt: f64,
+        interval_seconds: f64,
+    ) -> Result<AutoCloseRule> {
+        if !(-100_000.0..=100_000.0).contains(&threshold_apy_percent) {
+            bail!("threshold APY must be between -100000% and 100000%");
+        }
+        if !(10.0..=1_000_000.0).contains(&order_notional_usdt) {
+            bail!("order notional must be between 10 and 1,000,000 USDT");
+        }
+        if !(0.5..=3_600.0).contains(&interval_seconds) {
+            bail!("interval must be between 0.5 and 3,600 seconds");
+        }
+        let position = self
+            .positions()
+            .await?
+            .into_iter()
+            .find(|position| position.id == position_id)
+            .ok_or_else(|| anyhow!("position not found"))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let rule = AutoCloseRule {
+            id: Uuid::new_v4().to_string(),
+            position_id: position.id.clone(),
+            token: position.token,
+            threshold_apy_percent,
+            order_notional_usdt,
+            interval_seconds,
+            status: "armed".into(),
+            current_apy_percent: None,
+            completed_notional_usdt: 0.0,
+            created_at: now,
+            updated_at: now,
+            triggered_at: None,
+            error: None,
+        };
+        let mut rules = self.auto_close_rules.write().await;
+        for existing in rules
+            .values_mut()
+            .filter(|existing| existing.position_id == position.id && existing.status == "armed")
+        {
+            existing.status = "replaced".into();
+            existing.updated_at = now;
+        }
+        rules.insert(rule.id.clone(), rule.clone());
+        drop(rules);
+        self.persist_auto_close_rules().await;
+        Ok(rule)
+    }
+
+    pub async fn auto_close_rules(&self) -> Vec<AutoCloseRule> {
+        let mut rules = self
+            .auto_close_rules
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        rules.sort_by_key(|rule| std::cmp::Reverse(rule.created_at));
+        rules
+    }
+
+    pub async fn cancel_auto_close(&self, id: &str) -> Result<AutoCloseRule> {
+        let mut rules = self.auto_close_rules.write().await;
+        let rule = rules
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("auto-close rule not found"))?;
+        if rule.status != "armed" {
+            bail!("only an armed auto-close rule can be cancelled");
+        }
+        rule.status = "cancelled".into();
+        rule.updated_at = chrono::Utc::now().timestamp_millis();
+        let result = rule.clone();
+        drop(rules);
+        self.persist_auto_close_rules().await;
+        Ok(result)
+    }
+
+    async fn evaluate_auto_close_rules(&self) -> Result<()> {
+        let armed = self
+            .auto_close_rules
+            .read()
+            .await
+            .values()
+            .filter(|rule| rule.status == "armed")
+            .cloned()
+            .collect::<Vec<_>>();
+        if armed.is_empty() {
+            return Ok(());
+        }
+        let positions = self.positions().await?;
+        let opportunities = self.market.opportunities().await?;
+        for rule in armed {
+            let Some(position) = positions
+                .iter()
+                .find(|position| position.id == rule.position_id)
+            else {
+                self.update_auto_close(&rule.id, |rule| rule.status = "completed".into())
+                    .await;
+                continue;
+            };
+            // Funding opportunities only contain positive routes. If the held route
+            // disappears, its funding APY is non-positive and therefore below any
+            // normal positive exit threshold.
+            let current_apy_percent =
+                held_route_apy_percent(position, &opportunities.opportunities);
+            self.update_auto_close(&rule.id, |rule| {
+                rule.current_apy_percent = Some(current_apy_percent)
+            })
+            .await;
+            if current_apy_percent < rule.threshold_apy_percent {
+                let claimed = {
+                    let mut rules = self.auto_close_rules.write().await;
+                    let Some(stored) = rules.get_mut(&rule.id) else {
+                        continue;
+                    };
+                    if stored.status != "armed" {
+                        false
+                    } else {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        stored.status = "triggered".into();
+                        stored.triggered_at = Some(now);
+                        stored.updated_at = now;
+                        true
+                    }
+                };
+                if claimed {
+                    let service = self.clone();
+                    tokio::spawn(async move {
+                        service.run_auto_close(rule).await;
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_auto_close(&self, rule: AutoCloseRule) {
+        self.update_auto_close(&rule.id, |rule| rule.status = "closing".into())
+            .await;
+        loop {
+            let position = match self.positions().await.map(|positions| {
+                positions
+                    .into_iter()
+                    .find(|position| position.id == rule.position_id)
+            }) {
+                Ok(Some(position)) => position,
+                Ok(None) => {
+                    self.update_auto_close(&rule.id, |rule| rule.status = "completed".into())
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    self.fail_auto_close(&rule.id, error).await;
+                    return;
+                }
+            };
+            let remaining = position.notional_usdt;
+            let result = match auto_close_reduction(
+                remaining,
+                rule.order_notional_usdt,
+                self.config.position_tolerance_usdt,
+            ) {
+                Some(amount) => {
+                    self.reduce(
+                        &rule.position_id,
+                        AdjustPositionRequest {
+                            notional_usdt: amount,
+                        },
+                    )
+                    .await
+                }
+                None => self.close(&rule.position_id).await,
+            };
+            match result {
+                Ok(response) => {
+                    let reduced = if response.position.status == "closed" {
+                        remaining
+                    } else {
+                        (remaining - response.position.notional_usdt).max(0.0)
+                    };
+                    self.update_auto_close(&rule.id, |rule| {
+                        rule.completed_notional_usdt += reduced
+                    })
+                    .await;
+                    if response.position.status == "closed" {
+                        self.update_auto_close(&rule.id, |rule| rule.status = "completed".into())
+                            .await;
+                        return;
+                    }
+                }
+                Err(error) => {
+                    self.fail_auto_close(&rule.id, error).await;
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs_f64(rule.interval_seconds)).await;
+        }
+    }
+
+    async fn update_auto_close<F>(&self, id: &str, update: F)
+    where
+        F: FnOnce(&mut AutoCloseRule),
+    {
+        if let Some(rule) = self.auto_close_rules.write().await.get_mut(id) {
+            update(rule);
+            rule.updated_at = chrono::Utc::now().timestamp_millis();
+        }
+        self.persist_auto_close_rules().await;
+    }
+
+    async fn fail_auto_close(&self, id: &str, error: anyhow::Error) {
+        self.update_auto_close(id, |rule| {
+            rule.status = "failed".into();
+            rule.error = Some(format!("{error:#}"));
+        })
+        .await;
+    }
+
+    async fn persist_auto_close_rules(&self) {
+        let Some(path) = self.config.auto_close_state_path.as_ref() else {
+            return;
+        };
+        let rules = self.auto_close_rules.read().await;
+        let data = match serde_json::to_vec_pretty(&rules.values().collect::<Vec<_>>()) {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::error!("failed to serialize auto-close rules: {error}");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::error!("failed to create auto-close state directory: {error}");
+                return;
+            }
+        }
+        let temporary = path.with_extension("tmp");
+        if let Err(error) =
+            std::fs::write(&temporary, data).and_then(|_| std::fs::rename(&temporary, path))
+        {
+            tracing::error!("failed to persist auto-close rules: {error}");
+        }
     }
 
     pub async fn open(&self, request: OpenTradeRequest) -> Result<TradeResponse> {
@@ -2263,6 +2527,52 @@ fn weighted_average(
     }
 }
 
+fn load_auto_close_rules(config: &Config) -> Result<HashMap<String, AutoCloseRule>> {
+    let Some(path) = config.auto_close_state_path.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => {
+            return Err(error).context("failed to read auto-close state");
+        }
+    };
+    let mut rules = serde_json::from_slice::<Vec<AutoCloseRule>>(&data)
+        .context("failed to parse auto-close state")?;
+    for rule in &mut rules {
+        // A process restart interrupts an in-flight close loop. Re-arm it so
+        // the monitor resumes safely from the exchange's actual remaining size.
+        if matches!(rule.status.as_str(), "triggered" | "closing") {
+            rule.status = "armed".into();
+        }
+    }
+    Ok(rules
+        .into_iter()
+        .map(|rule| (rule.id.clone(), rule))
+        .collect())
+}
+
+fn held_route_apy_percent(position: &Position, opportunities: &[Opportunity]) -> f64 {
+    opportunities
+        .iter()
+        .find(|opportunity| {
+            opportunity.token.symbol == position.token
+                && opportunity.long.exchange == position.long.exchange
+                && opportunity.short.exchange == position.short.exchange
+        })
+        .map(|opportunity| opportunity.apy * 100.0)
+        .unwrap_or(0.0)
+}
+
+fn auto_close_reduction(remaining: f64, order_notional: f64, tolerance: f64) -> Option<f64> {
+    if remaining <= order_notional {
+        return None;
+    }
+    let amount = order_notional.min((remaining - tolerance).max(0.0));
+    (amount >= 10.0).then_some(amount)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2286,6 +2596,14 @@ mod tests {
         assert_eq!(status, "FILLED");
         assert!((quantity - 34.57).abs() < 1e-9);
         assert!((average_price - 2.887).abs() < 1e-9);
+    }
+
+    #[test]
+    fn auto_close_batches_never_exceed_configured_order_size() {
+        assert_eq!(auto_close_reduction(1_005.0, 100.0, 10.0), Some(100.0));
+        // Preserve the normal 10 USDT tolerance before the final full-close order.
+        assert_eq!(auto_close_reduction(105.0, 100.0, 10.0), Some(95.0));
+        assert_eq!(auto_close_reduction(10.0, 100.0, 10.0), None);
     }
 
     #[test]

@@ -165,6 +165,24 @@ pub struct BatchIncreaseTask {
     pub logs: Vec<BatchExecutionLog>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCloseRule {
+    pub id: String,
+    pub position_id: String,
+    pub token: String,
+    pub threshold_apy_percent: f64,
+    pub order_notional_usdt: f64,
+    pub interval_seconds: f64,
+    pub status: String,
+    pub current_apy_percent: Option<f64>,
+    pub completed_notional_usdt: f64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub triggered_at: Option<i64>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdjustPositionRequest {

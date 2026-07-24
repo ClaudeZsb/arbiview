@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let market = MarketService::new(config.clone())?;
     let trading = TradingService::new(config.clone(), market.clone())?;
     let state = Arc::new(AppState { market, trading });
+    state.trading.spawn_auto_close_monitor();
     if let Some(telegram) = config.telegram.clone() {
         telegram::spawn(telegram, state.clone());
     }

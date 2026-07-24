@@ -76,6 +76,7 @@ Rust 后端可像 Freqtrade 一样以 Telegram long polling 方式运行 Bot。B
 - `/positions` 查询持仓，并执行加仓、减仓、调整杠杆和完全平仓；
 - `/account` 查询各交易所余额和账户盈亏；
 - `/open TOKEN 金额 [杠杆]`、`/reduce TOKEN 金额`、`/leverage TOKEN 杠杆`、`/close TOKEN` 精确管理仓位。
+- `/autoclose TOKEN APY阈值 [单笔金额] [间隔秒数]` 设置资金 APY 跌破阈值后的批量全平；例如 `/autoclose DEXE 300 100 2`。
 
 所有会修改仓位的操作都需要二次确认。Bot 首先校验 `chat_id`，配置 `TELEGRAM_AUTHORIZED_USERS` 后还会校验发出命令的用户 ID；群组 Topic 可通过 `TELEGRAM_TOPIC_ID` 限定。
 
@@ -87,6 +88,9 @@ TELEGRAM_BOT_TOKEN=123456:replace-me
 TELEGRAM_CHAT_ID=123456789
 TELEGRAM_TOPIC_ID=
 TELEGRAM_AUTHORIZED_USERS=123456789
+AUTO_CLOSE_STATE_PATH=/opt/arbiview/data/auto-close-rules.json
 ```
 
 不要让两个进程使用同一个 Bot Token 同时执行 long polling，否则它们会争抢 updates。配置修改后重启 `arbiview-api` 即可。
+
+自动平仓监控每 15 秒检查一次持仓原方向的资金 APY。触发后每批订单不超过配置金额，最后一批会按实际剩余仓位全平；规则持久化后，后端重启会从交易所实际剩余仓位继续执行。
