@@ -250,7 +250,7 @@ export default function Dashboard() {
         ?.map((order) => `${order.exchange} ${order.status} #${order.orderId}`)
         .join(" · ");
       const balanceSummary = json.execution
-        ? `Long ${money(json.execution.longNotionalUsdt)} / Short ${money(json.execution.shortNotionalUsdt)} · 补单 ${json.execution.supplementOrders?.length || 0} · 对齐减仓 ${json.execution.rebalanceOrders?.length || 0}`
+        ? `Long ${money(json.execution.longNotionalUsdt)} / Short ${money(json.execution.shortNotionalUsdt)} · 第一阶段补单 ${json.execution.supplementOrders?.length || 0}（L ${json.execution.phaseOneLongAttempts || 0} / S ${json.execution.phaseOneShortAttempts || 0} 次）· 第二阶段减仓 ${json.execution.rebalanceOrders?.length || 0}（${json.execution.phaseTwoAttempts || 0} 次）`
         : "";
       setNotice([json.message, balanceSummary, orderSummary].filter(Boolean).join(" · "));
       setTradeItem(null);
