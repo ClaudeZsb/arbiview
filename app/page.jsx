@@ -424,26 +424,23 @@ export default function Dashboard() {
     };
 
     const binanceSymbols = subscriptions.filter((item) => item.exchange === "Binance");
-    const connectBinance = () => {
-      if (stopped || binanceSymbols.length === 0) return;
-      const streams = binanceSymbols
-        .map((item) => `${item.symbol.toLowerCase()}@markPrice@1s`)
-      const socket = new WebSocket("wss://fstream.binance.com/ws");
+    const connectBinanceSymbol = (item) => {
+      if (stopped) return;
+      const stream = `${item.symbol.toLowerCase()}@markPrice@1s`;
+      const socket = new WebSocket(`wss://fstream.binance.com/ws/${stream}`);
       sockets.push(socket);
       socket.onopen = () => {
         setStreamStatus((current) => ({ ...current, Binance: "connected" }));
-        socket.send(JSON.stringify({ method: "SUBSCRIBE", params: streams, id: Date.now() }));
       };
       socket.onmessage = (event) => {
         const message = JSON.parse(event.data);
-        if (message.result !== undefined) return;
         const quote = message.data || message;
         setStreamStatus((current) => ({ ...current, Binance: "live" }));
         updateQuote("Binance", quote.s, Number(quote.p), Number(quote.r));
       };
       socket.onclose = () => {
         setStreamStatus((current) => ({ ...current, Binance: "reconnecting" }));
-        reconnect(connectBinance);
+        reconnect(() => connectBinanceSymbol(item));
       };
       socket.onerror = () => socket.close();
     };
@@ -481,7 +478,7 @@ export default function Dashboard() {
       socket.onerror = () => socket.close();
     };
 
-    connectBinance();
+    binanceSymbols.forEach(connectBinanceSymbol);
     connectBybit();
     return () => {
       stopped = true;
