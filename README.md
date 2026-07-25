@@ -76,6 +76,7 @@ Rust 后端可像 Freqtrade 一样以 Telegram long polling 方式运行 Bot。B
 - `/positions` 查询持仓，并执行加仓、减仓、调整杠杆和完全平仓；
 - `/account` 查询各交易所余额和账户盈亏；
 - `/open TOKEN 金额 [杠杆]`、`/reduce TOKEN 金额`、`/leverage TOKEN 杠杆`、`/close TOKEN` 精确管理仓位。
+- `/batch_open TOKEN 目标金额 单笔金额 间隔秒数 [杠杆]` 与 `/batch_reduce TOKEN 目标金额 单笔金额 间隔秒数` 启动可查询进度、查看成交并可取消的批量任务。
 - `/autoclose TOKEN APY阈值 [单笔金额] [间隔秒数]` 设置资金 APY 跌破阈值后的批量全平；例如 `/autoclose DEXE 300 100 2`。
 
 所有会修改仓位的操作都需要二次确认。Bot 首先校验 `chat_id`，配置 `TELEGRAM_AUTHORIZED_USERS` 后还会校验发出命令的用户 ID；群组 Topic 可通过 `TELEGRAM_TOPIC_ID` 限定。

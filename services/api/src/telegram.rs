@@ -1,6 +1,9 @@
 use crate::{
     config::TelegramConfig,
-    models::{AdjustPositionRequest, OpenTradeRequest, Opportunity, Position},
+    models::{
+        AdjustPositionRequest, BatchIncreaseRequest, BatchIncreaseTask, BatchReduceRequest,
+        OpenTradeRequest, Opportunity, Position,
+    },
     AppState,
 };
 use anyhow::{anyhow, Context, Result};
@@ -103,7 +106,9 @@ impl TelegramBot {
                     {"command": "positions", "description": "查询和管理当前仓位"},
                     {"command": "account", "description": "查询账户余额和盈亏"},
                     {"command": "open", "description": "开仓：TOKEN 金额 [杠杆]"},
+                    {"command": "batch_open", "description": "批量开仓：TOKEN 目标 单笔 间隔 [杠杆]"},
                     {"command": "reduce", "description": "减仓：TOKEN 金额"},
+                    {"command": "batch_reduce", "description": "批量减仓：TOKEN 目标 单笔 间隔"},
                     {"command": "leverage", "description": "调整杠杆：TOKEN 杠杆"},
                     {"command": "close", "description": "完全平仓：TOKEN"},
                     {"command": "autoclose", "description": "设置 APY 自动平仓"},
@@ -209,6 +214,18 @@ impl TelegramBot {
                 let opportunity = self.find_opportunity(token, None, None).await?;
                 self.confirm_open(&opportunity, notional, leverage).await
             }
+            "/batch_open" => {
+                let token = parts.next().ok_or_else(|| {
+                    anyhow!("用法：/batch_open TOKEN 目标金额 单笔金额 间隔秒数 [杠杆]")
+                })?;
+                let target = parse_f64(parts.next(), "目标金额")?;
+                let order = parse_f64(parts.next(), "单笔金额")?;
+                let interval = parse_f64(parts.next(), "间隔秒数")?;
+                let leverage = parts.next().unwrap_or("1").parse::<u8>()?;
+                let opportunity = self.find_opportunity(token, None, None).await?;
+                self.confirm_batch_open(&opportunity, target, order, interval, leverage)
+                    .await
+            }
             "/reduce" => {
                 let token = parts
                     .next()
@@ -227,6 +244,17 @@ impl TelegramBot {
                     ]],
                 )
                 .await
+            }
+            "/batch_reduce" => {
+                let token = parts.next().ok_or_else(|| {
+                    anyhow!("用法：/batch_reduce TOKEN 目标金额 单笔金额 间隔秒数")
+                })?;
+                let target = parse_f64(parts.next(), "目标金额")?;
+                let order = parse_f64(parts.next(), "单笔金额")?;
+                let interval = parse_f64(parts.next(), "间隔秒数")?;
+                let position = self.find_position_by_token(token).await?;
+                self.confirm_batch_reduce(&position, target, order, interval)
+                    .await
             }
             "/leverage" => {
                 let token = parts
@@ -305,6 +333,10 @@ impl TelegramBot {
             ["pos"] => self.show_positions().await,
             ["acct"] => self.show_account().await,
             ["al"] => self.show_auto_close_rules().await,
+            ["bt", id] => {
+                let task = self.state.trading.batch_task(id).await?;
+                self.show_batch_task(&task).await
+            }
             ["o", token, long, short] => {
                 let opportunity = self
                     .find_opportunity(token, Some(long), Some(short))
@@ -345,6 +377,36 @@ impl TelegramBot {
                     position_keyboard(&response.position),
                 )
                 .await
+            }
+            ["boc", token, long, short, target, order, interval, leverage] => {
+                let opportunity = self
+                    .find_opportunity(token, Some(long), Some(short))
+                    .await?;
+                self.confirm_batch_open(
+                    &opportunity,
+                    target.parse()?,
+                    order.parse()?,
+                    interval.parse()?,
+                    leverage.parse()?,
+                )
+                .await
+            }
+            ["box", token, long, short, target, order, interval, leverage] => {
+                let opportunity = self
+                    .find_opportunity(token, Some(long), Some(short))
+                    .await?;
+                let task = self
+                    .state
+                    .trading
+                    .start_batch_increase(BatchIncreaseRequest {
+                        opportunity_id: opportunity.id,
+                        target_notional_usdt: target.parse()?,
+                        order_notional_usdt: order.parse()?,
+                        interval_seconds: interval.parse()?,
+                        leverage: leverage.parse()?,
+                    })
+                    .await?;
+                self.show_batch_task(&task).await
             }
             ["p", id] => {
                 let position = self.find_position(id).await?;
@@ -400,6 +462,43 @@ impl TelegramBot {
                     position_keyboard(&response.position),
                 )
                 .await
+            }
+            ["brc", id, target, order, interval] => {
+                let position = self.find_position(id).await?;
+                self.confirm_batch_reduce(
+                    &position,
+                    target.parse()?,
+                    order.parse()?,
+                    interval.parse()?,
+                )
+                .await
+            }
+            ["brx", id, target, order, interval] => {
+                let task = self
+                    .state
+                    .trading
+                    .start_batch_reduce(BatchReduceRequest {
+                        position_id: (*id).into(),
+                        target_notional_usdt: target.parse()?,
+                        order_notional_usdt: order.parse()?,
+                        interval_seconds: interval.parse()?,
+                    })
+                    .await?;
+                self.show_batch_task(&task).await
+            }
+            ["bcc", id] => {
+                self.send(
+                    "确认取消这个批量任务？已经成交的批次不会回滚。",
+                    vec![vec![
+                        button("确认取消", &format!("bcx|{id}")),
+                        button("返回任务", &format!("bt|{id}")),
+                    ]],
+                )
+                .await
+            }
+            ["bcx", id] => {
+                let task = self.state.trading.cancel_batch_task(id).await?;
+                self.show_batch_task(&task).await
             }
             ["lc", id, leverage] => {
                 let position = self.find_position(id).await?;
@@ -610,6 +709,134 @@ impl TelegramBot {
         .await
     }
 
+    async fn confirm_batch_open(
+        &self,
+        opportunity: &Opportunity,
+        target: f64,
+        order: f64,
+        interval: f64,
+        leverage: u8,
+    ) -> Result<()> {
+        validate_batch_settings(target, order, interval)?;
+        if !(1..=20).contains(&leverage) {
+            return Err(anyhow!("杠杆范围为 1–20×"));
+        }
+        let route = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            opportunity.token.symbol,
+            short_exchange(&opportunity.long.exchange),
+            short_exchange(&opportunity.short.exchange),
+            target,
+            order,
+            interval,
+            leverage
+        );
+        self.send(
+            &format!(
+                "⚠️ 确认批量加仓？\n<b>{}</b> · 每腿目标 ${:.2} · {}×\n每单最多 ${:.2} · 间隔 {:.1}s\n预计 {} 批\n🟢 LONG {}\n🔴 SHORT {}",
+                html(&opportunity.token.symbol),
+                target,
+                leverage,
+                order,
+                interval,
+                (target / order).ceil() as usize,
+                html(&opportunity.long.exchange),
+                html(&opportunity.short.exchange)
+            ),
+            vec![vec![
+                button("确认启动", &format!("box|{route}")),
+                button(
+                    "取消",
+                    &format!(
+                        "o|{}|{}|{}",
+                        opportunity.token.symbol,
+                        short_exchange(&opportunity.long.exchange),
+                        short_exchange(&opportunity.short.exchange)
+                    ),
+                ),
+            ]],
+        )
+        .await
+    }
+
+    async fn confirm_batch_reduce(
+        &self,
+        position: &Position,
+        target: f64,
+        order: f64,
+        interval: f64,
+    ) -> Result<()> {
+        validate_batch_settings(target, order, interval)?;
+        self.send(
+            &format!(
+                "⚠️ 确认批量减仓？\n<b>{}</b> · 每腿共减少 ${:.2}\n每单最多 ${:.2} · 间隔 {:.1}s\n预计 {} 批\n当前每腿约 ${:.2}",
+                html(&position.token),
+                target,
+                order,
+                interval,
+                (target / order).ceil() as usize,
+                position.notional_usdt
+            ),
+            vec![vec![
+                button(
+                    "确认启动",
+                    &format!("brx|{}|{}|{}|{}", position.id, target, order, interval),
+                ),
+                button("取消", &format!("p|{}", position.id)),
+            ]],
+        )
+        .await
+    }
+
+    async fn show_batch_task(&self, task: &BatchIncreaseTask) -> Result<()> {
+        let progress = if task.target_notional_usdt > 0.0 {
+            (task.completed_notional_usdt / task.target_notional_usdt * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let action = if task.action == "reduce" {
+            "批量减仓"
+        } else {
+            "批量加仓"
+        };
+        let mut text = format!(
+            "<b>{} · {}</b>\n状态：{}\n进度：{:.1}% · ${:.2} / ${:.2}\n批次：{} / {}\n单笔 ${:.2} · 间隔 {:.1}s",
+            action,
+            html(&task.token),
+            html(batch_status(&task.status)),
+            progress,
+            task.completed_notional_usdt,
+            task.target_notional_usdt,
+            task.completed_batches,
+            task.total_batches,
+            task.order_notional_usdt,
+            task.interval_seconds
+        );
+        if let Some(error) = task.error.as_deref() {
+            text.push_str(&format!("\n\n❌ {}", html(error)));
+        }
+        if !task.logs.is_empty() {
+            text.push_str("\n\n<b>最近成交</b>");
+            for log in task.logs.iter().rev().take(6).rev() {
+                text.push_str(&format!(
+                    "\n#{} {} · {} {} · ${:.2} @ ${:.6}",
+                    log.batch,
+                    html(&log.exchange),
+                    html(&log.side.to_uppercase()),
+                    html(&log.token),
+                    log.notional_usdt,
+                    log.average_price
+                ));
+            }
+        }
+        let mut keyboard = vec![vec![button("刷新进度", &format!("bt|{}", task.id))]];
+        if matches!(task.status.as_str(), "queued" | "running" | "cancelling") {
+            keyboard[0].push(button("取消任务", &format!("bcc|{}", task.id)));
+        }
+        keyboard.push(vec![button("查看持仓", "pos")]);
+        self.send(&text, keyboard).await
+    }
+
     async fn show_positions(&self) -> Result<()> {
         let positions = self.state.trading.positions().await?;
         if positions.is_empty() {
@@ -754,7 +981,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/open TOKEN 金额 [杠杆] — 开仓或加仓\n/reduce TOKEN 金额 — 减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/autoclose DEXE 300 100 2</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/open TOKEN 金额 [杠杆] — 开仓或加仓\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 批量加仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![
@@ -921,6 +1148,31 @@ fn parse_f64(value: Option<&str>, name: &str) -> Result<f64> {
         .map_err(|_| anyhow!("{name}格式错误"))
 }
 
+fn validate_batch_settings(target: f64, order: f64, interval: f64) -> Result<()> {
+    if !(10.0..=1_000_000.0).contains(&target) {
+        return Err(anyhow!("目标金额范围为 10–1,000,000 USDT"));
+    }
+    if !(10.0..=target).contains(&order) {
+        return Err(anyhow!("单笔金额必须在 10 USDT 与目标金额之间"));
+    }
+    if !(0.5..=3_600.0).contains(&interval) {
+        return Err(anyhow!("批次间隔范围为 0.5–3,600 秒"));
+    }
+    Ok(())
+}
+
+fn batch_status(status: &str) -> &str {
+    match status {
+        "queued" => "等待执行",
+        "running" => "执行中",
+        "cancelling" => "正在取消",
+        "cancelled" => "已取消",
+        "completed" => "已完成",
+        "failed" => "失败",
+        _ => status,
+    }
+}
+
 fn break_even(hours: f64) -> String {
     if hours <= 0.0 {
         "立即".into()
@@ -972,6 +1224,13 @@ mod tests {
                 assert!(button.callback_data.len() <= 64);
             }
         }
+    }
+
+    #[test]
+    fn validates_batch_settings() {
+        assert!(validate_batch_settings(1_000.0, 100.0, 2.0).is_ok());
+        assert!(validate_batch_settings(1_000.0, 2_000.0, 2.0).is_err());
+        assert!(validate_batch_settings(1_000.0, 100.0, 0.1).is_err());
     }
 
     fn test_leg(exchange: &str, side: &str) -> crate::models::PositionLeg {
