@@ -2739,6 +2739,7 @@ mod tests {
             next_funding_time: 0,
             qty_step: 0.01,
             tags: vec![],
+            volume_24h_usdt: 1_000_000.0,
         }
     }
 

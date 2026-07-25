@@ -643,13 +643,15 @@ impl TelegramBot {
             short_exchange(&opportunity.short.exchange)
         );
         let text = format!(
-            "<b>{}/USDT</b>{}\n🟢 LONG {} @ ${:.6}\n🔴 SHORT {} @ ${:.6}\n\n资金 APY：{:+.2}%\n开仓价差：{:+.3}%\n预计回本：{}\n资金净收益：{:+.5}%/小时",
+            "<b>{}/USDT</b>{}\n🟢 LONG {} @ ${:.6} · 24h {}\n🔴 SHORT {} @ ${:.6} · 24h {}\n\n资金 APY：{:+.2}%\n开仓价差：{:+.3}%\n预计回本：{}\n资金净收益：{:+.5}%/小时",
             html(&opportunity.token.symbol),
             telegram_tags(&opportunity.token.tags),
             html(&opportunity.long.exchange),
             opportunity.long.ask,
+            compact_usdt(opportunity.long.volume_24h_usdt),
             html(&opportunity.short.exchange),
             opportunity.short.bid,
+            compact_usdt(opportunity.short.volume_24h_usdt),
             opportunity.apy * 100.0,
             opportunity.spread * 100.0,
             break_even(opportunity.break_even_hours),
@@ -1186,6 +1188,18 @@ fn telegram_tags(tags: &[String]) -> String {
                 .collect::<Vec<_>>()
                 .join(" ")
         )
+    }
+}
+
+fn compact_usdt(value: f64) -> String {
+    if value >= 1_000_000_000.0 {
+        format!("${:.2}B", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("${:.2}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("${:.2}K", value / 1_000.0)
+    } else {
+        format!("${value:.2}")
     }
 }
 

@@ -23,6 +23,7 @@ pub struct Leg {
     pub next_funding_time: i64,
     pub qty_step: f64,
     pub tags: Vec<String>,
+    pub volume_24h_usdt: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

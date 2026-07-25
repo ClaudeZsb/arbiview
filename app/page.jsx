@@ -23,6 +23,15 @@ function money(value) {
   })}`;
 }
 
+function compactMoney(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return "—";
+  if (amount >= 1e9) return `$${(amount / 1e9).toFixed(amount >= 1e10 ? 1 : 2)}B`;
+  if (amount >= 1e6) return `$${(amount / 1e6).toFixed(amount >= 1e7 ? 1 : 2)}M`;
+  if (amount >= 1e3) return `$${(amount / 1e3).toFixed(amount >= 1e4 ? 1 : 2)}K`;
+  return money(amount);
+}
+
 function pct(value, digits = 3) {
   return `${value >= 0 ? "+" : ""}${(value * 100).toFixed(digits)}%`;
 }
@@ -55,6 +64,7 @@ function Leg({ type, leg }) {
       <div className="leg-meta">
         <span>资金费率 <b className={leg.rate < 0 ? "positive" : ""}>{pct(leg.rate, 4)}</b> / {leg.intervalHours}h</span>
         <span>下次结算 <b>{time(leg.nextFundingTime)}</b></span>
+        <span>24h 成交额 <b>{compactMoney(leg.volume24hUsdt)}</b></span>
       </div>
     </div>
   );

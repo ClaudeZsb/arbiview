@@ -13,6 +13,7 @@ const BINANCE_FEE: f64 = 0.0005;
 const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
+type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 
 #[derive(Clone)]
 pub struct MarketService {
@@ -22,6 +23,8 @@ pub struct MarketService {
     scan_lock: Arc<Mutex<()>>,
     quote_cache: Arc<RwLock<QuoteCache>>,
     quote_lock: Arc<Mutex<()>>,
+    binance_volume_cache: Arc<RwLock<VolumeCache>>,
+    binance_volume_lock: Arc<Mutex<()>>,
 }
 
 impl MarketService {
@@ -37,6 +40,8 @@ impl MarketService {
             scan_lock: Arc::new(Mutex::new(())),
             quote_cache: Arc::new(RwLock::new(None)),
             quote_lock: Arc::new(Mutex::new(())),
+            binance_volume_cache: Arc::new(RwLock::new(None)),
+            binance_volume_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -250,6 +255,18 @@ impl MarketService {
 
     async fn binance_markets(&self) -> Result<Vec<Leg>> {
         let base = "https://fapi.binance.com";
+        let volumes = match self.binance_volumes().await {
+            Ok(volumes) => volumes,
+            Err(error) => {
+                tracing::warn!("Binance 24h volume unavailable: {error:#}");
+                self.binance_volume_cache
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|(_, volumes)| volumes.clone())
+                    .unwrap_or_default()
+            }
+        };
         let (premium, book, exchange, funding): (Value, Value, Value, Value) = tokio::try_join!(
             self.get_json(format!("{base}/fapi/v1/premiumIndex")),
             self.get_json(format!("{base}/fapi/v1/ticker/bookTicker")),
@@ -319,6 +336,7 @@ impl MarketService {
                     } else {
                         vec![]
                     },
+                    volume_24h_usdt: volumes.get(symbol).copied().unwrap_or(0.0),
                 })
             })
             .collect())
@@ -374,9 +392,40 @@ impl MarketService {
                     } else {
                         vec![]
                     },
+                    volume_24h_usdt: parse(&x["turnover24h"]).unwrap_or(0.0),
                 })
             })
             .collect())
+    }
+
+    async fn binance_volumes(&self) -> Result<HashMap<String, f64>> {
+        if let Some((at, volumes)) = self.binance_volume_cache.read().await.as_ref() {
+            if at.elapsed() < Duration::from_secs(300) {
+                return Ok(volumes.clone());
+            }
+        }
+        let _guard = self.binance_volume_lock.lock().await;
+        if let Some((at, volumes)) = self.binance_volume_cache.read().await.as_ref() {
+            if at.elapsed() < Duration::from_secs(300) {
+                return Ok(volumes.clone());
+            }
+        }
+        let response = self
+            .get_json("https://fapi.binance.com/fapi/v1/ticker/24hr".into())
+            .await?;
+        let volumes = response
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item["symbol"].as_str()?.to_string(),
+                    parse(&item["quoteVolume"])?,
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        *self.binance_volume_cache.write().await = Some((Instant::now(), volumes.clone()));
+        Ok(volumes)
     }
 
     async fn get_json(&self, url: String) -> Result<Value> {
@@ -515,6 +564,7 @@ mod tests {
             next_funding_time: 0,
             qty_step: 0.01,
             tags,
+            volume_24h_usdt: 1_000_000.0,
         }
     }
 }
