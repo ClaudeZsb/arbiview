@@ -60,6 +60,18 @@ function Leg({ type, leg }) {
   );
 }
 
+function AssetMeta({ token }) {
+  return (
+    <div className="asset-meta">
+      <span>{token.name}</span>
+      <div className="asset-tags">
+        {(token.tags || []).map((tag) => <b key={tag} className={`asset-tag ${tag}`}>{tag}</b>)}
+        {token.rank && <b className="asset-tag cmc-rank">CMC #{token.rank}</b>}
+      </div>
+    </div>
+  );
+}
+
 function OpportunityCard({ item, index, onTrade }) {
   return (
     <article className="opportunity-card">
@@ -68,7 +80,7 @@ function OpportunityCard({ item, index, onTrade }) {
         <div className="asset-icon">{item.token.symbol.slice(0, 2)}</div>
         <div>
           <div className="asset-symbol">{item.token.symbol}<span>/USDT</span></div>
-          <div className="asset-name">{item.token.name} · CMC #{item.token.rank}</div>
+          <AssetMeta token={item.token} />
         </div>
       </div>
       <div className="legs">
@@ -108,7 +120,7 @@ function SpreadOpportunityCard({ item, index, onTrade }) {
       <div className="rank">#{String(index + 1).padStart(2, "0")}</div>
       <div className="asset">
         <div className="asset-icon">{item.token.symbol.slice(0, 2)}</div>
-        <div><div className="asset-symbol">{item.token.symbol}<span>/USDT</span></div><div className="asset-name">CMC #{item.token.rank}</div></div>
+        <div><div className="asset-symbol">{item.token.symbol}<span>/USDT</span></div><AssetMeta token={item.token} /></div>
       </div>
       <div className="spread-route">
         <div><i className="side-dot long" /><span>LONG · {item.long.exchange}</span><b>{price(item.long.ask)}</b></div>
@@ -716,7 +728,8 @@ export default function Dashboard() {
 
   const rows = useMemo(() => {
     const list = (data?.opportunities || []).filter((x) =>
-      x.token.symbol.toLowerCase().includes(query.toLowerCase()) &&
+      [x.token.symbol, x.token.name, ...(x.token.tags || [])]
+        .some((value) => value.toLowerCase().includes(query.toLowerCase())) &&
       x.apy * 100 >= minApy
     );
     return [...list].sort((a, b) =>
@@ -725,7 +738,8 @@ export default function Dashboard() {
   }, [data, query, minApy, sort]);
   const spreadRows = useMemo(
     () => (data?.spreadOpportunities || [])
-      .filter((item) => item.token.symbol.toLowerCase().includes(query.toLowerCase()))
+      .filter((item) => [item.token.symbol, item.token.name, ...(item.token.tags || [])]
+        .some((value) => value.toLowerCase().includes(query.toLowerCase())))
       .sort((a, b) => b.spread - a.spread),
     [data, query]
   );
@@ -749,10 +763,10 @@ export default function Dashboard() {
         <div className="hero-copy">
           <div className="eyebrow"><Sparkles size={14} /> PERPETUAL FUNDING ARBITRAGE</div>
           <h1>捕捉跨所<br /><em>资金费率差</em></h1>
-          <p>聚合 Binance 与 Bybit 永续合约，筛选 CoinMarketCap 市值前 200 的实时中性套利机会。</p>
+          <p>聚合 Binance 与 Bybit 共同支持的全部 USDT 永续合约，覆盖加密资产、股票与大宗商品。</p>
         </div>
         <div className="hero-stats">
-          <div><span>覆盖资产</span><strong>{data?.universeSize || "200"}</strong><small>CMC TOP 200</small></div>
+          <div><span>交易所合约</span><strong>{data?.universeSize ?? "—"}</strong><small>全部 USDT 永续</small></div>
           <div><span>共同合约</span><strong>{data?.matchedPairs ?? "—"}</strong><small>BINANCE × BYBIT</small></div>
           <div className="highlight"><span>最高资金 APY</span><strong>{best ? pct(best.apy, 1) : "—"}</strong><small>{best ? `${best.token.symbol} · ${best.long.exchange} → ${best.short.exchange}` : "正在扫描"}</small></div>
         </div>

@@ -1,6 +1,6 @@
 # ArbiView
 
-Binance 与 Bybit 跨所永续合约资金费率套利看板。仓库是一个 monorepo：
+Binance 与 Bybit 跨所永续合约资金费率套利看板。扫描两所共同支持的全部 USDT 永续，包括加密资产与 TradFi 股票/大宗商品合约；`cmc200`、`tradefi` 标签来自 CMC 排名和交易所官方合约元数据。仓库是一个 monorepo：
 
 - `app/`：Next.js 前端，只负责展示、交互和调用 API。
 - `services/api/`：Rust/Axum 后端，负责行情聚合、CMC 前 200 筛选、机会计算、账户查询和双腿开平仓。

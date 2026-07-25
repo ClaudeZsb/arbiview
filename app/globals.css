@@ -74,6 +74,13 @@ h1 em { color: var(--green); font-style: normal; }
 .asset-symbol { font: 600 15px DM Mono, monospace; white-space: nowrap; }
 .asset-symbol span { color: #94a39e; font-size: 10px; font-weight: 400; }
 .asset-name { color: var(--muted); font-size: 10px; margin-top: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+.asset-meta { color: var(--muted); font-size: 9px; margin-top: 5px; min-width: 0; }
+.asset-meta > span { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
+.asset-tags { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 4px; }
+.asset-tag { padding: 2px 4px; border-radius: 2px; background: #eef2f0; color: #71817b; font: 500 7px DM Mono, monospace; letter-spacing: .04em; text-transform: uppercase; }
+.asset-tag.tradefi { color: #7d4d00; background: #fff1ce; }
+.asset-tag.cmc200 { color: var(--green-dark); background: var(--green-pale); }
+.asset-tag.cmc-rank { color: #687771; background: #f0f3f2; }
 .legs { display: grid; grid-template-columns: 1fr 28px 1fr; gap: 7px; align-items: center; min-width: 0; }
 .leg { min-width: 0; border-left: 2px solid var(--line); padding-left: 13px; }
 .leg:first-child { border-left-color: var(--green); }

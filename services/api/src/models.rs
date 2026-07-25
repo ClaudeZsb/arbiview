@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Token {
     pub symbol: String,
     pub name: String,
-    pub rank: u32,
+    pub rank: Option<u32>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -21,6 +22,7 @@ pub struct Leg {
     pub interval_hours: f64,
     pub next_funding_time: i64,
     pub qty_step: f64,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

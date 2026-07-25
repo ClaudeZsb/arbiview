@@ -2675,7 +2675,8 @@ mod tests {
             token: Token {
                 symbol: "DEXE".into(),
                 name: "DeXe".into(),
-                rank: 100,
+                rank: Some(100),
+                tags: vec!["cmc200".into()],
             },
             long: test_market_leg("Bybit"),
             short: test_market_leg("Binance"),
@@ -2737,6 +2738,7 @@ mod tests {
             interval_hours: 8.0,
             next_funding_time: 0,
             qty_step: 0.01,
+            tags: vec![],
         }
     }
 

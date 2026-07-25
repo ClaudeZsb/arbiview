@@ -54,34 +54,46 @@ impl MarketService {
                 return Ok(value.clone());
             }
         }
-        let (tokens, binance, bybit) = tokio::try_join!(
-            self.top_tokens(),
-            self.binance_markets(),
-            self.bybit_markets()
-        )?;
-        let allowed: HashMap<String, Token> = tokens
-            .iter()
-            .cloned()
-            .map(|x| (x.symbol.clone(), x))
-            .collect();
+        let (tokens_result, markets_result) = tokio::join!(self.top_tokens(), async {
+            tokio::try_join!(self.binance_markets(), self.bybit_markets())
+        });
+        let (binance, bybit) = markets_result?;
+        let cmc = match tokens_result {
+            Ok(tokens) => tokens
+                .into_iter()
+                .map(|token| (token.symbol.clone(), token))
+                .collect::<HashMap<_, _>>(),
+            Err(error) => {
+                tracing::warn!("CMC tags unavailable; scanning all exchange contracts: {error:#}");
+                HashMap::new()
+            }
+        };
         let b_map: HashMap<String, Leg> =
             binance.into_iter().map(|x| (x.base.clone(), x)).collect();
         let y_map: HashMap<String, Leg> = bybit.into_iter().map(|x| (x.base.clone(), x)).collect();
         let mut opportunities = vec![];
         let mut spread_opportunities = vec![];
         let mut matched = HashSet::new();
-        for (symbol, token) in &allowed {
-            if let (Some(b), Some(y)) = (b_map.get(symbol), y_map.get(symbol)) {
+        for (symbol, b) in &b_map {
+            if let Some(y) = y_map.get(symbol) {
+                if is_tradefi(b) != is_tradefi(y) {
+                    tracing::warn!(
+                        symbol,
+                        "skipping cross-exchange symbol with incompatible asset classes"
+                    );
+                    continue;
+                }
                 matched.insert(symbol);
-                if let Some(x) = make_opportunity(token, b, y) {
+                let token = classify_token(symbol, cmc.get(symbol), b, y);
+                if let Some(x) = make_opportunity(&token, b, y) {
                     opportunities.push(x);
                 }
-                if let Some(x) = make_opportunity(token, y, b) {
+                if let Some(x) = make_opportunity(&token, y, b) {
                     opportunities.push(x);
                 }
                 let mut spread_candidates = [
-                    make_spread_opportunity(token, b, y),
-                    make_spread_opportunity(token, y, b),
+                    make_spread_opportunity(&token, b, y),
+                    make_spread_opportunity(&token, y, b),
                 ]
                 .into_iter()
                 .flatten()
@@ -98,7 +110,7 @@ impl MarketService {
             opportunities,
             spread_opportunities,
             updated_at: chrono::Utc::now().timestamp_millis(),
-            universe_size: tokens.len(),
+            universe_size: b_map.len() + y_map.len() - matched.len(),
             matched_pairs: matched.len(),
             assumptions: FeeAssumptions {
                 binance_taker_fee: BINANCE_FEE,
@@ -230,7 +242,8 @@ impl MarketService {
             .map(|x| Token {
                 symbol: x.symbol.to_uppercase(),
                 name: x.name,
-                rank: x.cmc_rank,
+                rank: Some(x.cmc_rank),
+                tags: vec!["cmc200".into()],
             })
             .collect())
     }
@@ -259,7 +272,10 @@ impl MarketService {
         let mut meta = HashMap::new();
         for item in exchange["symbols"].as_array().unwrap_or(&empty) {
             if item["quoteAsset"] == "USDT"
-                && item["contractType"] == "PERPETUAL"
+                && matches!(
+                    item["contractType"].as_str(),
+                    Some("PERPETUAL" | "TRADIFI_PERPETUAL")
+                )
                 && item["status"] == "TRADING"
             {
                 let step = item["filters"]
@@ -271,7 +287,11 @@ impl MarketService {
                 if let (Some(symbol), Some(base)) =
                     (item["symbol"].as_str(), item["baseAsset"].as_str())
                 {
-                    meta.insert(symbol, (base, step));
+                    let is_tradefi = item["contractType"] == "TRADIFI_PERPETUAL"
+                        || item["underlyingSubType"]
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|value| value == "TradFi"));
+                    meta.insert(symbol, (base, step, is_tradefi));
                 }
             }
         }
@@ -281,7 +301,7 @@ impl MarketService {
             .iter()
             .filter_map(|x| {
                 let symbol = x["symbol"].as_str()?;
-                let (base, step) = *meta.get(symbol)?;
+                let (base, step, is_tradefi) = *meta.get(symbol)?;
                 let b = books.get(symbol)?;
                 Some(Leg {
                     exchange: "Binance".into(),
@@ -294,6 +314,11 @@ impl MarketService {
                     interval_hours: intervals.get(symbol).copied().unwrap_or(8.0),
                     next_funding_time: x["nextFundingTime"].as_i64()?,
                     qty_step: step,
+                    tags: if is_tradefi {
+                        vec!["tradefi".into()]
+                    } else {
+                        vec![]
+                    },
                 })
             })
             .collect())
@@ -320,7 +345,9 @@ impl MarketService {
                         .as_str()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0.001);
-                    meta.insert(symbol, (base, interval, step));
+                    let is_tradefi =
+                        matches!(x["symbolType"].as_str(), Some("stock" | "commodity"));
+                    meta.insert(symbol, (base, interval, step, is_tradefi));
                 }
             }
         }
@@ -330,7 +357,7 @@ impl MarketService {
             .iter()
             .filter_map(|x| {
                 let symbol = x["symbol"].as_str()?;
-                let (base, interval, step) = *meta.get(symbol)?;
+                let (base, interval, step, is_tradefi) = *meta.get(symbol)?;
                 Some(Leg {
                     exchange: "Bybit".into(),
                     base: base.into(),
@@ -342,6 +369,11 @@ impl MarketService {
                     interval_hours: interval,
                     next_funding_time: x["nextFundingTime"].as_str()?.parse().ok()?,
                     qty_step: step,
+                    tags: if is_tradefi {
+                        vec!["tradefi".into()]
+                    } else {
+                        vec![]
+                    },
                 })
             })
             .collect())
@@ -367,6 +399,35 @@ fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunit
         return None;
     }
     Some(build_opportunity(token, long, short, funding_per_hour))
+}
+
+fn classify_token(symbol: &str, cmc: Option<&Token>, binance: &Leg, bybit: &Leg) -> Token {
+    let mut tags = Vec::new();
+    let tradefi = is_tradefi(binance) && is_tradefi(bybit);
+    if tradefi {
+        tags.push("tradefi".into());
+    } else if cmc.is_some() {
+        tags.push("cmc200".into());
+    }
+    Token {
+        symbol: symbol.into(),
+        name: if tradefi {
+            symbol.into()
+        } else {
+            cmc.map(|token| token.name.clone())
+                .unwrap_or_else(|| symbol.into())
+        },
+        rank: if tradefi {
+            None
+        } else {
+            cmc.and_then(|token| token.rank)
+        },
+        tags,
+    }
+}
+
+fn is_tradefi(leg: &Leg) -> bool {
+    leg.tags.iter().any(|tag| tag == "tradefi")
 }
 
 fn make_spread_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunity> {
@@ -414,4 +475,46 @@ fn parse(value: &Value) -> Option<f64> {
 
 fn host(url: &str) -> &str {
     url.split('/').nth(2).unwrap_or("upstream")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_cmc_and_tradefi_independently() {
+        let cmc = Token {
+            symbol: "BTC".into(),
+            name: "Bitcoin".into(),
+            rank: Some(1),
+            tags: vec!["cmc200".into()],
+        };
+        let crypto = test_leg("Binance", vec![]);
+        let bybit_crypto = test_leg("Bybit", vec![]);
+        let btc = classify_token("BTC", Some(&cmc), &crypto, &bybit_crypto);
+        assert_eq!(btc.tags, vec!["cmc200"]);
+        assert_eq!(btc.rank, Some(1));
+
+        let stock = test_leg("Binance", vec!["tradefi".into()]);
+        let bybit_stock = test_leg("Bybit", vec!["tradefi".into()]);
+        let micron = classify_token("MU", None, &stock, &bybit_stock);
+        assert_eq!(micron.tags, vec!["tradefi"]);
+        assert_eq!(micron.rank, None);
+    }
+
+    fn test_leg(exchange: &str, tags: Vec<String>) -> Leg {
+        Leg {
+            exchange: exchange.into(),
+            base: "TEST".into(),
+            symbol: "TESTUSDT".into(),
+            bid: 1.0,
+            ask: 1.0,
+            mark: 1.0,
+            rate: 0.0,
+            interval_hours: 8.0,
+            next_funding_time: 0,
+            qty_step: 0.01,
+            tags,
+        }
+    }
 }
