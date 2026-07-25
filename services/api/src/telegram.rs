@@ -607,9 +607,10 @@ impl TelegramBot {
         let mut keyboard = vec![];
         for (index, opportunity) in snapshot.opportunities.iter().take(10).enumerate() {
             text.push_str(&format!(
-                "{}. <b>{}</b> {}→{} · APY {:+.1}% · 价差 {:+.3}% · 回本 {}\n",
+                "{}. <b>{}</b>{} {}→{} · APY {:+.1}% · 价差 {:+.3}% · 回本 {}\n",
                 index + 1,
                 html(&opportunity.token.symbol),
+                telegram_tags(&opportunity.token.tags),
                 html(&opportunity.long.exchange),
                 html(&opportunity.short.exchange),
                 opportunity.apy * 100.0,
@@ -642,8 +643,9 @@ impl TelegramBot {
             short_exchange(&opportunity.short.exchange)
         );
         let text = format!(
-            "<b>{}/USDT</b>\n🟢 LONG {} @ ${:.6}\n🔴 SHORT {} @ ${:.6}\n\n资金 APY：{:+.2}%\n开仓价差：{:+.3}%\n预计回本：{}\n资金净收益：{:+.5}%/小时",
+            "<b>{}/USDT</b>{}\n🟢 LONG {} @ ${:.6}\n🔴 SHORT {} @ ${:.6}\n\n资金 APY：{:+.2}%\n开仓价差：{:+.3}%\n预计回本：{}\n资金净收益：{:+.5}%/小时",
             html(&opportunity.token.symbol),
+            telegram_tags(&opportunity.token.tags),
             html(&opportunity.long.exchange),
             opportunity.long.ask,
             html(&opportunity.short.exchange),
@@ -1170,6 +1172,20 @@ fn batch_status(status: &str) -> &str {
         "completed" => "已完成",
         "failed" => "失败",
         _ => status,
+    }
+}
+
+fn telegram_tags(tags: &[String]) -> String {
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " · {}",
+            tags.iter()
+                .map(|tag| format!("#{}", html(tag)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     }
 }
 
