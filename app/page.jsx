@@ -286,7 +286,7 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
   );
 }
 
-function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
+function AccountBoard({ account, positions, protection, onClose, onAdjust, busyId }) {
   return (
     <section className="account-board" id="account">
       <div className="section-head">
@@ -315,6 +315,20 @@ function AccountBoard({ account, positions, onClose, onAdjust, busyId }) {
         ))}
       </div>
       <p className="balance-note">未实现盈亏仅统计当前未平仓仓位；已实现盈亏只统计当前跨所套利合约近 {account?.realizedPeriodDays || 7} 日的平仓损益加 Funding 净额再减交易手续费，不含账户内其他策略。Bybit 可用金额为 Unified Account 的 USD 口径，可能低于账户权益。</p>
+      {protection?.enabled && (
+        <div className="protection-status">
+          <b><ShieldCheck size={14} /> 双腿保护运行中</b>
+          <span>差额容差 {money(protection.toleranceUsdt)} · 孤腿退出每单 {money(protection.orderNotionalUsdt)} / {protection.intervalSeconds}s</span>
+          <small>已保护：{protection.protectedTokens?.join("、") || "等待识别双腿仓位"}</small>
+        </div>
+      )}
+      {(protection?.events || []).slice(-3).reverse().map((event) => (
+        <div className={`protection-event ${event.status}`} key={event.id}>
+          <b>{event.token} · {event.status === "failed" ? "保护失败" : event.status === "completed" ? "保护完成" : "正在保护"}</b>
+          <span>{event.message}</span>
+          <small>{event.orders.length} 笔 reduceOnly 订单</small>
+        </div>
+      ))}
       {(account?.unhedgedLegs || []).length > 0 && (
         <div className="risk-alert">
           <b>检测到未对冲仓位</b>
@@ -384,6 +398,7 @@ export default function Dashboard() {
   const [minApy, setMinApy] = useState(0);
   const [account, setAccount] = useState(null);
   const [positions, setPositions] = useState([]);
+  const [protection, setProtection] = useState(null);
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
   const [adjustment, setAdjustment] = useState(null);
@@ -416,16 +431,19 @@ export default function Dashboard() {
   const loadAccount = useCallback(async () => {
     if (Date.now() < accountBackoffUntil.current) return;
     try {
-      const [summaryResponse, positionsResponse] = await Promise.all([
+      const [summaryResponse, positionsResponse, protectionResponse] = await Promise.all([
         fetch("/backend/account/summary", { cache: "no-store" }),
-        fetch("/backend/positions", { cache: "no-store" })
+        fetch("/backend/positions", { cache: "no-store" }),
+        fetch("/backend/account/hedge-protection", { cache: "no-store" })
       ]);
       const summary = await summaryResponse.json();
       const active = await positionsResponse.json();
+      const protectionStatus = await protectionResponse.json();
       if (summaryResponse.ok) setAccount(summary);
       if (positionsResponse.ok) setPositions(active);
-      if (!summaryResponse.ok || !positionsResponse.ok) {
-        throw new Error(summary.error || active.error);
+      if (protectionResponse.ok) setProtection(protectionStatus);
+      if (!summaryResponse.ok || !positionsResponse.ok || !protectionResponse.ok) {
+        throw new Error(summary.error || active.error || protectionStatus.error);
       }
       accountBackoffUntil.current = 0;
     } catch (e) {
@@ -784,7 +802,7 @@ export default function Dashboard() {
 
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
 
-      <AccountBoard account={account} positions={positions} onClose={closePosition} onAdjust={(position, type) => {
+      <AccountBoard account={account} positions={positions} protection={protection} onClose={closePosition} onAdjust={(position, type) => {
         if (type === "increase" || type === "reduce") {
           if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {
             setNotice("已有批量仓位任务正在执行，请先等待完成或停止任务");

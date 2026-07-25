@@ -81,6 +81,13 @@ h1 em { color: var(--green); font-style: normal; }
 .asset-tag.tradefi { color: #7d4d00; background: #fff1ce; }
 .asset-tag.cmc200 { color: var(--green-dark); background: var(--green-pale); }
 .asset-tag.cmc-rank { color: #687771; background: #f0f3f2; }
+.protection-status, .protection-event { margin-top: 10px; padding: 11px 14px; border: 1px solid #b8daca; background: #eff9f4; display: flex; align-items: center; gap: 14px; font-size: 10px; }
+.protection-status b { color: var(--green-dark); display: flex; align-items: center; gap: 6px; }
+.protection-status span, .protection-event span { color: var(--ink); }
+.protection-status small, .protection-event small { color: var(--muted); margin-left: auto; }
+.protection-event { border-color: #f0ce9b; background: #fff8e9; }
+.protection-event.failed { border-color: #efb4a3; background: #fff1ec; }
+.protection-event.completed { border-color: #b8daca; background: #eff9f4; }
 .legs { display: grid; grid-template-columns: 1fr 28px 1fr; gap: 7px; align-items: center; min-width: 0; }
 .leg { min-width: 0; border-left: 2px solid var(--line); padding-left: 13px; }
 .leg:first-child { border-left-color: var(--green); }

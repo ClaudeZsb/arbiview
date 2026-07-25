@@ -188,6 +188,30 @@ pub struct AutoCloseRule {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HedgeProtectionEvent {
+    pub id: String,
+    pub token: String,
+    pub event_type: String,
+    pub status: String,
+    pub message: String,
+    pub started_at: i64,
+    pub updated_at: i64,
+    pub orders: Vec<OrderExecution>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HedgeProtectionStatus {
+    pub enabled: bool,
+    pub tolerance_usdt: f64,
+    pub order_notional_usdt: f64,
+    pub interval_seconds: f64,
+    pub protected_tokens: Vec<String>,
+    pub events: Vec<HedgeProtectionEvent>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdjustPositionRequest {

@@ -66,6 +66,8 @@ impl IncomeSummary {
 }
 
 const MAX_RECONCILIATION_ATTEMPTS: u8 = 3;
+const HEDGE_PROTECTION_ORDER_USDT: f64 = 100.0;
+const HEDGE_PROTECTION_INTERVAL_SECONDS: f64 = 1.0;
 
 struct PhaseOneResult {
     state: Option<PositionLeg>,
@@ -83,6 +85,14 @@ struct PhaseTwoResult {
 }
 
 #[derive(Clone)]
+struct ProtectedRoute {
+    token: String,
+    symbol: String,
+    long_exchange: String,
+    short_exchange: String,
+}
+
+#[derive(Clone)]
 pub struct TradingService {
     config: Config,
     client: Client,
@@ -92,6 +102,9 @@ pub struct TradingService {
     income_refresh_lock: Arc<Mutex<()>>,
     batch_tasks: Arc<RwLock<HashMap<String, BatchIncreaseTask>>>,
     auto_close_rules: Arc<RwLock<HashMap<String, AutoCloseRule>>>,
+    protected_routes: Arc<RwLock<HashMap<String, ProtectedRoute>>>,
+    protection_events: Arc<RwLock<Vec<HedgeProtectionEvent>>>,
+    execution_lock: Arc<Mutex<()>>,
 }
 
 impl TradingService {
@@ -106,6 +119,9 @@ impl TradingService {
             income_refresh_lock: Arc::new(Mutex::new(())),
             batch_tasks: Arc::new(RwLock::new(HashMap::new())),
             auto_close_rules: Arc::new(RwLock::new(auto_close_rules)),
+            protected_routes: Arc::new(RwLock::new(HashMap::new())),
+            protection_events: Arc::new(RwLock::new(Vec::new())),
+            execution_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -121,6 +137,284 @@ impl TradingService {
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
         });
+    }
+
+    pub fn spawn_hedge_protection_monitor(&self) {
+        if self.config.trading_mode != TradingMode::Live {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            loop {
+                if let Err(error) = service.inspect_hedge_protection().await {
+                    tracing::warn!("hedge protection inspection failed: {error:#}");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+
+    pub async fn hedge_protection_status(&self) -> HedgeProtectionStatus {
+        let mut protected_tokens = self
+            .protected_routes
+            .read()
+            .await
+            .values()
+            .map(|route| route.token.clone())
+            .collect::<Vec<_>>();
+        protected_tokens.sort();
+        protected_tokens.dedup();
+        HedgeProtectionStatus {
+            enabled: self.config.trading_mode == TradingMode::Live,
+            tolerance_usdt: self.config.position_tolerance_usdt,
+            order_notional_usdt: HEDGE_PROTECTION_ORDER_USDT,
+            interval_seconds: HEDGE_PROTECTION_INTERVAL_SECONDS,
+            protected_tokens,
+            events: self.protection_events.read().await.clone(),
+        }
+    }
+
+    async fn inspect_hedge_protection(&self) -> Result<()> {
+        let (binance, bybit) = tokio::try_join!(self.binance_positions(), self.bybit_positions())?;
+        let legs = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+        self.remember_protected_routes(&legs).await;
+        if self
+            .batch_tasks
+            .read()
+            .await
+            .values()
+            .any(|task| matches!(task.status.as_str(), "queued" | "running" | "cancelling"))
+        {
+            return Ok(());
+        }
+        let routes = self
+            .protected_routes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for route in routes {
+            let long = find_route_leg(&legs, &route.long_exchange, &route.symbol, "long");
+            let short = find_route_leg(&legs, &route.short_exchange, &route.symbol, "short");
+            let needs_protection = match (&long, &short) {
+                (Some(long), Some(short)) => {
+                    (position_notional(long) - position_notional(short)).abs()
+                        > self.config.position_tolerance_usdt
+                }
+                (Some(_), None) | (None, Some(_)) => true,
+                (None, None) => false,
+            };
+            if !needs_protection {
+                continue;
+            }
+            let Ok(_guard) = self.execution_lock.try_lock() else {
+                continue;
+            };
+            // Re-read under the execution lock. A normal trade may have completed
+            // between the initial observation and acquiring the lock.
+            let (binance, bybit) =
+                tokio::try_join!(self.binance_positions(), self.bybit_positions())?;
+            let actual = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+            let long = find_route_leg(&actual, &route.long_exchange, &route.symbol, "long");
+            let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
+            let still_unbalanced = match (&long, &short) {
+                (Some(long), Some(short)) => {
+                    (position_notional(long) - position_notional(short)).abs()
+                        > self.config.position_tolerance_usdt
+                }
+                (Some(_), None) | (None, Some(_)) => true,
+                (None, None) => false,
+            };
+            if still_unbalanced {
+                self.run_hedge_protection(route).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn remember_protected_routes(&self, legs: &[PositionLeg]) {
+        let mut routes = self.protected_routes.write().await;
+        for long in legs.iter().filter(|leg| leg.side == "long") {
+            if let Some(short) = legs.iter().find(|leg| {
+                leg.symbol == long.symbol && leg.side == "short" && leg.exchange != long.exchange
+            }) {
+                let token = long.symbol.trim_end_matches("USDT").to_string();
+                routes.insert(
+                    token.clone(),
+                    ProtectedRoute {
+                        token,
+                        symbol: long.symbol.clone(),
+                        long_exchange: long.exchange.clone(),
+                        short_exchange: short.exchange.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    async fn run_hedge_protection(&self, route: ProtectedRoute) {
+        let event_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        let initial = HedgeProtectionEvent {
+            id: event_id.clone(),
+            token: route.token.clone(),
+            event_type: "detecting".into(),
+            status: "running".into(),
+            message: "检测到双腿名义价值不平衡".into(),
+            started_at: now,
+            updated_at: now,
+            orders: vec![],
+        };
+        self.push_protection_event(initial).await;
+        let market_legs = match self.market.trading_legs().await {
+            Ok(legs) => legs,
+            Err(error) => {
+                self.fail_protection_event(&event_id, format!("合约元数据读取失败：{error:#}"))
+                    .await;
+                return;
+            }
+        };
+        loop {
+            let actual = match tokio::try_join!(self.binance_positions(), self.bybit_positions()) {
+                Ok((binance, bybit)) => binance.into_iter().chain(bybit).collect::<Vec<_>>(),
+                Err(error) => {
+                    self.fail_protection_event(&event_id, format!("仓位读取失败：{error:#}"))
+                        .await;
+                    return;
+                }
+            };
+            let long = find_route_leg(&actual, &route.long_exchange, &route.symbol, "long");
+            let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
+            let (target, event_type, message) = match (long, short) {
+                (None, None) => {
+                    self.complete_protection_event(&event_id, "双腿仓位均已归零")
+                        .await;
+                    return;
+                }
+                (Some(leg), None) | (None, Some(leg)) => {
+                    (leg, "orphan_exit", "检测到一条腿归零，正在批量退出剩余腿")
+                }
+                (Some(long), Some(short)) => {
+                    let long_notional = position_notional(&long);
+                    let short_notional = position_notional(&short);
+                    let difference = (long_notional - short_notional).abs();
+                    if difference <= self.config.position_tolerance_usdt {
+                        self.complete_protection_event(&event_id, "双腿差额已恢复至容差内")
+                            .await;
+                        return;
+                    }
+                    if long_notional > short_notional {
+                        (long, "mismatch_reduce", "正在削减名义价值更大的 LONG 腿")
+                    } else {
+                        (short, "mismatch_reduce", "正在削减名义价值更大的 SHORT 腿")
+                    }
+                }
+            };
+            self.update_protection_event(&event_id, |event| {
+                event.event_type = event_type.into();
+                event.message = message.into();
+            })
+            .await;
+            let current_notional = position_notional(&target);
+            let other_notional = actual
+                .iter()
+                .find(|leg| {
+                    leg.symbol == target.symbol
+                        && leg.exchange != target.exchange
+                        && leg.side != target.side
+                })
+                .map(position_notional)
+                .unwrap_or(0.0);
+            let excess = if event_type == "orphan_exit" {
+                current_notional
+            } else {
+                (current_notional - other_notional).max(0.0)
+            };
+            let metadata = match market_legs
+                .iter()
+                .find(|leg| leg.exchange == target.exchange && leg.symbol == target.symbol)
+            {
+                Some(metadata) => metadata,
+                None => {
+                    self.fail_protection_event(&event_id, "找不到剩余腿的合约元数据".into())
+                        .await;
+                    return;
+                }
+            };
+            let quantity = protection_order_quantity(
+                &target,
+                excess,
+                metadata.qty_step,
+                self.config.position_tolerance_usdt,
+            );
+            if quantity <= 0.0 {
+                self.fail_protection_event(&event_id, "保护订单数量计算为零".into())
+                    .await;
+                return;
+            }
+            let side = if target.side == "long" { "Sell" } else { "Buy" };
+            match self
+                .place(&target.exchange, &target.symbol, side, quantity, true, 0.0)
+                .await
+            {
+                Ok(order) => {
+                    self.update_protection_event(&event_id, |event| event.orders.push(order))
+                        .await;
+                }
+                Err(error) => {
+                    self.fail_protection_event(
+                        &event_id,
+                        format!("保护性 reduceOnly 订单失败：{error:#}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs_f64(HEDGE_PROTECTION_INTERVAL_SECONDS)).await;
+        }
+    }
+
+    async fn push_protection_event(&self, event: HedgeProtectionEvent) {
+        let mut events = self.protection_events.write().await;
+        events.push(event);
+        if events.len() > 100 {
+            events.remove(0);
+        }
+    }
+
+    async fn update_protection_event<F>(&self, id: &str, update: F)
+    where
+        F: FnOnce(&mut HedgeProtectionEvent),
+    {
+        if let Some(event) = self
+            .protection_events
+            .write()
+            .await
+            .iter_mut()
+            .find(|event| event.id == id)
+        {
+            update(event);
+            event.updated_at = chrono::Utc::now().timestamp_millis();
+        }
+    }
+
+    async fn complete_protection_event(&self, id: &str, message: &str) {
+        self.update_protection_event(id, |event| {
+            event.status = "completed".into();
+            event.message = message.into();
+        })
+        .await;
+    }
+
+    async fn fail_protection_event(&self, id: &str, message: String) {
+        tracing::error!(event_id = id, %message, "hedge protection failed");
+        self.update_protection_event(id, |event| {
+            event.status = "failed".into();
+            event.message = message;
+        })
+        .await;
     }
 
     pub async fn set_auto_close(
@@ -423,7 +717,10 @@ impl TradingService {
         }
         match self.config.trading_mode {
             TradingMode::Paper => self.open_paper(opportunity, request).await,
-            TradingMode::Live => self.open_live(opportunity, request).await,
+            TradingMode::Live => {
+                let _guard = self.execution_lock.lock().await;
+                self.open_live(opportunity, request).await
+            }
         }
     }
 
@@ -796,7 +1093,10 @@ impl TradingService {
                     execution: None,
                 })
             }
-            TradingMode::Live => self.close_live(id).await,
+            TradingMode::Live => {
+                let _guard = self.execution_lock.lock().await;
+                self.close_live(id).await
+            }
         }
     }
 
@@ -806,7 +1106,10 @@ impl TradingService {
         }
         match self.config.trading_mode {
             TradingMode::Paper => self.reduce_paper(id, request.notional_usdt).await,
-            TradingMode::Live => self.reduce_live(id, request.notional_usdt).await,
+            TradingMode::Live => {
+                let _guard = self.execution_lock.lock().await;
+                self.reduce_live(id, request.notional_usdt).await
+            }
         }
     }
 
@@ -2564,6 +2867,32 @@ fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
 }
 
+fn find_route_leg(
+    legs: &[PositionLeg],
+    exchange: &str,
+    symbol: &str,
+    side: &str,
+) -> Option<PositionLeg> {
+    legs.iter()
+        .find(|leg| leg.exchange == exchange && leg.symbol == symbol && leg.side == side)
+        .cloned()
+}
+
+fn protection_order_quantity(
+    leg: &PositionLeg,
+    excess_notional: f64,
+    qty_step: f64,
+    tolerance_usdt: f64,
+) -> f64 {
+    let current_notional = position_notional(leg);
+    let order_notional = HEDGE_PROTECTION_ORDER_USDT.min(excess_notional);
+    if order_notional + tolerance_usdt >= current_notional {
+        leg.quantity
+    } else {
+        floor_step(order_notional / leg.mark_price, qty_step)
+    }
+}
+
 fn weighted_average(
     first_price: f64,
     first_quantity: f64,
@@ -2663,6 +2992,18 @@ mod tests {
         // Preserve the normal 10 USDT tolerance before the final full-close order.
         assert_eq!(auto_close_reduction(105.0, 100.0, 10.0), Some(95.0));
         assert_eq!(auto_close_reduction(10.0, 100.0, 10.0), None);
+    }
+
+    #[test]
+    fn hedge_protection_caps_orders_and_closes_the_final_remainder() {
+        let mut leg = test_position().long;
+        leg.quantity = 100.0;
+        leg.mark_price = 10.0;
+        assert_eq!(protection_order_quantity(&leg, 1_000.0, 0.01, 10.0), 10.0);
+        assert_eq!(protection_order_quantity(&leg, 50.0, 0.01, 10.0), 5.0);
+
+        leg.quantity = 8.0;
+        assert_eq!(protection_order_quantity(&leg, 80.0, 0.01, 10.0), 8.0);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 const API_TIMEOUT_SECONDS: u64 = 25;
 const DEFAULT_NOTIONAL: f64 = 100.0;
@@ -86,6 +86,10 @@ pub fn spawn(config: TelegramConfig, state: Arc<AppState>) {
             .expect("Telegram HTTP client"),
         state,
     };
+    let notifier = bot.clone();
+    tokio::spawn(async move {
+        notifier.run_protection_notifications().await;
+    });
     tokio::spawn(async move {
         tracing::info!("Telegram bot enabled with long polling");
         if let Err(error) = bot.run().await {
@@ -105,6 +109,7 @@ impl TelegramBot {
                     {"command": "opportunities", "description": "查询当前资费套利机会"},
                     {"command": "positions", "description": "查询和管理当前仓位"},
                     {"command": "account", "description": "查询账户余额和盈亏"},
+                    {"command": "protection", "description": "查询双腿保护状态和事件"},
                     {"command": "open", "description": "开仓：TOKEN 金额 [杠杆]"},
                     {"command": "batch_open", "description": "批量开仓：TOKEN 目标 单笔 间隔 [杠杆]"},
                     {"command": "reduce", "description": "减仓：TOKEN 金额"},
@@ -205,6 +210,7 @@ impl TelegramBot {
             "/opportunities" | "/opps" => self.show_opportunities().await,
             "/positions" | "/status" => self.show_positions().await,
             "/account" | "/balance" => self.show_account().await,
+            "/protection" => self.show_protection().await,
             "/open" => {
                 let token = parts
                     .next()
@@ -332,6 +338,7 @@ impl TelegramBot {
             ["opps"] => self.show_opportunities().await,
             ["pos"] => self.show_positions().await,
             ["acct"] => self.show_account().await,
+            ["protect"] => self.show_protection().await,
             ["al"] => self.show_auto_close_rules().await,
             ["bt", id] => {
                 let task = self.state.trading.batch_task(id).await?;
@@ -913,6 +920,66 @@ impl TelegramBot {
         .await
     }
 
+    async fn show_protection(&self) -> Result<()> {
+        let status = self.state.trading.hedge_protection_status().await;
+        let mut text = format!(
+            "<b>双腿仓位保护</b>\n状态：{}\n差额容差：${:.2}\n孤腿退出：每单 ${:.2} / {:.1}s\n保护标的：{}",
+            if status.enabled { "运行中" } else { "未启用" },
+            status.tolerance_usdt,
+            status.order_notional_usdt,
+            status.interval_seconds,
+            if status.protected_tokens.is_empty() {
+                "等待识别".into()
+            } else {
+                status.protected_tokens.join("、")
+            }
+        );
+        for event in status.events.iter().rev().take(5).rev() {
+            text.push_str(&format!(
+                "\n\n<b>{} · {}</b>\n{} · {} 笔订单",
+                html(&event.token),
+                html(&event.status),
+                html(&event.message),
+                event.orders.len()
+            ));
+        }
+        self.send(&text, vec![vec![button("刷新", "protect")]])
+            .await
+    }
+
+    async fn run_protection_notifications(&self) {
+        let mut known = HashMap::<String, String>::new();
+        loop {
+            let status = self.state.trading.hedge_protection_status().await;
+            for event in status.events {
+                let previous = known.insert(event.id.clone(), event.status.clone());
+                if previous.as_deref() == Some(event.status.as_str()) {
+                    continue;
+                }
+                let icon = match event.status.as_str() {
+                    "failed" => "🚨",
+                    "completed" => "✅",
+                    _ => "⚠️",
+                };
+                let message = format!(
+                    "{} <b>双腿保护 · {}</b>\n{}\n状态：{} · reduceOnly 订单 {} 笔",
+                    icon,
+                    html(&event.token),
+                    html(&event.message),
+                    html(&event.status),
+                    event.orders.len()
+                );
+                if let Err(error) = self
+                    .send(&message, vec![vec![button("查看保护状态", "protect")]])
+                    .await
+                {
+                    tracing::warn!("Telegram protection notification failed: {error:#}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     async fn confirm_auto_close(
         &self,
         position: &Position,
@@ -985,7 +1052,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/open TOKEN 金额 [杠杆] — 开仓或加仓\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 批量加仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/protection — 查询双腿保护状态\n/open TOKEN 金额 [杠杆] — 开仓或加仓\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 批量加仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![

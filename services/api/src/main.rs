@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let trading = TradingService::new(config.clone(), market.clone())?;
     let state = Arc::new(AppState { market, trading });
     state.trading.spawn_auto_close_monitor();
+    state.trading.spawn_hedge_protection_monitor();
     if let Some(telegram) = config.telegram.clone() {
         telegram::spawn(telegram, state.clone());
     }
@@ -55,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/opportunities", get(opportunities))
         .route("/api/position-quotes", get(position_quotes))
         .route("/api/account/summary", get(account_summary))
+        .route("/api/account/hedge-protection", get(hedge_protection))
         .route("/api/positions", get(positions))
         .route("/api/trades/open", post(open_trade))
         .route("/api/trades/batch-increase", post(start_batch_increase))
@@ -94,6 +96,12 @@ async fn account_summary(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.account_summary().await?))
+}
+
+async fn hedge_protection(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.hedge_protection_status().await))
 }
 
 async fn positions(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {

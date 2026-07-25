@@ -95,3 +95,12 @@ AUTO_CLOSE_STATE_PATH=/opt/arbiview/data/auto-close-rules.json
 不要让两个进程使用同一个 Bot Token 同时执行 long polling，否则它们会争抢 updates。配置修改后重启 `arbiview-api` 即可。
 
 自动平仓监控每 15 秒检查一次持仓原方向的资金 APY。触发后每批订单不超过配置金额，最后一批会按实际剩余仓位全平；规则持久化后，后端重启会从交易所实际剩余仓位继续执行。
+
+## 双腿仓位保护
+
+Live 模式下后端每 2 秒读取 Binance 与 Bybit 的实际仓位，并记住已识别的跨所双腿路线：
+
+- 两腿名义价值差超过 `POSITION_TOLERANCE_USDT` 时，只通过 `reduceOnly` 削减金额更大的腿；
+- 一条腿归零（包括被强平）时，按每单最多 100 USDT、间隔 1 秒退出剩余腿；
+- 正在执行正常批量任务时暂停保护检查，所有交易路径共享执行锁，避免保护单与用户订单竞争；
+- 前端账户页和 Telegram `/protection` 可查看保护状态与事件，Telegram 会推送触发、完成或失败通知。
