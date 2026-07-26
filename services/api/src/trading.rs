@@ -1611,17 +1611,21 @@ impl TradingService {
         let short = phase_two.short;
         report.long_notional_usdt = long.as_ref().map(position_notional).unwrap_or(0.0);
         report.short_notional_usdt = short.as_ref().map(position_notional).unwrap_or(0.0);
-        report.balanced = (report.long_notional_usdt - report.short_notional_usdt).abs()
-            <= self.config.position_tolerance_usdt;
+        report.balanced = paired_positions_are_balanced(long.as_ref(), short.as_ref());
         if !report.balanced {
             report.naked_exposure = true;
             report.alert = true;
+            let mismatch = (report.long_notional_usdt - report.short_notional_usdt).abs();
+            let mismatch_percent = match (&long, &short) {
+                (Some(long), Some(short)) => hedge_notional_imbalance_ratio(long, short) * 100.0,
+                _ => 100.0,
+            };
             bail!(
-                "NAKED_EXPOSURE: phase two exhausted after {} attempts ({} anomalies); actual position mismatch {:.2} USDT exceeds tolerance {:.2}",
+                "NAKED_EXPOSURE: phase two exhausted after {} attempts ({} anomalies); actual position mismatch {:.2} USDT ({:.2}%) exceeds both 10 USDT and 1%",
                 report.phase_two_attempts,
                 report.phase_two_anomalies,
-                (report.long_notional_usdt - report.short_notional_usdt).abs(),
-                self.config.position_tolerance_usdt
+                mismatch,
+                mismatch_percent
             );
         }
         let long =
@@ -1941,11 +1945,7 @@ impl TradingService {
         let short = phase_two.short;
         report.long_notional_usdt = long.as_ref().map(position_notional).unwrap_or(0.0);
         report.short_notional_usdt = short.as_ref().map(position_notional).unwrap_or(0.0);
-        report.balanced = match (&long, &short) {
-            (Some(long), Some(short)) => !hedge_notional_needs_protection(long, short),
-            (None, None) => true,
-            _ => false,
-        };
+        report.balanced = paired_positions_are_balanced(long.as_ref(), short.as_ref());
         if !report.balanced {
             let mismatch = (report.long_notional_usdt - report.short_notional_usdt).abs();
             let mismatch_percent = match (&long, &short) {
@@ -3021,6 +3021,10 @@ fn hedge_notional_needs_protection(long: &PositionLeg, short: &PositionLeg) -> b
         && hedge_notional_imbalance_ratio(long, short) > HEDGE_PROTECTION_TOLERANCE_RATIO
 }
 
+fn paired_positions_are_balanced(long: Option<&PositionLeg>, short: Option<&PositionLeg>) -> bool {
+    matches!((long, short), (Some(long), Some(short)) if !hedge_notional_needs_protection(long, short))
+}
+
 fn find_route_leg(
     legs: &[PositionLeg],
     exchange: &str,
@@ -3193,6 +3197,18 @@ mod tests {
 
         long.quantity = 2.01;
         assert!(hedge_notional_needs_protection(&long, &short));
+    }
+
+    #[test]
+    fn paired_positions_accept_small_relative_mismatch_above_ten_usdt() {
+        let mut long = test_position().long;
+        let mut short = test_position().short;
+        long.quantity = 500.0;
+        short.quantity = 498.4;
+        long.mark_price = 10.0;
+        short.mark_price = 10.0;
+        assert!(paired_positions_are_balanced(Some(&long), Some(&short)));
+        assert!(!paired_positions_are_balanced(Some(&long), None));
     }
 
     #[test]
