@@ -120,6 +120,11 @@ h1 em { color: var(--green); font-style: normal; }
 .opportunity-history-chart { min-width: 0; padding: 13px 14px 6px; border: 1px solid var(--line); background: white; }
 .opportunity-history-chart svg { display: block; width: 100%; height: auto; overflow: visible; }
 .opportunity-history-chart text { fill: var(--muted); font: 9px DM Mono, monospace; }
+.history-hover-area { fill: transparent; pointer-events: all; cursor: crosshair; }
+.history-tooltip { pointer-events: none; }
+.history-tooltip > line { stroke: #758680; stroke-width: 1; stroke-dasharray: 3 3; }
+.history-tooltip > rect { fill: #10231d; stroke: rgba(255,255,255,.16); stroke-width: 1; }
+.history-tooltip text, .history-tooltip tspan { fill: #f4f8f6; font: 10px DM Mono, monospace; }
 .history-chart-title { min-height: 38px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .history-chart-title > div:first-child { display: grid; gap: 3px; }
 .history-chart-title b { font-size: 12px; }
@@ -128,6 +133,7 @@ h1 em { color: var(--green); font-style: normal; }
 .history-legend span { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 .history-legend i { width: 8px; height: 8px; border-radius: 50%; }
 .opportunity-history-loading { border-top: 1px solid var(--line); min-height: 100px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 11px; background: #f8faf9; }
+.position-funding-history { margin: 14px 0 2px; }
 .pagination { margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 18px; }
 .pagination span { color: var(--muted); font: 500 10px DM Mono, monospace; }
 .pagination button { height: 34px; padding: 0 15px; border: 1px solid var(--line); background: white; color: var(--ink); font-size: 10px; border-radius: 3px; }
