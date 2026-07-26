@@ -311,7 +311,11 @@ function HistoryLineChart({ points, fields, title, subtitle, valueLabel }) {
   const y = (value) => pad.top + (max - value) * (height - pad.top - pad.bottom) / (max - min);
   const hovered = hoverIndex == null ? null : points[hoverIndex];
   const hoverX = hoverIndex == null ? null : x(hoverIndex);
-  const tooltipWidth = 205;
+  const longestTooltipLine = Math.max(
+    16,
+    ...fields.map((field) => `${field.label}：${valueLabel(0)}`.length)
+  );
+  const tooltipWidth = Math.min(330, Math.max(205, 34 + longestTooltipLine * 8.5));
   const tooltipHeight = 28 + fields.length * 18;
   const tooltipX = hoverX == null ? 0 : Math.min(Math.max(hoverX + 10, pad.left), width - tooltipWidth - 8);
   return (
