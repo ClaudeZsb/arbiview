@@ -133,7 +133,7 @@ h1 em { color: var(--green); font-style: normal; }
 .history-legend span { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 .history-legend i { width: 8px; height: 8px; border-radius: 50%; }
 .opportunity-history-loading { border-top: 1px solid var(--line); min-height: 100px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 11px; background: #f8faf9; }
-.position-funding-history { margin: 14px 0 2px; }
+.position-history { margin: 14px 0 2px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .pagination { margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 18px; }
 .pagination span { color: var(--muted); font: 500 10px DM Mono, monospace; }
 .pagination button { height: 34px; padding: 0 15px; border: 1px solid var(--line); background: white; color: var(--ink); font-size: 10px; border-radius: 3px; }
@@ -334,6 +334,7 @@ footer span { display: flex; align-items: center; gap: 7px; }
   .spread-stat:nth-of-type(n+2), .spread-card > .trade-button { grid-column: span 1; }
   .metric.spread, .metric.breakeven { grid-column: span 1; }
   .opportunity-history { grid-template-columns: 1fr; }
+  .position-history { grid-template-columns: 1fr; }
   .methodology { grid-template-columns: 1fr 1fr; margin-left: 4vw; margin-right: 4vw; }
   .trade-button { grid-column: 4; }
   .position-row { grid-template-columns: 130px 1fr 1fr 100px; }

@@ -361,14 +361,23 @@ function HistoryLineChart({ points, fields, title, subtitle, valueLabel }) {
 }
 
 function PositionHistoryDetails({ position, data, loading }) {
-  if (loading) return <div className="opportunity-history-loading"><RefreshCw className="spin" size={15} />读取 {position.token} 近 24 小时资金费…</div>;
-  if (!data?.points?.length) return <div className="opportunity-history-loading">展开后读取近 24 小时资金费历史</div>;
-  const points = data.points.map((point) => ({
-    ...point,
-    binanceFundingPercent: Number.isFinite(point.binanceFundingRate) ? point.binanceFundingRate * 100 : null,
-    bybitFundingPercent: Number.isFinite(point.bybitFundingRate) ? point.bybitFundingRate * 100 : null
-  }));
-  return <div className="position-funding-history">
+  if (loading) return <div className="opportunity-history-loading"><RefreshCw className="spin" size={15} />读取 {position.token} 近 24 小时价差与资金费…</div>;
+  if (!data?.points?.length) return <div className="opportunity-history-loading">展开后读取近 24 小时价差与资金费历史</div>;
+  const longIsBinance = position.long.exchange === "Binance";
+  const points = data.points.map((point) => {
+    const longPrice = longIsBinance ? point.binanceClose : point.bybitClose;
+    const shortPrice = longIsBinance ? point.bybitClose : point.binanceClose;
+    return {
+      ...point,
+      directionalSpread: longPrice > 0 ? (shortPrice - longPrice) / longPrice * 100 : null,
+      binanceFundingPercent: Number.isFinite(point.binanceFundingRate) ? point.binanceFundingRate * 100 : null,
+      bybitFundingPercent: Number.isFinite(point.bybitFundingRate) ? point.bybitFundingRate * 100 : null
+    };
+  });
+  return <div className="position-history">
+    <HistoryLineChart points={points} fields={[
+      { key: "directionalSpread", label: `${position.long.exchange} LONG → ${position.short.exchange} SHORT`, color: "#087d5a" }
+    ]} title={`${position.token} 近 24h 方向价差`} subtitle="每小时收盘；SHORT 价格高于 LONG 为正，低于 LONG 为负" valueLabel={(value) => `${value.toFixed(3)}%`} />
     <HistoryLineChart points={points} fields={[
       { key: "binanceFundingPercent", label: `Binance${position.long.exchange === "Binance" ? " · LONG" : " · SHORT"}`, color: "#d8a000" },
       { key: "bybitFundingPercent", label: `Bybit${position.long.exchange === "Bybit" ? " · LONG" : " · SHORT"}`, color: "#dc5d43" }
