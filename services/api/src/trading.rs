@@ -11,14 +11,14 @@ use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 type FundingTotals = HashMap<String, f64>;
-type FundingCache = Option<(Instant, IncomeSummary, IncomeSummary)>;
+type FundingCache = Option<(i64, IncomeSummary, IncomeSummary)>;
 
 #[derive(Clone, Default)]
 struct IncomeSummary {
@@ -70,6 +70,7 @@ const HEDGE_PROTECTION_ORDER_USDT: f64 = 100.0;
 const HEDGE_PROTECTION_INTERVAL_SECONDS: f64 = 1.0;
 const HEDGE_PROTECTION_TOLERANCE_RATIO: f64 = 0.01;
 const HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT: f64 = 10.0;
+const FUNDING_REFRESH_DELAY_SECONDS: i64 = 2 * 60;
 
 struct PhaseOneResult {
     state: Option<PositionLeg>,
@@ -2453,20 +2454,21 @@ impl TradingService {
     }
 
     async fn income_summary(&self) -> Result<(IncomeSummary, IncomeSummary)> {
-        if let Some((updated_at, binance, bybit)) = self.funding_cache.read().await.as_ref() {
-            if updated_at.elapsed() < Duration::from_secs(60 * 60) {
+        let refresh_bucket = funding_refresh_bucket(chrono::Utc::now().timestamp_millis());
+        if let Some((cached_bucket, binance, bybit)) = self.funding_cache.read().await.as_ref() {
+            if *cached_bucket == refresh_bucket {
                 return Ok((binance.clone(), bybit.clone()));
             }
         }
         let _refresh_guard = self.income_refresh_lock.lock().await;
-        if let Some((updated_at, binance, bybit)) = self.funding_cache.read().await.as_ref() {
-            if updated_at.elapsed() < Duration::from_secs(60 * 60) {
+        if let Some((cached_bucket, binance, bybit)) = self.funding_cache.read().await.as_ref() {
+            if *cached_bucket == refresh_bucket {
                 return Ok((binance.clone(), bybit.clone()));
             }
         }
         let (binance, bybit) =
             tokio::try_join!(self.binance_income_summary(), self.bybit_income_summary())?;
-        *self.funding_cache.write().await = Some((Instant::now(), binance.clone(), bybit.clone()));
+        *self.funding_cache.write().await = Some((refresh_bucket, binance.clone(), bybit.clone()));
         Ok((binance, bybit))
     }
 
@@ -2864,6 +2866,10 @@ fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
 }
 
+fn funding_refresh_bucket(timestamp_millis: i64) -> i64 {
+    (timestamp_millis / 1_000 - FUNDING_REFRESH_DELAY_SECONDS).div_euclid(60 * 60)
+}
+
 fn hedge_notional_imbalance_ratio(long: &PositionLeg, short: &PositionLeg) -> f64 {
     let long_notional = position_notional(long);
     let short_notional = position_notional(short);
@@ -3159,6 +3165,19 @@ mod tests {
         assert!((filtered.funding_income - 8.0).abs() < 1e-9);
         assert!((filtered.trading_fees - 0.7).abs() < 1e-9);
         assert!((filtered.realized_pnl() - 7.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn funding_cache_rolls_over_two_minutes_after_the_hour() {
+        let hour = 60 * 60 * 1_000;
+        assert_eq!(
+            funding_refresh_bucket(hour + 119_999),
+            funding_refresh_bucket(hour - 1)
+        );
+        assert_eq!(
+            funding_refresh_bucket(hour + 120_000),
+            funding_refresh_bucket(hour - 1) + 1
+        );
     }
 
     #[test]

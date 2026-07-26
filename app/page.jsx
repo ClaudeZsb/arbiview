@@ -485,11 +485,20 @@ export default function Dashboard() {
     loadAccount();
     const opportunityTimer = window.setInterval(load, 20_000);
     const accountTimer = window.setInterval(loadAccountSummary, 20_000);
-    const fundingTimer = window.setInterval(loadFullPositions, 60 * 60_000);
+    const now = new Date();
+    const nextFundingRefresh = new Date(now);
+    nextFundingRefresh.setMinutes(2, 0, 0);
+    if (nextFundingRefresh <= now) nextFundingRefresh.setHours(nextFundingRefresh.getHours() + 1);
+    let fundingInterval;
+    const fundingTimer = window.setTimeout(() => {
+      loadFullPositions();
+      fundingInterval = window.setInterval(loadFullPositions, 60 * 60_000);
+    }, nextFundingRefresh.getTime() - now.getTime());
     return () => {
       window.clearInterval(opportunityTimer);
       window.clearInterval(accountTimer);
-      window.clearInterval(fundingTimer);
+      window.clearTimeout(fundingTimer);
+      if (fundingInterval) window.clearInterval(fundingInterval);
     };
   }, [load, loadAccount, loadAccountSummary, loadFullPositions]);
 
