@@ -68,6 +68,7 @@ impl IncomeSummary {
 const MAX_RECONCILIATION_ATTEMPTS: u8 = 3;
 const HEDGE_PROTECTION_ORDER_USDT: f64 = 100.0;
 const HEDGE_PROTECTION_INTERVAL_SECONDS: f64 = 1.0;
+const HEDGE_PROTECTION_TOLERANCE_RATIO: f64 = 0.01;
 
 struct PhaseOneResult {
     state: Option<PositionLeg>,
@@ -167,7 +168,7 @@ impl TradingService {
         protected_tokens.dedup();
         HedgeProtectionStatus {
             enabled: self.config.trading_mode == TradingMode::Live,
-            tolerance_usdt: self.config.position_tolerance_usdt,
+            tolerance_percent: HEDGE_PROTECTION_TOLERANCE_RATIO * 100.0,
             order_notional_usdt: HEDGE_PROTECTION_ORDER_USDT,
             interval_seconds: HEDGE_PROTECTION_INTERVAL_SECONDS,
             protected_tokens,
@@ -200,8 +201,7 @@ impl TradingService {
             let short = find_route_leg(&legs, &route.short_exchange, &route.symbol, "short");
             let needs_protection = match (&long, &short) {
                 (Some(long), Some(short)) => {
-                    hedge_quantity_difference_usdt(long, short)
-                        > self.config.position_tolerance_usdt
+                    hedge_notional_imbalance_ratio(long, short) > HEDGE_PROTECTION_TOLERANCE_RATIO
                 }
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
@@ -221,8 +221,7 @@ impl TradingService {
             let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
             let still_unbalanced = match (&long, &short) {
                 (Some(long), Some(short)) => {
-                    hedge_quantity_difference_usdt(long, short)
-                        > self.config.position_tolerance_usdt
+                    hedge_notional_imbalance_ratio(long, short) > HEDGE_PROTECTION_TOLERANCE_RATIO
                 }
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
@@ -262,7 +261,7 @@ impl TradingService {
             token: route.token.clone(),
             event_type: "detecting".into(),
             status: "running".into(),
-            message: "检测到双腿对冲数量不平衡".into(),
+            message: "检测到双腿名义价值偏差超过 1%".into(),
             started_at: now,
             updated_at: now,
             orders: vec![],
@@ -297,16 +296,19 @@ impl TradingService {
                     (leg, "orphan_exit", "检测到一条腿归零，正在批量退出剩余腿")
                 }
                 (Some(long), Some(short)) => {
-                    let difference = hedge_quantity_difference_usdt(&long, &short);
-                    if difference <= self.config.position_tolerance_usdt {
-                        self.complete_protection_event(&event_id, "双腿差额已恢复至容差内")
-                            .await;
+                    let difference_ratio = hedge_notional_imbalance_ratio(&long, &short);
+                    if difference_ratio <= HEDGE_PROTECTION_TOLERANCE_RATIO {
+                        self.complete_protection_event(
+                            &event_id,
+                            "双腿名义价值偏差已恢复至 1% 以内",
+                        )
+                        .await;
                         return;
                     }
-                    if long.quantity > short.quantity {
-                        (long, "mismatch_reduce", "正在削减数量更多的 LONG 腿")
+                    if position_notional(&long) > position_notional(&short) {
+                        (long, "mismatch_reduce", "正在削减名义价值更大的 LONG 腿")
                     } else {
-                        (short, "mismatch_reduce", "正在削减数量更多的 SHORT 腿")
+                        (short, "mismatch_reduce", "正在削减名义价值更大的 SHORT 腿")
                     }
                 }
             };
@@ -315,19 +317,20 @@ impl TradingService {
                 event.message = message.into();
             })
             .await;
-            let other_quantity = actual
+            let current_notional = position_notional(&target);
+            let other_notional = actual
                 .iter()
                 .find(|leg| {
                     leg.symbol == target.symbol
                         && leg.exchange != target.exchange
                         && leg.side != target.side
                 })
-                .map(|leg| leg.quantity)
+                .map(position_notional)
                 .unwrap_or(0.0);
-            let excess_quantity = if event_type == "orphan_exit" {
-                target.quantity
+            let excess_notional = if event_type == "orphan_exit" {
+                current_notional
             } else {
-                (target.quantity - other_quantity).max(0.0)
+                (current_notional - other_notional).max(0.0)
             };
             let metadata = match market_legs
                 .iter()
@@ -342,7 +345,7 @@ impl TradingService {
             };
             let quantity = protection_order_quantity(
                 &target,
-                excess_quantity,
+                excess_notional,
                 metadata.qty_step,
                 event_type == "orphan_exit",
             );
@@ -2864,9 +2867,15 @@ fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
 }
 
-fn hedge_quantity_difference_usdt(long: &PositionLeg, short: &PositionLeg) -> f64 {
-    let reference_price = (long.mark_price + short.mark_price) / 2.0;
-    (long.quantity - short.quantity).abs() * reference_price
+fn hedge_notional_imbalance_ratio(long: &PositionLeg, short: &PositionLeg) -> f64 {
+    let long_notional = position_notional(long);
+    let short_notional = position_notional(short);
+    let larger = long_notional.max(short_notional);
+    if larger <= f64::EPSILON {
+        0.0
+    } else {
+        (long_notional - short_notional).abs() / larger
+    }
 }
 
 fn find_route_leg(
@@ -2876,13 +2885,18 @@ fn find_route_leg(
     side: &str,
 ) -> Option<PositionLeg> {
     legs.iter()
-        .find(|leg| leg.exchange == exchange && leg.symbol == symbol && leg.side == side)
+        .find(|leg| {
+            leg.exchange == exchange
+                && leg.symbol == symbol
+                && leg.side == side
+                && position_notional(leg) > f64::EPSILON
+        })
         .cloned()
 }
 
 fn protection_order_quantity(
     leg: &PositionLeg,
-    excess_quantity: f64,
+    excess_notional: f64,
     qty_step: f64,
     close_entire_leg: bool,
 ) -> f64 {
@@ -2890,7 +2904,7 @@ fn protection_order_quantity(
         leg.quantity
     } else {
         floor_step(
-            excess_quantity.min(HEDGE_PROTECTION_ORDER_USDT / leg.mark_price),
+            HEDGE_PROTECTION_ORDER_USDT.min(excess_notional) / leg.mark_price,
             qty_step,
         )
     }
@@ -3002,25 +3016,26 @@ mod tests {
         let mut leg = test_position().long;
         leg.quantity = 100.0;
         leg.mark_price = 10.0;
-        assert_eq!(protection_order_quantity(&leg, 100.0, 0.01, false), 10.0);
-        assert_eq!(protection_order_quantity(&leg, 5.0, 0.01, false), 5.0);
+        assert_eq!(protection_order_quantity(&leg, 1_000.0, 0.01, false), 10.0);
+        assert_eq!(protection_order_quantity(&leg, 50.0, 0.01, false), 5.0);
 
         leg.quantity = 8.0;
         assert_eq!(protection_order_quantity(&leg, 8.0, 0.01, true), 8.0);
     }
 
     #[test]
-    fn hedge_protection_ignores_cross_exchange_price_spread() {
+    fn hedge_protection_uses_relative_notional_difference_without_dividing_by_zero() {
         let mut long = test_position().long;
         let mut short = test_position().short;
         long.quantity = 50.0;
         short.quantity = 50.0;
         long.mark_price = 4.50;
         short.mark_price = 4.00;
-        assert_eq!(hedge_quantity_difference_usdt(&long, &short), 0.0);
+        assert!((hedge_notional_imbalance_ratio(&long, &short) - (25.0 / 225.0)).abs() < 1e-9);
 
-        short.quantity = 48.0;
-        assert!((hedge_quantity_difference_usdt(&long, &short) - 8.5).abs() < 1e-9);
+        long.quantity = 0.0;
+        short.quantity = 0.0;
+        assert_eq!(hedge_notional_imbalance_ratio(&long, &short), 0.0);
     }
 
     #[test]

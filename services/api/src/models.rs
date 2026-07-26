@@ -205,7 +205,7 @@ pub struct HedgeProtectionEvent {
 #[serde(rename_all = "camelCase")]
 pub struct HedgeProtectionStatus {
     pub enabled: bool,
-    pub tolerance_usdt: f64,
+    pub tolerance_percent: f64,
     pub order_notional_usdt: f64,
     pub interval_seconds: f64,
     pub protected_tokens: Vec<String>,
