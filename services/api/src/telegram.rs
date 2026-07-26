@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 const API_TIMEOUT_SECONDS: u64 = 25;
 const DEFAULT_NOTIONAL: f64 = 100.0;
@@ -86,10 +86,6 @@ pub fn spawn(config: TelegramConfig, state: Arc<AppState>) {
             .expect("Telegram HTTP client"),
         state,
     };
-    let notifier = bot.clone();
-    tokio::spawn(async move {
-        notifier.run_protection_notifications().await;
-    });
     tokio::spawn(async move {
         tracing::info!("Telegram bot enabled with long polling");
         if let Err(error) = bot.run().await {
@@ -935,50 +931,32 @@ impl TelegramBot {
                 status.protected_tokens.join("、")
             }
         );
-        for event in status.events.iter().rev().take(5).rev() {
+        for event in status
+            .events
+            .iter()
+            .rev()
+            .filter(|event| !event.orders.is_empty() || event.status == "failed")
+            .take(5)
+        {
+            let initial_long = event.initial_long_notional_usdt.unwrap_or(0.0);
+            let initial_short = event.initial_short_notional_usdt.unwrap_or(0.0);
+            let final_long = event.final_long_notional_usdt.unwrap_or(initial_long);
+            let final_short = event.final_short_notional_usdt.unwrap_or(initial_short);
             text.push_str(&format!(
-                "\n\n<b>{} · {}</b>\n{} · {} 笔订单",
+                "\n\n<b>{}</b>：LONG ${:.2} → ${:.2}；SHORT ${:.2} → ${:.2} · {} 笔",
                 html(&event.token),
-                html(&event.status),
-                html(&event.message),
+                initial_long,
+                final_long,
+                initial_short,
+                final_short,
                 event.orders.len()
             ));
+            if event.status == "failed" {
+                text.push_str(&format!("\n失败：{}", html(&event.message)));
+            }
         }
         self.send(&text, vec![vec![button("刷新", "protect")]])
             .await
-    }
-
-    async fn run_protection_notifications(&self) {
-        let mut known = HashMap::<String, String>::new();
-        loop {
-            let status = self.state.trading.hedge_protection_status().await;
-            for event in status.events {
-                let previous = known.insert(event.id.clone(), event.status.clone());
-                if previous.as_deref() == Some(event.status.as_str()) {
-                    continue;
-                }
-                let icon = match event.status.as_str() {
-                    "failed" => "🚨",
-                    "completed" => "✅",
-                    _ => "⚠️",
-                };
-                let message = format!(
-                    "{} <b>双腿保护 · {}</b>\n{}\n状态：{} · reduceOnly 订单 {} 笔",
-                    icon,
-                    html(&event.token),
-                    html(&event.message),
-                    html(&event.status),
-                    event.orders.len()
-                );
-                if let Err(error) = self
-                    .send(&message, vec![vec![button("查看保护状态", "protect")]])
-                    .await
-                {
-                    tracing::warn!("Telegram protection notification failed: {error:#}");
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
     }
 
     async fn confirm_auto_close(

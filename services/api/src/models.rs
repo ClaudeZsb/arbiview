@@ -198,6 +198,10 @@ pub struct HedgeProtectionEvent {
     pub message: String,
     pub started_at: i64,
     pub updated_at: i64,
+    pub initial_long_notional_usdt: Option<f64>,
+    pub initial_short_notional_usdt: Option<f64>,
+    pub final_long_notional_usdt: Option<f64>,
+    pub final_short_notional_usdt: Option<f64>,
     pub orders: Vec<OrderExecution>,
 }
 

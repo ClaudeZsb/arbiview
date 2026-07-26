@@ -263,6 +263,10 @@ impl TradingService {
             message: "检测到双腿名义价值偏差超过 1%".into(),
             started_at: now,
             updated_at: now,
+            initial_long_notional_usdt: None,
+            initial_short_notional_usdt: None,
+            final_long_notional_usdt: None,
+            final_short_notional_usdt: None,
             orders: vec![],
         };
         self.push_protection_event(initial).await;
@@ -285,6 +289,17 @@ impl TradingService {
             };
             let long = find_route_leg(&actual, &route.long_exchange, &route.symbol, "long");
             let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
+            let long_notional = long.as_ref().map(position_notional).unwrap_or(0.0);
+            let short_notional = short.as_ref().map(position_notional).unwrap_or(0.0);
+            self.update_protection_event(&event_id, |event| {
+                if event.initial_long_notional_usdt.is_none() {
+                    event.initial_long_notional_usdt = Some(long_notional);
+                    event.initial_short_notional_usdt = Some(short_notional);
+                }
+                event.final_long_notional_usdt = Some(long_notional);
+                event.final_short_notional_usdt = Some(short_notional);
+            })
+            .await;
             let (target, event_type, message) = match (long, short) {
                 (None, None) => {
                     self.complete_protection_event(&event_id, "双腿仓位均已归零")
