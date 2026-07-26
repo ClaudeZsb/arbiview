@@ -1771,10 +1771,14 @@ impl TradingService {
             let short_notional = short.as_ref().map(position_notional).unwrap_or(0.0);
             result.long = long;
             result.short = short;
-            let difference = (long_notional - short_notional).abs();
-            if difference <= self.config.position_tolerance_usdt {
+            if let (Some(long), Some(short)) = (&result.long, &result.short) {
+                if !hedge_notional_needs_protection(long, short) {
+                    break;
+                }
+            } else if long_notional <= f64::EPSILON && short_notional <= f64::EPSILON {
                 break;
             }
+            let difference = (long_notional - short_notional).abs();
             let (leg, side, reference) = if long_notional > short_notional {
                 (long_leg, "Sell", result.long.as_ref().map(|x| x.mark_price))
             } else {
@@ -1849,6 +1853,8 @@ impl TradingService {
             .ok_or_else(|| anyhow!("position not found"))?;
         let original_long = position_notional(&position.long);
         let original_short = position_notional(&position.short);
+        let original_long_quantity = position.long.quantity;
+        let original_short_quantity = position.short.quantity;
         if notional_usdt >= original_long.min(original_short) {
             bail!("reduction is too close to the full position; use close for a full exit");
         }
@@ -1935,20 +1941,42 @@ impl TradingService {
         let short = phase_two.short;
         report.long_notional_usdt = long.as_ref().map(position_notional).unwrap_or(0.0);
         report.short_notional_usdt = short.as_ref().map(position_notional).unwrap_or(0.0);
-        report.balanced = (report.long_notional_usdt - report.short_notional_usdt).abs()
-            <= self.config.position_tolerance_usdt;
+        report.balanced = match (&long, &short) {
+            (Some(long), Some(short)) => !hedge_notional_needs_protection(long, short),
+            (None, None) => true,
+            _ => false,
+        };
         if !report.balanced {
+            let mismatch = (report.long_notional_usdt - report.short_notional_usdt).abs();
+            let mismatch_percent = match (&long, &short) {
+                (Some(long), Some(short)) => hedge_notional_imbalance_ratio(long, short) * 100.0,
+                _ => 100.0,
+            };
             bail!(
-                "NAKED_EXPOSURE: reduction reconciliation failed; actual mismatch is {:.2} USDT",
-                (report.long_notional_usdt - report.short_notional_usdt).abs()
+                "NAKED_EXPOSURE: reduction reconciliation failed; actual mismatch is {:.2} USDT ({:.2}%)",
+                mismatch,
+                mismatch_percent
             );
         }
-        if original_long - report.long_notional_usdt
-            < notional_usdt - self.config.position_tolerance_usdt
-            || original_short - report.short_notional_usdt
-                < notional_usdt - self.config.position_tolerance_usdt
+        let long_reduced_usdt = reduced_notional_at_reference(
+            original_long_quantity,
+            long.as_ref().map(|leg| leg.quantity).unwrap_or(0.0),
+            position.long.mark_price,
+        );
+        let short_reduced_usdt = reduced_notional_at_reference(
+            original_short_quantity,
+            short.as_ref().map(|leg| leg.quantity).unwrap_or(0.0),
+            position.short.mark_price,
+        );
+        if long_reduced_usdt < notional_usdt - self.config.position_tolerance_usdt
+            || short_reduced_usdt < notional_usdt - self.config.position_tolerance_usdt
         {
-            bail!("reduction target was not reached; actual positions remain balanced");
+            bail!(
+                "reduction target was not reached; target {:.2} USDT, actual LONG {:.2} / SHORT {:.2} USDT",
+                notional_usdt,
+                long_reduced_usdt,
+                short_reduced_usdt
+            );
         }
         let long =
             long.ok_or_else(|| anyhow!("position was fully closed; refresh the position list"))?;
@@ -2946,6 +2974,14 @@ fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
 }
 
+fn reduced_notional_at_reference(
+    original_quantity: f64,
+    final_quantity: f64,
+    reference_price: f64,
+) -> f64 {
+    (original_quantity - final_quantity).max(0.0) * reference_price
+}
+
 fn apply_position_quotes(legs: &mut [PositionLeg], quotes: &[PositionQuote]) {
     for leg in legs {
         let Some(quote) = quotes
@@ -3157,6 +3193,12 @@ mod tests {
 
         long.quantity = 2.01;
         assert!(hedge_notional_needs_protection(&long, &short));
+    }
+
+    #[test]
+    fn reduction_progress_uses_quantity_change_at_a_stable_reference_price() {
+        assert!((reduced_notional_at_reference(100.0, 90.0, 10.0) - 100.0).abs() < 1e-9);
+        assert_eq!(reduced_notional_at_reference(100.0, 100.5, 10.0), 0.0);
     }
 
     #[test]
