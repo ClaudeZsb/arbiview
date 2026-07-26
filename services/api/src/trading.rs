@@ -2546,7 +2546,7 @@ impl TradingService {
         let json = self
             .bybit_signed(
                 Method::GET,
-                "/v5/account/wallet-balance?accountType=UNIFIED",
+                "/v5/account/wallet-balance?accountType=UNIFIED&coin=USDT",
                 None,
             )
             .await?;
@@ -2556,7 +2556,7 @@ impl TradingService {
             .ok_or_else(|| anyhow!("Bybit wallet missing"))?;
         Ok((
             number(&account["totalEquity"]).unwrap_or(0.0),
-            number(&account["totalAvailableBalance"]).unwrap_or(0.0),
+            bybit_available_usdt(account),
             number(&account["totalPerpUPL"]).unwrap_or(0.0),
         ))
     }
@@ -2864,6 +2864,22 @@ fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
 }
 
+fn bybit_available_usdt(account: &Value) -> f64 {
+    let available_usd = number(&account["totalAvailableBalance"]).unwrap_or(0.0);
+    let usdt = account["coin"]
+        .as_array()
+        .and_then(|coins| coins.iter().find(|coin| coin["coin"] == "USDT"));
+    let usdt_usd_price = usdt
+        .and_then(|coin| {
+            let wallet_balance = number(&coin["walletBalance"])?;
+            let usd_value = number(&coin["usdValue"])?;
+            (wallet_balance.abs() > f64::EPSILON).then_some((usd_value / wallet_balance).abs())
+        })
+        .filter(|price| price.is_finite() && *price > f64::EPSILON)
+        .unwrap_or(1.0);
+    available_usd / usdt_usd_price
+}
+
 fn hedge_notional_imbalance_ratio(long: &PositionLeg, short: &PositionLeg) -> f64 {
     let long_notional = position_notional(long);
     let short_notional = position_notional(short);
@@ -3053,6 +3069,22 @@ mod tests {
 
         long.quantity = 2.01;
         assert!(hedge_notional_needs_protection(&long, &short));
+    }
+
+    #[test]
+    fn bybit_available_balance_is_converted_from_usd_to_usdt() {
+        let account = json!({
+            "totalAvailableBalance": "99",
+            "coin": [{
+                "coin": "USDT",
+                "walletBalance": "100",
+                "usdValue": "99"
+            }]
+        });
+        assert!((bybit_available_usdt(&account) - 100.0).abs() < 1e-9);
+
+        let empty = json!({"totalAvailableBalance": "50", "coin": []});
+        assert_eq!(bybit_available_usdt(&empty), 50.0);
     }
 
     #[test]

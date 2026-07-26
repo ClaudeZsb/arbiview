@@ -314,7 +314,7 @@ function AccountBoard({ account, positions, protection, onClose, onAdjust, busyI
           </article>
         ))}
       </div>
-      <p className="balance-note">未实现盈亏仅统计当前未平仓仓位；已实现盈亏只统计当前跨所套利合约近 {account?.realizedPeriodDays || 7} 日的平仓损益加 Funding 净额再减交易手续费，不含账户内其他策略。Bybit 可用金额为 Unified Account 的 USD 口径，可能低于账户权益。</p>
+      <p className="balance-note">未实现盈亏仅统计当前未平仓仓位；已实现盈亏只统计当前跨所套利合约近 {account?.realizedPeriodDays || 7} 日的平仓损益加 Funding 净额再减交易手续费，不含账户内其他策略。Bybit 可用金额已按 USDT 的 USD 价值从 Unified Account 可用余额换算为 USDT，可能低于账户权益。</p>
       {protection?.enabled && (
         <div className="protection-status">
           <b><ShieldCheck size={14} /> 双腿保护运行中</b>
