@@ -183,6 +183,19 @@ h1 em { color: var(--green); font-style: normal; }
 .position-leg-detail { min-height: 43px; padding: 0 13px; border: 1px solid var(--line); border-bottom: 0; background: white; }
 .position-leg-detail:nth-of-type(3) { border-bottom: 1px solid var(--line); }
 .position-leg-detail b { font: 500 10px DM Mono, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spread-chart { margin: 14px 0 2px; padding: 14px 16px 8px; border: 1px solid var(--line); background: #fff; }
+.spread-chart-title { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 5px; }
+.spread-chart-title div { display: grid; gap: 3px; }
+.spread-chart-title b { font-size: 13px; }
+.spread-chart-title span, .spread-chart-empty { color: var(--muted); font-size: 10px; }
+.spread-chart-title strong { font: 700 18px DM Mono, monospace; }
+.spread-chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.spread-chart text { fill: var(--muted); font: 9px DM Mono, monospace; }
+.spread-grid { stroke: #e8eeeb; stroke-width: 1; }
+.spread-zero { stroke: #82928c; stroke-width: 1; stroke-dasharray: 4 4; }
+.spread-line { fill: none; stroke: #087d5a; stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+.spread-point { fill: #fff; stroke: #087d5a; stroke-width: 2; }
+.spread-chart-empty { padding: 18px; border: 1px dashed var(--line); }
 .leg-detail-title { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .side-dot { width: 11px; height: 11px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px rgba(0,0,0,.04); }
 .side-dot.long { background: #13a36f; }

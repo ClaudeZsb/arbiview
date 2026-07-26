@@ -286,7 +286,53 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
   );
 }
 
-function AccountBoard({ account, positions, protection, onClose, onAdjust, busyId }) {
+function SpreadHistoryChart({ data }) {
+  const points = data?.points || [];
+  if (points.length < 2) return <div className="spread-chart-empty">正在读取 DEXE 24h 价差…</div>;
+  const width = 900;
+  const height = 220;
+  const pad = { top: 22, right: 24, bottom: 34, left: 58 };
+  const values = points.map((point) => point.spreadPercent);
+  const rawMin = Math.min(...values, 0);
+  const rawMax = Math.max(...values, 0);
+  const margin = Math.max((rawMax - rawMin) * 0.12, 0.02);
+  const min = rawMin - margin;
+  const max = rawMax + margin;
+  const x = (index) => pad.left + index * (width - pad.left - pad.right) / (points.length - 1);
+  const y = (value) => pad.top + (max - value) * (height - pad.top - pad.bottom) / (max - min);
+  const line = points.map((point, index) => `${index ? "L" : "M"} ${x(index).toFixed(2)} ${y(point.spreadPercent).toFixed(2)}`).join(" ");
+  const latest = points.at(-1)?.spreadPercent || 0;
+  return (
+    <div className="spread-chart">
+      <div className="spread-chart-title">
+        <div><b>DEXE 近 24h 跨所价差</b><span>每小时收盘 · (Bybit − Binance) / Binance</span></div>
+        <strong className={latest >= 0 ? "positive" : "negative"}>{latest >= 0 ? "+" : ""}{latest.toFixed(3)}%</strong>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="DEXE 最近24小时 Binance 与 Bybit 价差折线图">
+        <line className="spread-zero" x1={pad.left} x2={width - pad.right} y1={y(0)} y2={y(0)} />
+        {[min, (min + max) / 2, max].map((value) => (
+          <g key={value}>
+            <line className="spread-grid" x1={pad.left} x2={width - pad.right} y1={y(value)} y2={y(value)} />
+            <text x={pad.left - 8} y={y(value) + 3} textAnchor="end">{value.toFixed(2)}%</text>
+          </g>
+        ))}
+        <path className="spread-line" d={line} />
+        {points.map((point, index) => (
+          <g key={point.timestamp}>
+            <circle className="spread-point" cx={x(index)} cy={y(point.spreadPercent)} r="3">
+              <title>{new Date(point.timestamp).toLocaleString("zh-CN")} · Binance ${price(point.binanceClose)} · Bybit ${price(point.bybitClose)} · {point.spreadPercent >= 0 ? "+" : ""}{point.spreadPercent.toFixed(3)}%</title>
+            </circle>
+            {(index === 0 || index === points.length - 1 || index % 6 === 0) && (
+              <text x={x(index)} y={height - 10} textAnchor="middle">{new Date(point.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</text>
+            )}
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function AccountBoard({ account, positions, protection, spreadHistory, onClose, onAdjust, busyId }) {
   return (
     <section className="account-board" id="account">
       <div className="section-head">
@@ -386,6 +432,7 @@ function AccountBoard({ account, positions, protection, onClose, onAdjust, busyI
                 </div>
               ))}
               <p>Funding 为交易所账户近 7 日该合约资金费净额；正数表示收到，负数表示支付。</p>
+              {p.token === "DEXE" && <SpreadHistoryChart data={spreadHistory} />}
             </div>
           </details>
         ))}
@@ -403,6 +450,7 @@ export default function Dashboard() {
   const [minApy, setMinApy] = useState(0);
   const [account, setAccount] = useState(null);
   const [positions, setPositions] = useState([]);
+  const [spreadHistory, setSpreadHistory] = useState(null);
   const [protection, setProtection] = useState(null);
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
@@ -485,11 +533,24 @@ export default function Dashboard() {
     }
   }, []);
 
+  const loadSpreadHistory = useCallback(async () => {
+    try {
+      const response = await fetch("/backend/spread-history/DEXEUSDT", { cache: "no-store" });
+      const history = await response.json();
+      if (!response.ok) throw new Error(history.error);
+      setSpreadHistory(history);
+    } catch (e) {
+      setNotice(`价差历史：${e.message}`);
+    }
+  }, []);
+
   useEffect(() => {
     load();
     loadAccount();
+    loadSpreadHistory();
     const opportunityTimer = window.setInterval(load, 20_000);
     const accountTimer = window.setInterval(loadAccountSummary, 20_000);
+    const spreadTimer = window.setInterval(loadSpreadHistory, 60 * 60_000);
     const now = new Date();
     const nextFundingRefresh = new Date(now);
     nextFundingRefresh.setMinutes(2, 0, 0);
@@ -502,10 +563,11 @@ export default function Dashboard() {
     return () => {
       window.clearInterval(opportunityTimer);
       window.clearInterval(accountTimer);
+      window.clearInterval(spreadTimer);
       window.clearTimeout(fundingTimer);
       if (fundingInterval) window.clearInterval(fundingInterval);
     };
-  }, [load, loadAccount, loadAccountSummary, loadFullPositions]);
+  }, [load, loadAccount, loadAccountSummary, loadFullPositions, loadSpreadHistory]);
 
   const positionSubscriptionKey = useMemo(
     () => account?.mode === "live" ? positions
@@ -819,7 +881,7 @@ export default function Dashboard() {
 
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
 
-      <AccountBoard account={account} positions={positions} protection={protection} onClose={closePosition} onAdjust={(position, type) => {
+      <AccountBoard account={account} positions={positions} protection={protection} spreadHistory={spreadHistory} onClose={closePosition} onAdjust={(position, type) => {
         if (type === "increase" || type === "reduce") {
           if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {
             setNotice("已有批量仓位任务正在执行，请先等待完成或停止任务");

@@ -89,6 +89,23 @@ pub struct PositionQuote {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SpreadHistoryPoint {
+    pub timestamp: i64,
+    pub binance_close: f64,
+    pub bybit_close: f64,
+    pub spread_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpreadHistoryResponse {
+    pub symbol: String,
+    pub formula: String,
+    pub points: Vec<SpreadHistoryPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Position {
     pub id: String,
     pub token: String,

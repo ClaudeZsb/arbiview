@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/api/opportunities", get(opportunities))
         .route("/api/position-quotes", get(position_quotes))
+        .route("/api/spread-history/:symbol", get(spread_history))
         .route("/api/account/summary", get(account_summary))
         .route("/api/account/hedge-protection", get(hedge_protection))
         .route("/api/positions", get(positions))
@@ -90,6 +91,13 @@ async fn position_quotes(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.market.position_quotes().await?))
+}
+
+async fn spread_history(
+    State(state): State<Arc<AppState>>,
+    Path(symbol): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.market.spread_history(&symbol).await?))
 }
 
 async fn account_summary(

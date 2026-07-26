@@ -1,5 +1,5 @@
 use crate::{config::Config, models::*};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde_json::Value;
 use std::{
@@ -220,6 +220,56 @@ impl MarketService {
         }
         *self.quote_cache.write().await = Some((Instant::now(), quotes.clone()));
         Ok(quotes)
+    }
+
+    pub async fn spread_history(&self, symbol: &str) -> Result<SpreadHistoryResponse> {
+        let symbol = symbol.trim().to_ascii_uppercase();
+        if !symbol.ends_with("USDT") || !symbol.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+            bail!("symbol must be an alphanumeric USDT perpetual symbol");
+        }
+        let (binance, bybit): (Value, Value) = tokio::try_join!(
+            self.get_json(format!(
+                "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1h&limit=25"
+            )),
+            self.get_json(format!(
+                "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=60&limit=25"
+            ))
+        )?;
+        let binance_closes = binance
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|candle| Some((candle[0].as_i64()?, parse(&candle[4])?)))
+            .collect::<HashMap<_, _>>();
+        let bybit_closes = bybit["result"]["list"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|candle| {
+                Some((candle[0].as_str()?.parse::<i64>().ok()?, parse(&candle[4])?))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut points = binance_closes
+            .into_iter()
+            .filter_map(|(timestamp, binance_close)| {
+                let bybit_close = *bybit_closes.get(&timestamp)?;
+                (binance_close > 0.0).then_some(SpreadHistoryPoint {
+                    timestamp,
+                    binance_close,
+                    bybit_close,
+                    spread_percent: (bybit_close - binance_close) / binance_close * 100.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        points.sort_by_key(|point| point.timestamp);
+        if points.len() > 24 {
+            points.drain(..points.len() - 24);
+        }
+        Ok(SpreadHistoryResponse {
+            symbol,
+            formula: "(Bybit - Binance) / Binance × 100%".into(),
+            points,
+        })
     }
 
     pub async fn trading_legs(&self) -> Result<Vec<Leg>> {
