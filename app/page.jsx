@@ -332,7 +332,47 @@ function SpreadHistoryChart({ data }) {
   );
 }
 
-function AccountBoard({ account, positions, protection, spreadHistory, onClose, onAdjust, busyId }) {
+function AutoCloseControl({ position, rule, busy, onSet, onCancel }) {
+  const [threshold, setThreshold] = useState(rule?.thresholdApyPercent ?? 300);
+  const [orderNotional, setOrderNotional] = useState(rule?.orderNotionalUsdt ?? 100);
+  const [intervalSeconds, setIntervalSeconds] = useState(rule?.intervalSeconds ?? 2);
+  const statusText = {
+    armed: "监控中",
+    triggered: "已触发",
+    closing: "平仓中",
+    completed: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
+    replaced: "已替换"
+  }[rule?.status] || rule?.status;
+  return (
+    <div className="auto-close-control">
+      <div className="auto-close-head">
+        <div><b>APY 阈值自动平仓</b><span>连续 3 次（约 45 秒）低于阈值后触发双腿批量退出</span></div>
+        {rule && <strong className={`auto-close-status ${rule.status}`}>{statusText}</strong>}
+      </div>
+      <div className="auto-close-fields">
+        <label>触发 APY 低于<input type="number" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} /><span>%</span></label>
+        <label>单笔金额<input type="number" min="10" step="10" value={orderNotional} onChange={(event) => setOrderNotional(Number(event.target.value))} /><span>USDT</span></label>
+        <label>下单间隔<input type="number" min="0.5" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /><span>秒</span></label>
+        <button disabled={busy || orderNotional < 10 || intervalSeconds < 0.5} onClick={() => onSet(position.id, { thresholdApyPercent: threshold, orderNotionalUsdt: orderNotional, intervalSeconds })}>
+          {busy ? "保存中…" : rule?.status === "armed" ? "更新规则" : "启用自动平仓"}
+        </button>
+        {rule?.status === "armed" && <button className="cancel" disabled={busy} onClick={() => onCancel(rule.id)}>取消</button>}
+      </div>
+      {rule && (
+        <div className="auto-close-meta">
+          <span>当前 APY：{rule.currentApyPercent == null ? "等待有效行情" : `${rule.currentApyPercent.toFixed(2)}%`}</span>
+          <span>低于阈值连续读数：{rule.consecutiveLowReadings}/3</span>
+          <span>已平仓：{money(rule.completedNotionalUsdt)}</span>
+          {rule.error && <span className="negative">错误：{rule.error}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AccountBoard({ account, positions, protection, spreadHistory, autoCloseRules, onSetAutoClose, onCancelAutoClose, autoCloseBusy, onClose, onAdjust, busyId }) {
   return (
     <section className="account-board" id="account">
       <div className="section-head">
@@ -432,6 +472,13 @@ function AccountBoard({ account, positions, protection, spreadHistory, onClose, 
                 </div>
               ))}
               <p>Funding 为交易所账户近 7 日该合约资金费净额；正数表示收到，负数表示支付。</p>
+              <AutoCloseControl
+                position={p}
+                rule={autoCloseRules.find((rule) => rule.positionId === p.id && ["armed", "triggered", "closing"].includes(rule.status)) || autoCloseRules.find((rule) => rule.positionId === p.id)}
+                busy={autoCloseBusy === p.id}
+                onSet={onSetAutoClose}
+                onCancel={onCancelAutoClose}
+              />
               {p.token === "DEXE" && <SpreadHistoryChart data={spreadHistory} />}
             </div>
           </details>
@@ -451,6 +498,8 @@ export default function Dashboard() {
   const [account, setAccount] = useState(null);
   const [positions, setPositions] = useState([]);
   const [spreadHistory, setSpreadHistory] = useState(null);
+  const [autoCloseRules, setAutoCloseRules] = useState([]);
+  const [autoCloseBusy, setAutoCloseBusy] = useState("");
   const [protection, setProtection] = useState(null);
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
@@ -484,19 +533,22 @@ export default function Dashboard() {
   const loadAccount = useCallback(async () => {
     if (Date.now() < accountBackoffUntil.current) return;
     try {
-      const [summaryResponse, positionsResponse, protectionResponse] = await Promise.all([
+      const [summaryResponse, positionsResponse, protectionResponse, autoCloseResponse] = await Promise.all([
         fetch("/backend/account/summary", { cache: "no-store" }),
         fetch("/backend/positions", { cache: "no-store" }),
-        fetch("/backend/account/hedge-protection", { cache: "no-store" })
+        fetch("/backend/account/hedge-protection", { cache: "no-store" }),
+        fetch("/backend/auto-close", { cache: "no-store" })
       ]);
       const summary = await summaryResponse.json();
       const active = await positionsResponse.json();
       const protectionStatus = await protectionResponse.json();
+      const rules = await autoCloseResponse.json();
       if (summaryResponse.ok) setAccount(summary);
       if (positionsResponse.ok) setPositions(active);
       if (protectionResponse.ok) setProtection(protectionStatus);
-      if (!summaryResponse.ok || !positionsResponse.ok || !protectionResponse.ok) {
-        throw new Error(summary.error || active.error || protectionStatus.error);
+      if (autoCloseResponse.ok) setAutoCloseRules(rules);
+      if (!summaryResponse.ok || !positionsResponse.ok || !protectionResponse.ok || !autoCloseResponse.ok) {
+        throw new Error(summary.error || active.error || protectionStatus.error || rules.error);
       }
       accountBackoffUntil.current = 0;
     } catch (e) {
@@ -544,12 +596,24 @@ export default function Dashboard() {
     }
   }, []);
 
+  const loadAutoCloseRules = useCallback(async () => {
+    try {
+      const response = await fetch("/backend/auto-close", { cache: "no-store" });
+      const rules = await response.json();
+      if (!response.ok) throw new Error(rules.error);
+      setAutoCloseRules(rules);
+    } catch (e) {
+      setNotice(`自动平仓：${e.message}`);
+    }
+  }, []);
+
   useEffect(() => {
     load();
     loadAccount();
     loadSpreadHistory();
     const opportunityTimer = window.setInterval(load, 20_000);
     const accountTimer = window.setInterval(loadAccountSummary, 20_000);
+    const autoCloseTimer = window.setInterval(loadAutoCloseRules, 15_000);
     const spreadTimer = window.setInterval(loadSpreadHistory, 60 * 60_000);
     const now = new Date();
     const nextFundingRefresh = new Date(now);
@@ -563,11 +627,12 @@ export default function Dashboard() {
     return () => {
       window.clearInterval(opportunityTimer);
       window.clearInterval(accountTimer);
+      window.clearInterval(autoCloseTimer);
       window.clearInterval(spreadTimer);
       window.clearTimeout(fundingTimer);
       if (fundingInterval) window.clearInterval(fundingInterval);
     };
-  }, [load, loadAccount, loadAccountSummary, loadFullPositions, loadSpreadHistory]);
+  }, [load, loadAccount, loadAccountSummary, loadAutoCloseRules, loadFullPositions, loadSpreadHistory]);
 
   const positionSubscriptionKey = useMemo(
     () => account?.mode === "live" ? positions
@@ -833,6 +898,41 @@ export default function Dashboard() {
     }
   }
 
+  async function setAutoClose(positionId, request) {
+    setAutoCloseBusy(positionId);
+    try {
+      const response = await fetch(`/backend/positions/${positionId}/auto-close`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request)
+      });
+      const rule = await response.json();
+      if (!response.ok) throw new Error(rule.error);
+      setNotice(`${rule.token} 自动平仓已启用：APY 低于 ${rule.thresholdApyPercent}% 时，每单 ${money(rule.orderNotionalUsdt)} / ${rule.intervalSeconds}s`);
+      await loadAutoCloseRules();
+    } catch (error) {
+      setNotice(`设置自动平仓失败：${error.message}`);
+    } finally {
+      setAutoCloseBusy("");
+    }
+  }
+
+  async function cancelAutoClose(ruleId) {
+    const rule = autoCloseRules.find((item) => item.id === ruleId);
+    setAutoCloseBusy(rule?.positionId || ruleId);
+    try {
+      const response = await fetch(`/backend/auto-close/${ruleId}/cancel`, { method: "POST" });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error);
+      setNotice(`${result.token} 自动平仓规则已取消`);
+      await loadAutoCloseRules();
+    } catch (error) {
+      setNotice(`取消自动平仓失败：${error.message}`);
+    } finally {
+      setAutoCloseBusy("");
+    }
+  }
+
   const rows = useMemo(() => {
     const list = (data?.opportunities || []).filter((x) =>
       [x.token.symbol, x.token.name, ...(x.token.tags || [])]
@@ -881,7 +981,7 @@ export default function Dashboard() {
 
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
 
-      <AccountBoard account={account} positions={positions} protection={protection} spreadHistory={spreadHistory} onClose={closePosition} onAdjust={(position, type) => {
+      <AccountBoard account={account} positions={positions} protection={protection} spreadHistory={spreadHistory} autoCloseRules={autoCloseRules} onSetAutoClose={setAutoClose} onCancelAutoClose={cancelAutoClose} autoCloseBusy={autoCloseBusy} onClose={closePosition} onAdjust={(position, type) => {
         if (type === "increase" || type === "reduce") {
           if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {
             setNotice("已有批量仓位任务正在执行，请先等待完成或停止任务");

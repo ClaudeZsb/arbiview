@@ -196,6 +196,24 @@ h1 em { color: var(--green); font-style: normal; }
 .spread-line { fill: none; stroke: #087d5a; stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
 .spread-point { fill: #fff; stroke: #087d5a; stroke-width: 2; }
 .spread-chart-empty { padding: 18px; border: 1px dashed var(--line); }
+.auto-close-control { margin: 14px 0 2px; padding: 14px 16px; border: 1px solid #dacb98; background: #fffaf0; }
+.auto-close-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.auto-close-head > div { display: grid; gap: 3px; }
+.auto-close-head b { font-size: 13px; }
+.auto-close-head span, .auto-close-meta { color: var(--muted); font-size: 10px; }
+.auto-close-status { padding: 4px 8px; border: 1px solid #c9b46d; color: #7a6318; font: 600 10px DM Mono, monospace; }
+.auto-close-status.closing, .auto-close-status.triggered { color: #c44c32; border-color: #df947f; }
+.auto-close-status.completed { color: var(--green); border-color: #79bda6; }
+.auto-close-status.failed { color: var(--negative); border-color: #e89988; }
+.auto-close-fields { display: grid; grid-template-columns: repeat(3, minmax(150px, 1fr)) auto auto; gap: 9px; align-items: end; }
+.auto-close-fields label { display: grid; grid-template-columns: 1fr auto; gap: 5px; align-items: center; color: var(--muted); font-size: 9px; }
+.auto-close-fields label input { grid-column: 1; width: 100%; min-width: 0; height: 34px; border: 1px solid var(--line); padding: 0 9px; background: #fff; font: 500 11px DM Mono, monospace; }
+.auto-close-fields label span { grid-column: 2; grid-row: 2; }
+.auto-close-fields button { height: 34px; padding: 0 13px; border: 1px solid var(--ink); background: var(--ink); color: #fff; cursor: pointer; white-space: nowrap; }
+.auto-close-fields button.cancel { border-color: #dc8d76; background: transparent; color: #bd4b30; }
+.auto-close-fields button:disabled { opacity: .45; cursor: wait; }
+.auto-close-meta { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; }
+@media (max-width: 900px) { .auto-close-fields { grid-template-columns: 1fr 1fr; } }
 .leg-detail-title { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .side-dot { width: 11px; height: 11px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 3px rgba(0,0,0,.04); }
 .side-dot.long { background: #13a36f; }

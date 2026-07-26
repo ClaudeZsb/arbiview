@@ -15,7 +15,7 @@ use config::Config;
 use market::MarketService;
 use models::{
     AdjustLeverageRequest, AdjustPositionRequest, BatchIncreaseRequest, BatchReduceRequest,
-    OpenTradeRequest,
+    OpenTradeRequest, SetAutoCloseRequest,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -58,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/spread-history/:symbol", get(spread_history))
         .route("/api/account/summary", get(account_summary))
         .route("/api/account/hedge-protection", get(hedge_protection))
+        .route("/api/auto-close", get(auto_close_rules))
+        .route("/api/auto-close/:id/cancel", post(cancel_auto_close))
         .route("/api/positions", get(positions))
         .route("/api/trades/open", post(open_trade))
         .route("/api/trades/batch-increase", post(start_batch_increase))
@@ -71,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/positions/:id/close", post(close_position))
         .route("/api/positions/:id/reduce", post(reduce_position))
         .route("/api/positions/:id/leverage", post(adjust_leverage))
+        .route("/api/positions/:id/auto-close", post(set_auto_close))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -110,6 +113,37 @@ async fn hedge_protection(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.hedge_protection_status().await))
+}
+
+async fn auto_close_rules(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.auto_close_rules().await))
+}
+
+async fn set_auto_close(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<SetAutoCloseRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        state
+            .trading
+            .set_auto_close(
+                &id,
+                request.threshold_apy_percent,
+                request.order_notional_usdt,
+                request.interval_seconds,
+            )
+            .await?,
+    ))
+}
+
+async fn cancel_auto_close(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.cancel_auto_close(&id).await?))
 }
 
 async fn positions(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {

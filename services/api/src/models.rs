@@ -208,6 +208,14 @@ pub struct AutoCloseRule {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoCloseRequest {
+    pub threshold_apy_percent: f64,
+    pub order_notional_usdt: f64,
+    pub interval_seconds: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HedgeProtectionEvent {
