@@ -180,8 +180,13 @@ impl TradingService {
     }
 
     async fn inspect_hedge_protection(&self) -> Result<()> {
-        let (binance, bybit) = tokio::try_join!(self.binance_positions(), self.bybit_positions())?;
-        let legs = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+        let (binance, bybit, quotes) = tokio::try_join!(
+            self.binance_positions(),
+            self.bybit_positions(),
+            self.market.position_quotes()
+        )?;
+        let mut legs = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+        apply_position_quotes(&mut legs, &quotes);
         self.remember_protected_routes(&legs).await;
         if self
             .batch_tasks
@@ -215,9 +220,13 @@ impl TradingService {
             };
             // Re-read under the execution lock. A normal trade may have completed
             // between the initial observation and acquiring the lock.
-            let (binance, bybit) =
-                tokio::try_join!(self.binance_positions(), self.bybit_positions())?;
-            let actual = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+            let (binance, bybit, quotes) = tokio::try_join!(
+                self.binance_positions(),
+                self.bybit_positions(),
+                self.market.position_quotes()
+            )?;
+            let mut actual = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+            apply_position_quotes(&mut actual, &quotes);
             let long = find_route_leg(&actual, &route.long_exchange, &route.symbol, "long");
             let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
             let still_unbalanced = match (&long, &short) {
@@ -279,8 +288,16 @@ impl TradingService {
             }
         };
         loop {
-            let actual = match tokio::try_join!(self.binance_positions(), self.bybit_positions()) {
-                Ok((binance, bybit)) => binance.into_iter().chain(bybit).collect::<Vec<_>>(),
+            let actual = match tokio::try_join!(
+                self.binance_positions(),
+                self.bybit_positions(),
+                self.market.position_quotes()
+            ) {
+                Ok((binance, bybit, quotes)) => {
+                    let mut legs = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+                    apply_position_quotes(&mut legs, &quotes);
+                    legs
+                }
                 Err(error) => {
                     self.fail_protection_event(&event_id, format!("仓位读取失败：{error:#}"))
                         .await;
@@ -1216,13 +1233,25 @@ impl TradingService {
                 unhedged_legs: vec![],
             });
         }
-        let (binance, bybit, binance_legs, bybit_legs, (binance_income, bybit_income)) = tokio::try_join!(
+        let (
+            binance,
+            bybit,
+            mut binance_legs,
+            mut bybit_legs,
+            (binance_income, bybit_income),
+            quotes,
+        ) = tokio::try_join!(
             self.binance_balance(),
             self.bybit_balance(),
             self.binance_positions(),
             self.bybit_positions(),
-            self.income_summary()
+            self.income_summary(),
+            self.market.position_quotes()
         )?;
+        apply_position_quotes(&mut binance_legs, &quotes);
+        apply_position_quotes(&mut bybit_legs, &quotes);
+        let binance_effective_upl = binance_legs.iter().map(|leg| leg.unrealized_pnl).sum();
+        let bybit_effective_upl = bybit_legs.iter().map(|leg| leg.unrealized_pnl).sum();
         let all_legs: Vec<PositionLeg> = binance_legs.into_iter().chain(bybit_legs).collect();
         let active_positions = all_legs
             .iter()
@@ -1268,7 +1297,7 @@ impl TradingService {
                     exchange: "Binance".into(),
                     equity_usdt: binance.0,
                     available_usdt: binance.1,
-                    unrealized_pnl: binance.2,
+                    unrealized_pnl: binance_effective_upl,
                     realized_pnl: binance_income.realized_pnl(),
                     closed_position_pnl: binance_income.closed_position_pnl,
                     funding_income: binance_income.funding_income,
@@ -1278,7 +1307,7 @@ impl TradingService {
                     exchange: "Bybit".into(),
                     equity_usdt: bybit.0,
                     available_usdt: bybit.1,
-                    unrealized_pnl: bybit.2,
+                    unrealized_pnl: bybit_effective_upl,
                     realized_pnl: bybit_income.realized_pnl(),
                     closed_position_pnl: bybit_income.closed_position_pnl,
                     funding_income: bybit_income.funding_income,
@@ -2274,23 +2303,36 @@ impl TradingService {
     }
 
     async fn actual_leg(&self, leg: &Leg, side: &str) -> Result<Option<PositionLeg>> {
-        let positions = match leg.exchange.as_str() {
+        let mut positions = match leg.exchange.as_str() {
             "Binance" => self.binance_positions().await?,
             "Bybit" => self.bybit_positions().await?,
             exchange => bail!("unsupported exchange {exchange}"),
         };
+        let quotes = self.market.position_quotes().await?;
+        apply_position_quotes(&mut positions, &quotes);
         Ok(positions
             .into_iter()
             .find(|position| position.symbol == leg.symbol && position.side == side))
     }
 
     async fn live_positions(&self) -> Result<Vec<Position>> {
-        let (mut binance, mut bybit, (binance_income, bybit_income), funding_rates) = tokio::try_join!(
+        let (mut binance, mut bybit, (binance_income, bybit_income), quotes) = tokio::try_join!(
             self.binance_positions(),
             self.bybit_positions(),
             self.income_summary(),
-            self.market.funding_rates()
+            self.market.position_quotes()
         )?;
+        apply_position_quotes(&mut binance, &quotes);
+        apply_position_quotes(&mut bybit, &quotes);
+        let funding_rates = quotes
+            .iter()
+            .map(|quote| {
+                (
+                    format!("{}:{}", quote.exchange, quote.symbol),
+                    quote.funding_rate,
+                )
+            })
+            .collect::<HashMap<_, _>>();
         for leg in &mut binance {
             leg.funding_earned = *binance_income
                 .funding_by_symbol
@@ -2875,6 +2917,24 @@ fn binance_fill(response: &Value) -> (String, f64, f64) {
 
 fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
+}
+
+fn apply_position_quotes(legs: &mut [PositionLeg], quotes: &[PositionQuote]) {
+    for leg in legs {
+        let Some(quote) = quotes
+            .iter()
+            .find(|quote| quote.exchange == leg.exchange && quote.symbol == leg.symbol)
+        else {
+            continue;
+        };
+        leg.mark_price = quote.reference_price;
+        leg.unrealized_pnl = if leg.side == "long" {
+            (quote.reference_price - leg.entry_price) * leg.quantity
+        } else {
+            (leg.entry_price - quote.reference_price) * leg.quantity
+        };
+        leg.funding_rate = quote.funding_rate;
+    }
 }
 
 fn funding_refresh_bucket(timestamp_millis: i64) -> i64 {

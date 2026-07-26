@@ -361,7 +361,8 @@ function AccountBoard({ account, positions, protection, onClose, onAdjust, busyI
               <div className="position-detail-head">
                 <span>方向 / 交易所</span>
                 <span>可平仓价</span>
-                <span>标记价格</span>
+                <span>策略参考价</span>
+                <span>最新成交价</span>
                 <span>开仓均价</span>
                 <span>仓位数量</span>
                 <span>Funding Rate</span>
@@ -372,7 +373,8 @@ function AccountBoard({ account, positions, protection, onClose, onAdjust, busyI
                 <div className="position-leg-detail" key={`${leg.exchange}-${leg.side}`}>
                   <div className="leg-detail-title"><i className={`side-dot ${leg.side}`} /><b>{leg.side.toUpperCase()} · {leg.exchange}</b></div>
                   <b>{price(leg.closePrice ?? leg.markPrice)}</b>
-                  <b>{price(leg.markPrice)}</b>
+                  <b title={leg.usesLastPrice ? `Mark ${price(leg.rawMarkPrice)} 与 Last 偏差超过 0.1%，已使用 Last` : "使用 Mark Price"}>{price(leg.markPrice)}{leg.usesLastPrice ? " · LAST" : ""}</b>
+                  <b>{price(leg.lastPrice ?? leg.markPrice)}</b>
                   <b>{price(leg.entryPrice)}</b>
                   <b>{formatter.format(leg.quantity)}</b>
                   <b className={leg.fundingRate >= 0 ? "positive" : "negative"}>{pct(leg.fundingRate)}</b>
@@ -531,7 +533,7 @@ export default function Dashboard() {
           const updateLeg = (leg) => {
             const quote = relevant.get(`${leg.exchange}:${leg.symbol}`);
             if (!quote) return leg;
-            const markPrice = Number(quote.markPrice);
+            const markPrice = Number(quote.referencePrice);
             const closePrice = leg.side === "long"
               ? Number(quote.bidPrice)
               : Number(quote.askPrice);
@@ -541,6 +543,9 @@ export default function Dashboard() {
             return {
               ...leg,
               markPrice,
+              rawMarkPrice: Number(quote.markPrice),
+              lastPrice: Number(quote.lastPrice),
+              usesLastPrice: Boolean(quote.usesLastPrice),
               closePrice,
               fundingRate: Number(quote.fundingRate),
               unrealizedPnl

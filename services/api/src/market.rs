@@ -126,20 +126,6 @@ impl MarketService {
         Ok(result)
     }
 
-    pub async fn funding_rates(&self) -> Result<HashMap<String, f64>> {
-        Ok(self
-            .position_quotes()
-            .await?
-            .into_iter()
-            .map(|quote| {
-                (
-                    format!("{}:{}", quote.exchange, quote.symbol),
-                    quote.funding_rate,
-                )
-            })
-            .collect())
-    }
-
     pub async fn position_quotes(&self) -> Result<Vec<PositionQuote>> {
         if let Some((at, quotes)) = self.quote_cache.read().await.as_ref() {
             if at.elapsed() < Duration::from_millis(1500) {
@@ -152,9 +138,10 @@ impl MarketService {
                 return Ok(quotes.clone());
             }
         }
-        let (binance_marks, binance_book, bybit): (Value, Value, Value) = tokio::try_join!(
+        let (binance_marks, binance_book, binance_last, bybit): (Value, Value, Value, Value) = tokio::try_join!(
             self.get_json("https://fapi.binance.com/fapi/v1/premiumIndex".into()),
             self.get_json("https://fapi.binance.com/fapi/v1/ticker/bookTicker".into()),
+            self.get_json("https://fapi.binance.com/fapi/v1/ticker/price".into()),
             self.get_json("https://api.bybit.com/v5/market/tickers?category=linear".into())
         )?;
         let binance_funding = binance_marks
@@ -171,6 +158,12 @@ impl MarketService {
                 ))
             })
             .collect::<HashMap<_, _>>();
+        let binance_last = binance_last
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|item| Some((item["symbol"].as_str()?.to_string(), parse(&item["price"])?)))
+            .collect::<HashMap<_, _>>();
         let mut quotes = Vec::new();
         for item in binance_book.as_array().unwrap_or(&vec![]) {
             if let (Some(symbol), Some(bid_price), Some(ask_price)) = (
@@ -180,10 +173,16 @@ impl MarketService {
             ) {
                 let (mark_price, funding_rate) =
                     binance_funding.get(symbol).copied().unwrap_or((0.0, 0.0));
+                let last_price = binance_last.get(symbol).copied().unwrap_or(mark_price);
+                let (reference_price, uses_last_price) =
+                    strategy_reference_price(mark_price, last_price);
                 quotes.push(PositionQuote {
                     exchange: "Binance".into(),
                     symbol: symbol.into(),
                     mark_price,
+                    last_price,
+                    reference_price,
+                    uses_last_price,
                     bid_price,
                     ask_price,
                     funding_rate,
@@ -191,16 +190,28 @@ impl MarketService {
             }
         }
         for item in bybit["result"]["list"].as_array().unwrap_or(&vec![]) {
-            if let (Some(symbol), Some(mark_price), Some(bid_price), Some(ask_price)) = (
+            if let (
+                Some(symbol),
+                Some(mark_price),
+                Some(last_price),
+                Some(bid_price),
+                Some(ask_price),
+            ) = (
                 item["symbol"].as_str(),
                 parse(&item["markPrice"]),
+                parse(&item["lastPrice"]),
                 parse(&item["bid1Price"]),
                 parse(&item["ask1Price"]),
             ) {
+                let (reference_price, uses_last_price) =
+                    strategy_reference_price(mark_price, last_price);
                 quotes.push(PositionQuote {
                     exchange: "Bybit".into(),
                     symbol: symbol.into(),
                     mark_price,
+                    last_price,
+                    reference_price,
+                    uses_last_price,
                     bid_price,
                     ask_price,
                     funding_rate: parse(&item["fundingRate"]).unwrap_or(0.0),
@@ -442,6 +453,15 @@ impl MarketService {
     }
 }
 
+fn strategy_reference_price(mark_price: f64, last_price: f64) -> (f64, bool) {
+    let uses_last_price = last_price > 0.0 && (mark_price - last_price).abs() / last_price > 0.001;
+    if uses_last_price {
+        (last_price, true)
+    } else {
+        (mark_price, false)
+    }
+}
+
 fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunity> {
     let funding_per_hour = short.rate / short.interval_hours - long.rate / long.interval_hours;
     if funding_per_hour <= 0.0 {
@@ -549,6 +569,13 @@ mod tests {
         let micron = classify_token("MU", None, &stock, &bybit_stock);
         assert_eq!(micron.tags, vec!["tradefi"]);
         assert_eq!(micron.rank, None);
+    }
+
+    #[test]
+    fn strategy_price_falls_back_to_last_above_point_one_percent() {
+        assert_eq!(strategy_reference_price(100.1, 100.0), (100.1, false));
+        assert_eq!(strategy_reference_price(100.1001, 100.0), (100.0, true));
+        assert_eq!(strategy_reference_price(99.8999, 100.0), (100.0, true));
     }
 
     fn test_leg(exchange: &str, tags: Vec<String>) -> Leg {
