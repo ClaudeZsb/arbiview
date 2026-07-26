@@ -1237,14 +1237,10 @@ impl TradingService {
         let unhedged_legs = all_legs
             .iter()
             .filter(|leg| {
-                let opposite = all_legs.iter().find(|other| {
+                !all_legs.iter().any(|other| {
                     other.exchange != leg.exchange
                         && other.symbol == leg.symbol
                         && other.side != leg.side
-                });
-                opposite.is_none_or(|other| {
-                    (position_notional(leg) - position_notional(other)).abs()
-                        > self.config.position_tolerance_usdt
                 })
             })
             .cloned()
