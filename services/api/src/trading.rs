@@ -69,6 +69,7 @@ const MAX_RECONCILIATION_ATTEMPTS: u8 = 3;
 const HEDGE_PROTECTION_ORDER_USDT: f64 = 100.0;
 const HEDGE_PROTECTION_INTERVAL_SECONDS: f64 = 1.0;
 const HEDGE_PROTECTION_TOLERANCE_RATIO: f64 = 0.01;
+const HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT: f64 = 10.0;
 
 struct PhaseOneResult {
     state: Option<PositionLeg>,
@@ -169,6 +170,7 @@ impl TradingService {
         HedgeProtectionStatus {
             enabled: self.config.trading_mode == TradingMode::Live,
             tolerance_percent: HEDGE_PROTECTION_TOLERANCE_RATIO * 100.0,
+            minimum_difference_usdt: HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT,
             order_notional_usdt: HEDGE_PROTECTION_ORDER_USDT,
             interval_seconds: HEDGE_PROTECTION_INTERVAL_SECONDS,
             protected_tokens,
@@ -200,9 +202,7 @@ impl TradingService {
             let long = find_route_leg(&legs, &route.long_exchange, &route.symbol, "long");
             let short = find_route_leg(&legs, &route.short_exchange, &route.symbol, "short");
             let needs_protection = match (&long, &short) {
-                (Some(long), Some(short)) => {
-                    hedge_notional_imbalance_ratio(long, short) > HEDGE_PROTECTION_TOLERANCE_RATIO
-                }
+                (Some(long), Some(short)) => hedge_notional_needs_protection(long, short),
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
             };
@@ -220,9 +220,7 @@ impl TradingService {
             let long = find_route_leg(&actual, &route.long_exchange, &route.symbol, "long");
             let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
             let still_unbalanced = match (&long, &short) {
-                (Some(long), Some(short)) => {
-                    hedge_notional_imbalance_ratio(long, short) > HEDGE_PROTECTION_TOLERANCE_RATIO
-                }
+                (Some(long), Some(short)) => hedge_notional_needs_protection(long, short),
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
             };
@@ -296,11 +294,10 @@ impl TradingService {
                     (leg, "orphan_exit", "检测到一条腿归零，正在批量退出剩余腿")
                 }
                 (Some(long), Some(short)) => {
-                    let difference_ratio = hedge_notional_imbalance_ratio(&long, &short);
-                    if difference_ratio <= HEDGE_PROTECTION_TOLERANCE_RATIO {
+                    if !hedge_notional_needs_protection(&long, &short) {
                         self.complete_protection_event(
                             &event_id,
-                            "双腿名义价值偏差已恢复至 1% 以内",
+                            "双腿名义价值偏差已恢复至 1% 或 10 USDT 以内",
                         )
                         .await;
                         return;
@@ -2878,6 +2875,12 @@ fn hedge_notional_imbalance_ratio(long: &PositionLeg, short: &PositionLeg) -> f6
     }
 }
 
+fn hedge_notional_needs_protection(long: &PositionLeg, short: &PositionLeg) -> bool {
+    let difference = (position_notional(long) - position_notional(short)).abs();
+    difference > HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT
+        && hedge_notional_imbalance_ratio(long, short) > HEDGE_PROTECTION_TOLERANCE_RATIO
+}
+
 fn find_route_leg(
     legs: &[PositionLeg],
     exchange: &str,
@@ -3036,6 +3039,20 @@ mod tests {
         long.quantity = 0.0;
         short.quantity = 0.0;
         assert_eq!(hedge_notional_imbalance_ratio(&long, &short), 0.0);
+    }
+
+    #[test]
+    fn hedge_protection_ignores_differences_at_or_below_ten_usdt() {
+        let mut long = test_position().long;
+        let mut short = test_position().short;
+        long.quantity = 2.0;
+        short.quantity = 1.0;
+        long.mark_price = 10.0;
+        short.mark_price = 10.0;
+        assert!(!hedge_notional_needs_protection(&long, &short));
+
+        long.quantity = 2.01;
+        assert!(hedge_notional_needs_protection(&long, &short));
     }
 
     #[test]

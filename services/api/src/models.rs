@@ -206,6 +206,7 @@ pub struct HedgeProtectionEvent {
 pub struct HedgeProtectionStatus {
     pub enabled: bool,
     pub tolerance_percent: f64,
+    pub minimum_difference_usdt: f64,
     pub order_notional_usdt: f64,
     pub interval_seconds: f64,
     pub protected_tokens: Vec<String>,

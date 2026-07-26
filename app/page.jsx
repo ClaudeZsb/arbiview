@@ -318,7 +318,7 @@ function AccountBoard({ account, positions, protection, onClose, onAdjust, busyI
       {protection?.enabled && (
         <div className="protection-status">
           <b><ShieldCheck size={14} /> 双腿保护运行中</b>
-          <span>名义价值偏差容差 {protection.tolerancePercent}% · 孤腿退出每单 {money(protection.orderNotionalUsdt)} / {protection.intervalSeconds}s</span>
+          <span>名义价值偏差同时超过 {protection.tolerancePercent}% 和 {money(protection.minimumDifferenceUsdt)} 才保护 · 孤腿退出每单 {money(protection.orderNotionalUsdt)} / {protection.intervalSeconds}s</span>
           <small>已保护：{protection.protectedTokens?.join("、") || "等待识别双腿仓位"}</small>
         </div>
       )}
