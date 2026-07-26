@@ -15,6 +15,14 @@ const YEAR_HOURS: f64 = 365.0 * 24.0;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 
+fn latest_rate_at(rates: &[(i64, f64)], timestamp: i64) -> Option<f64> {
+    rates
+        .iter()
+        .rev()
+        .find(|(rate_timestamp, _)| *rate_timestamp <= timestamp)
+        .map(|(_, rate)| *rate)
+}
+
 #[derive(Clone)]
 pub struct MarketService {
     client: Client,
@@ -227,6 +235,8 @@ impl MarketService {
         if !symbol.ends_with("USDT") || !symbol.chars().all(|ch| ch.is_ascii_alphanumeric()) {
             bail!("symbol must be an alphanumeric USDT perpetual symbol");
         }
+        let now = chrono::Utc::now().timestamp_millis();
+        let start = now - 48 * 60 * 60 * 1000;
         let (binance, bybit): (Value, Value) = tokio::try_join!(
             self.get_json(format!(
                 "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1h&limit=25"
@@ -235,6 +245,22 @@ impl MarketService {
                 "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=60&limit=25"
             ))
         )?;
+        let (binance_funding_result, bybit_funding_result) = tokio::join!(
+            self.get_json(format!(
+                "https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&startTime={start}&limit=1000"
+            )),
+            self.get_json(format!(
+                "https://api.bybit.com/v5/market/funding/history?category=linear&symbol={symbol}&startTime={start}&endTime={now}&limit=200"
+            )),
+        );
+        let binance_funding = binance_funding_result.unwrap_or_else(|error| {
+            tracing::warn!(symbol, "Binance funding history unavailable: {error:#}");
+            Value::Null
+        });
+        let bybit_funding = bybit_funding_result.unwrap_or_else(|error| {
+            tracing::warn!(symbol, "Bybit funding history unavailable: {error:#}");
+            Value::Null
+        });
         let binance_closes = binance
             .as_array()
             .unwrap_or(&vec![])
@@ -249,6 +275,25 @@ impl MarketService {
                 Some((candle[0].as_str()?.parse::<i64>().ok()?, parse(&candle[4])?))
             })
             .collect::<HashMap<_, _>>();
+        let mut binance_rates = binance_funding
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|item| Some((item["fundingTime"].as_i64()?, parse(&item["fundingRate"])?)))
+            .collect::<Vec<_>>();
+        let mut bybit_rates = bybit_funding["result"]["list"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item["fundingRateTimestamp"].as_str()?.parse::<i64>().ok()?,
+                    parse(&item["fundingRate"])?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        binance_rates.sort_by_key(|(timestamp, _)| *timestamp);
+        bybit_rates.sort_by_key(|(timestamp, _)| *timestamp);
         let mut points = binance_closes
             .into_iter()
             .filter_map(|(timestamp, binance_close)| {
@@ -258,6 +303,8 @@ impl MarketService {
                     binance_close,
                     bybit_close,
                     spread_percent: (bybit_close - binance_close) / binance_close * 100.0,
+                    binance_funding_rate: latest_rate_at(&binance_rates, timestamp),
+                    bybit_funding_rate: latest_rate_at(&bybit_rates, timestamp),
                 })
             })
             .collect::<Vec<_>>();
@@ -268,6 +315,7 @@ impl MarketService {
         Ok(SpreadHistoryResponse {
             symbol,
             formula: "(Bybit - Binance) / Binance × 100%".into(),
+            funding_note: "每小时展示截至该时刻最近一次已知结算费率；并非每小时发生结算".into(),
             points,
         })
     }

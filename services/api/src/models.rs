@@ -94,6 +94,8 @@ pub struct SpreadHistoryPoint {
     pub binance_close: f64,
     pub bybit_close: f64,
     pub spread_percent: f64,
+    pub binance_funding_rate: Option<f64>,
+    pub bybit_funding_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +103,7 @@ pub struct SpreadHistoryPoint {
 pub struct SpreadHistoryResponse {
     pub symbol: String,
     pub formula: String,
+    pub funding_note: String,
     pub points: Vec<SpreadHistoryPoint>,
 }
 

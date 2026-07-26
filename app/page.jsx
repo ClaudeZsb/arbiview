@@ -82,38 +82,46 @@ function AssetMeta({ token }) {
   );
 }
 
-function OpportunityCard({ item, index, onTrade }) {
+function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, historyLoading }) {
   return (
-    <article className="opportunity-card">
-      <div className="rank">#{String(index + 1).padStart(2, "0")}</div>
-      <div className="asset">
-        <div className="asset-icon">{item.token.symbol.slice(0, 2)}</div>
-        <div>
-          <div className="asset-symbol">{item.token.symbol}<span>/USDT</span></div>
-          <AssetMeta token={item.token} />
+    <article className={`opportunity-shell ${expanded ? "expanded" : ""}`}>
+      <div className="opportunity-card" role="button" tabIndex={0} onClick={onToggle} onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") onToggle();
+      }}>
+        <div className="rank">#{String(index + 1).padStart(2, "0")}</div>
+        <div className="asset">
+          <div className="asset-icon">{item.token.symbol.slice(0, 2)}</div>
+          <div>
+            <div className="asset-symbol">{item.token.symbol}<span>/USDT</span></div>
+            <AssetMeta token={item.token} />
+          </div>
+        </div>
+        <div className="legs">
+          <Leg type="long" leg={item.long} />
+          <div className="direction"><ArrowRight size={16} /></div>
+          <Leg type="short" leg={item.short} />
+        </div>
+        <div className="metric apy">
+          <span className="metric-label">资金费率 APY</span>
+          <strong>{pct(item.apy, 1)}</strong>
+          <small>{pct(item.fundingPerHour, 4)} / 小时</small>
+        </div>
+        <div className="metric spread">
+          <span className="metric-label">开仓价差</span>
+          <strong className={item.spread >= 0 ? "positive" : "negative"}>{pct(item.spread)}</strong>
+          <small>{item.spread >= 0 ? "顺价开仓" : "逆价开仓"}</small>
+        </div>
+        <div className="metric breakeven">
+          <span className="metric-label">预计回本</span>
+          <strong>{duration(item.breakEvenHours)}</strong>
+          <small>含双边开平仓费</small>
+        </div>
+        <div className="opportunity-actions">
+          <button className="trade-button" onClick={(event) => { event.stopPropagation(); onTrade(item); }}><Zap size={13} />开仓</button>
+          <ChevronDown className="opportunity-chevron" size={16} />
         </div>
       </div>
-      <div className="legs">
-        <Leg type="long" leg={item.long} />
-        <div className="direction"><ArrowRight size={16} /></div>
-        <Leg type="short" leg={item.short} />
-      </div>
-      <div className="metric apy">
-        <span className="metric-label">资金费率 APY</span>
-        <strong>{pct(item.apy, 1)}</strong>
-        <small>{pct(item.fundingPerHour, 4)} / 小时</small>
-      </div>
-      <div className="metric spread">
-        <span className="metric-label">开仓价差</span>
-        <strong className={item.spread >= 0 ? "positive" : "negative"}>{pct(item.spread)}</strong>
-        <small>{item.spread >= 0 ? "顺价开仓" : "逆价开仓"}</small>
-      </div>
-      <div className="metric breakeven">
-        <span className="metric-label">预计回本</span>
-        <strong>{duration(item.breakEvenHours)}</strong>
-        <small>含双边开平仓费</small>
-      </div>
-      <button className="trade-button" onClick={() => onTrade(item)}><Zap size={13} />开仓</button>
+      {expanded && <OpportunityHistoryDetails item={item} data={history} loading={historyLoading} />}
     </article>
   );
 }
@@ -332,6 +340,77 @@ function SpreadHistoryChart({ data }) {
   );
 }
 
+function HistoryLineChart({ points, fields, title, subtitle, valueLabel }) {
+  if (points.length < 2) return <div className="spread-chart-empty">暂无足够历史数据</div>;
+  const width = 900;
+  const height = 190;
+  const pad = { top: 18, right: 22, bottom: 32, left: 58 };
+  const values = points.flatMap((point) => fields.map((field) => point[field.key])).filter(Number.isFinite);
+  if (values.length < 2) return <div className="spread-chart-empty">交易所暂未返回该时段历史数据</div>;
+  const rawMin = Math.min(...values, 0);
+  const rawMax = Math.max(...values, 0);
+  const margin = Math.max((rawMax - rawMin) * 0.12, 0.0001);
+  const min = rawMin - margin;
+  const max = rawMax + margin;
+  const x = (index) => pad.left + index * (width - pad.left - pad.right) / (points.length - 1);
+  const y = (value) => pad.top + (max - value) * (height - pad.top - pad.bottom) / (max - min);
+  return (
+    <div className="opportunity-history-chart">
+      <div className="history-chart-title"><div><b>{title}</b><span>{subtitle}</span></div>
+        <div className="history-legend">{fields.map((field) => <span key={field.key}><i style={{ background: field.color }} />{field.label}</span>)}</div>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`}>
+        <line className="spread-zero" x1={pad.left} x2={width - pad.right} y1={y(0)} y2={y(0)} />
+        {[min, (min + max) / 2, max].map((value) => <g key={value}>
+          <line className="spread-grid" x1={pad.left} x2={width - pad.right} y1={y(value)} y2={y(value)} />
+          <text x={pad.left - 8} y={y(value) + 3} textAnchor="end">{valueLabel(value)}</text>
+        </g>)}
+        {fields.map((field) => {
+          const segments = [];
+          let segment = [];
+          points.forEach((point, index) => {
+            if (Number.isFinite(point[field.key])) segment.push([index, point[field.key]]);
+            else if (segment.length) { segments.push(segment); segment = []; }
+          });
+          if (segment.length) segments.push(segment);
+          return <g key={field.key}>{segments.map((part, partIndex) => (
+            <path key={partIndex} fill="none" stroke={field.color} strokeWidth="2.3" d={part.map(([index, value], pointIndex) => `${pointIndex ? "L" : "M"} ${x(index).toFixed(2)} ${y(value).toFixed(2)}`).join(" ")} />
+          ))}</g>;
+        })}
+        {points.map((point, index) => (index === 0 || index === points.length - 1 || index % 6 === 0) && (
+          <text key={point.timestamp} x={x(index)} y={height - 9} textAnchor="middle">{new Date(point.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</text>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function OpportunityHistoryDetails({ item, data, loading }) {
+  if (loading) return <div className="opportunity-history-loading"><RefreshCw className="spin" size={15} />读取 {item.token.symbol} 近 24 小时历史…</div>;
+  if (!data?.points?.length) return <div className="opportunity-history-loading">暂无历史数据</div>;
+  const longIsBinance = item.long.exchange === "Binance";
+  const points = data.points.map((point) => {
+    const longPrice = longIsBinance ? point.binanceClose : point.bybitClose;
+    const shortPrice = longIsBinance ? point.bybitClose : point.binanceClose;
+    return {
+      ...point,
+      directionalSpread: longPrice > 0 ? (shortPrice - longPrice) / longPrice * 100 : null,
+      binanceFundingPercent: Number.isFinite(point.binanceFundingRate) ? point.binanceFundingRate * 100 : null,
+      bybitFundingPercent: Number.isFinite(point.bybitFundingRate) ? point.bybitFundingRate * 100 : null
+    };
+  });
+  return <div className="opportunity-history">
+    <HistoryLineChart points={points} fields={[{ key: "directionalSpread", label: `${item.long.exchange} LONG → ${item.short.exchange} SHORT`, color: "#087d5a" }]}
+      title={`${item.token.symbol} 近 24h 方向价差`}
+      subtitle="每小时收盘；SHORT 价格高于 LONG 为正，低于 LONG 为负"
+      valueLabel={(value) => `${value.toFixed(2)}%`} />
+    <HistoryLineChart points={points} fields={[
+      { key: "binanceFundingPercent", label: "Binance", color: "#d8a000" },
+      { key: "bybitFundingPercent", label: "Bybit", color: "#dc5d43" }
+    ]} title="两所历史资金费率" subtitle={data.fundingNote || "按小时展示最近一次已知结算费率"} valueLabel={(value) => `${value.toFixed(3)}%`} />
+  </div>;
+}
+
 function AutoCloseControl({ position, rule, busy, onSet, onCancel }) {
   const [threshold, setThreshold] = useState(rule?.thresholdApyPercent ?? 300);
   const [orderNotional, setOrderNotional] = useState(rule?.orderNotionalUsdt ?? 100);
@@ -495,6 +574,10 @@ export default function Dashboard() {
   const [sort, setSort] = useState("apy");
   const [query, setQuery] = useState("");
   const [minApy, setMinApy] = useState(0);
+  const [opportunityPage, setOpportunityPage] = useState(1);
+  const [expandedOpportunity, setExpandedOpportunity] = useState("");
+  const [opportunityHistories, setOpportunityHistories] = useState({});
+  const [historyLoading, setHistoryLoading] = useState("");
   const [account, setAccount] = useState(null);
   const [positions, setPositions] = useState([]);
   const [spreadHistory, setSpreadHistory] = useState(null);
@@ -933,6 +1016,27 @@ export default function Dashboard() {
     }
   }
 
+  async function toggleOpportunity(item) {
+    if (expandedOpportunity === item.id) {
+      setExpandedOpportunity("");
+      return;
+    }
+    setExpandedOpportunity(item.id);
+    const symbol = item.long.symbol;
+    if (opportunityHistories[symbol]) return;
+    setHistoryLoading(item.id);
+    try {
+      const response = await fetch(`/backend/spread-history/${encodeURIComponent(symbol)}`, { cache: "no-store" });
+      const history = await response.json();
+      if (!response.ok) throw new Error(history.error);
+      setOpportunityHistories((current) => ({ ...current, [symbol]: history }));
+    } catch (error) {
+      setNotice(`${item.token.symbol} 历史行情：${error.message}`);
+    } finally {
+      setHistoryLoading("");
+    }
+  }
+
   const rows = useMemo(() => {
     const list = (data?.opportunities || []).filter((x) =>
       [x.token.symbol, x.token.name, ...(x.token.tags || [])]
@@ -950,6 +1054,18 @@ export default function Dashboard() {
       .sort((a, b) => b.spread - a.spread),
     [data, query]
   );
+  const pageSize = 10;
+  const opportunityPageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+  const pagedRows = rows.slice((opportunityPage - 1) * pageSize, opportunityPage * pageSize);
+
+  useEffect(() => {
+    setOpportunityPage(1);
+    setExpandedOpportunity("");
+  }, [query, minApy, sort]);
+
+  useEffect(() => {
+    if (opportunityPage > opportunityPageCount) setOpportunityPage(opportunityPageCount);
+  }, [opportunityPage, opportunityPageCount]);
 
   const best = data?.opportunities?.[0];
 
@@ -1029,8 +1145,22 @@ export default function Dashboard() {
           {loading && !data && <div className="state"><RefreshCw className="spin" />正在扫描两个交易所的永续合约…</div>}
           {error && <div className="state error">行情连接失败：{error}<button onClick={load}>重试</button></div>}
           {!loading && !error && rows.length === 0 && <div className="state">当前筛选条件下暂无套利机会</div>}
-          {rows.map((item, i) => <OpportunityCard key={item.id} item={item} index={i} onTrade={setTradeItem} />)}
+          {pagedRows.map((item, i) => <OpportunityCard
+            key={item.id}
+            item={item}
+            index={(opportunityPage - 1) * pageSize + i}
+            onTrade={setTradeItem}
+            expanded={expandedOpportunity === item.id}
+            onToggle={() => toggleOpportunity(item)}
+            history={opportunityHistories[item.long.symbol]}
+            historyLoading={historyLoading === item.id}
+          />)}
         </div>
+        {rows.length > pageSize && <nav className="pagination" aria-label="套利机会分页">
+          <button disabled={opportunityPage === 1} onClick={() => { setOpportunityPage((page) => page - 1); setExpandedOpportunity(""); }}>上一页</button>
+          <span>第 {opportunityPage} / {opportunityPageCount} 页 · 共 {rows.length} 个机会</span>
+          <button disabled={opportunityPage === opportunityPageCount} onClick={() => { setOpportunityPage((page) => page + 1); setExpandedOpportunity(""); }}>下一页</button>
+        </nav>}
       </section>
 
       <section className="spread-workspace" id="spread-arbitrage">
