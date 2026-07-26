@@ -200,7 +200,7 @@ impl TradingService {
             let short = find_route_leg(&legs, &route.short_exchange, &route.symbol, "short");
             let needs_protection = match (&long, &short) {
                 (Some(long), Some(short)) => {
-                    (position_notional(long) - position_notional(short)).abs()
+                    hedge_quantity_difference_usdt(long, short)
                         > self.config.position_tolerance_usdt
                 }
                 (Some(_), None) | (None, Some(_)) => true,
@@ -221,7 +221,7 @@ impl TradingService {
             let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
             let still_unbalanced = match (&long, &short) {
                 (Some(long), Some(short)) => {
-                    (position_notional(long) - position_notional(short)).abs()
+                    hedge_quantity_difference_usdt(long, short)
                         > self.config.position_tolerance_usdt
                 }
                 (Some(_), None) | (None, Some(_)) => true,
@@ -262,7 +262,7 @@ impl TradingService {
             token: route.token.clone(),
             event_type: "detecting".into(),
             status: "running".into(),
-            message: "检测到双腿名义价值不平衡".into(),
+            message: "检测到双腿对冲数量不平衡".into(),
             started_at: now,
             updated_at: now,
             orders: vec![],
@@ -297,18 +297,16 @@ impl TradingService {
                     (leg, "orphan_exit", "检测到一条腿归零，正在批量退出剩余腿")
                 }
                 (Some(long), Some(short)) => {
-                    let long_notional = position_notional(&long);
-                    let short_notional = position_notional(&short);
-                    let difference = (long_notional - short_notional).abs();
+                    let difference = hedge_quantity_difference_usdt(&long, &short);
                     if difference <= self.config.position_tolerance_usdt {
                         self.complete_protection_event(&event_id, "双腿差额已恢复至容差内")
                             .await;
                         return;
                     }
-                    if long_notional > short_notional {
-                        (long, "mismatch_reduce", "正在削减名义价值更大的 LONG 腿")
+                    if long.quantity > short.quantity {
+                        (long, "mismatch_reduce", "正在削减数量更多的 LONG 腿")
                     } else {
-                        (short, "mismatch_reduce", "正在削减名义价值更大的 SHORT 腿")
+                        (short, "mismatch_reduce", "正在削减数量更多的 SHORT 腿")
                     }
                 }
             };
@@ -317,20 +315,19 @@ impl TradingService {
                 event.message = message.into();
             })
             .await;
-            let current_notional = position_notional(&target);
-            let other_notional = actual
+            let other_quantity = actual
                 .iter()
                 .find(|leg| {
                     leg.symbol == target.symbol
                         && leg.exchange != target.exchange
                         && leg.side != target.side
                 })
-                .map(position_notional)
+                .map(|leg| leg.quantity)
                 .unwrap_or(0.0);
-            let excess = if event_type == "orphan_exit" {
-                current_notional
+            let excess_quantity = if event_type == "orphan_exit" {
+                target.quantity
             } else {
-                (current_notional - other_notional).max(0.0)
+                (target.quantity - other_quantity).max(0.0)
             };
             let metadata = match market_legs
                 .iter()
@@ -345,9 +342,9 @@ impl TradingService {
             };
             let quantity = protection_order_quantity(
                 &target,
-                excess,
+                excess_quantity,
                 metadata.qty_step,
-                self.config.position_tolerance_usdt,
+                event_type == "orphan_exit",
             );
             if quantity <= 0.0 {
                 self.fail_protection_event(&event_id, "保护订单数量计算为零".into())
@@ -2867,6 +2864,11 @@ fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
 }
 
+fn hedge_quantity_difference_usdt(long: &PositionLeg, short: &PositionLeg) -> f64 {
+    let reference_price = (long.mark_price + short.mark_price) / 2.0;
+    (long.quantity - short.quantity).abs() * reference_price
+}
+
 fn find_route_leg(
     legs: &[PositionLeg],
     exchange: &str,
@@ -2880,16 +2882,17 @@ fn find_route_leg(
 
 fn protection_order_quantity(
     leg: &PositionLeg,
-    excess_notional: f64,
+    excess_quantity: f64,
     qty_step: f64,
-    tolerance_usdt: f64,
+    close_entire_leg: bool,
 ) -> f64 {
-    let current_notional = position_notional(leg);
-    let order_notional = HEDGE_PROTECTION_ORDER_USDT.min(excess_notional);
-    if order_notional + tolerance_usdt >= current_notional {
+    if close_entire_leg && position_notional(leg) <= HEDGE_PROTECTION_ORDER_USDT {
         leg.quantity
     } else {
-        floor_step(order_notional / leg.mark_price, qty_step)
+        floor_step(
+            excess_quantity.min(HEDGE_PROTECTION_ORDER_USDT / leg.mark_price),
+            qty_step,
+        )
     }
 }
 
@@ -2999,11 +3002,25 @@ mod tests {
         let mut leg = test_position().long;
         leg.quantity = 100.0;
         leg.mark_price = 10.0;
-        assert_eq!(protection_order_quantity(&leg, 1_000.0, 0.01, 10.0), 10.0);
-        assert_eq!(protection_order_quantity(&leg, 50.0, 0.01, 10.0), 5.0);
+        assert_eq!(protection_order_quantity(&leg, 100.0, 0.01, false), 10.0);
+        assert_eq!(protection_order_quantity(&leg, 5.0, 0.01, false), 5.0);
 
         leg.quantity = 8.0;
-        assert_eq!(protection_order_quantity(&leg, 80.0, 0.01, 10.0), 8.0);
+        assert_eq!(protection_order_quantity(&leg, 8.0, 0.01, true), 8.0);
+    }
+
+    #[test]
+    fn hedge_protection_ignores_cross_exchange_price_spread() {
+        let mut long = test_position().long;
+        let mut short = test_position().short;
+        long.quantity = 50.0;
+        short.quantity = 50.0;
+        long.mark_price = 4.50;
+        short.mark_price = 4.00;
+        assert_eq!(hedge_quantity_difference_usdt(&long, &short), 0.0);
+
+        short.quantity = 48.0;
+        assert!((hedge_quantity_difference_usdt(&long, &short) - 8.5).abs() < 1e-9);
     }
 
     #[test]
