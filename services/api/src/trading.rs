@@ -330,7 +330,7 @@ impl TradingService {
                     if !hedge_notional_needs_protection(&long, &short) {
                         self.complete_protection_event(
                             &event_id,
-                            "双腿名义价值偏差已恢复至 1% 或 10 USDT 以内",
+                            "当前差额未同时超过 1% 与 10 USDT，保护停止",
                         )
                         .await;
                         return;
