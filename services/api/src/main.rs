@@ -1,9 +1,11 @@
+mod advisor;
 mod config;
 mod market;
 mod models;
 mod telegram;
 mod trading;
 
+use advisor::AdvisorService;
 use axum::{
     extract::{Path, State},
     http::{HeaderValue, Method, StatusCode},
@@ -26,6 +28,7 @@ use trading::TradingService;
 struct AppState {
     market: MarketService,
     trading: TradingService,
+    advisor: AdvisorService,
 }
 
 #[tokio::main]
@@ -41,7 +44,12 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let market = MarketService::new(config.clone())?;
     let trading = TradingService::new(config.clone(), market.clone())?;
-    let state = Arc::new(AppState { market, trading });
+    let advisor = AdvisorService::new(market.clone(), trading.clone());
+    let state = Arc::new(AppState {
+        market,
+        trading,
+        advisor,
+    });
     state.trading.spawn_auto_close_monitor();
     state.trading.spawn_hedge_protection_monitor();
     if let Some(telegram) = config.telegram.clone() {
@@ -54,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/api/opportunities", get(opportunities))
+        .route("/api/advisor/recommendation", get(advisor_recommendation))
         .route("/api/position-quotes", get(position_quotes))
         .route("/api/spread-history/:symbol", get(spread_history))
         .route("/api/account/summary", get(account_summary))
@@ -88,6 +97,12 @@ async fn main() -> anyhow::Result<()> {
 
 async fn opportunities(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.market.opportunities().await?))
+}
+
+async fn advisor_recommendation(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.advisor.recommendation().await?))
 }
 
 async fn position_quotes(
