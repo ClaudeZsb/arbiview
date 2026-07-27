@@ -49,6 +49,16 @@ function time(ts) {
   }).format(new Date(ts));
 }
 
+async function readJson(response, label = "接口") {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const detail = text.trim().slice(0, 160) || response.statusText || "空响应";
+    throw new Error(`${label}返回非 JSON（HTTP ${response.status}）：${detail}`);
+  }
+}
+
 function ExchangeLogo({ name }) {
   return <span className={`exchange-logo ${name.toLowerCase()}`}>{name === "Binance" ? "◈" : "◆"}</span>;
 }
@@ -627,10 +637,12 @@ export default function Dashboard() {
         fetch("/backend/account/hedge-protection", { cache: "no-store" }),
         fetch("/backend/auto-close", { cache: "no-store" })
       ]);
-      const summary = await summaryResponse.json();
-      const active = await positionsResponse.json();
-      const protectionStatus = await protectionResponse.json();
-      const rules = await autoCloseResponse.json();
+      const [summary, active, protectionStatus, rules] = await Promise.all([
+        readJson(summaryResponse, "账户汇总接口"),
+        readJson(positionsResponse, "持仓接口"),
+        readJson(protectionResponse, "仓位保护接口"),
+        readJson(autoCloseResponse, "自动平仓接口")
+      ]);
       if (summaryResponse.ok) setAccount(summary);
       if (positionsResponse.ok) setPositions(active);
       if (protectionResponse.ok) setProtection(protectionStatus);
