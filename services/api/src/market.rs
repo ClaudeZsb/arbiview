@@ -24,6 +24,11 @@ fn latest_rate_at(rates: &[(i64, f64)], timestamp: i64) -> Option<f64> {
         .map(|(_, rate)| *rate)
 }
 
+fn current_hour_start_millis() -> i64 {
+    let now = chrono::Utc::now().timestamp_millis();
+    now.div_euclid(60 * 60 * 1_000) * 60 * 60 * 1_000
+}
+
 #[derive(Clone)]
 pub struct MarketService {
     client: Client,
@@ -348,6 +353,7 @@ impl MarketService {
             })
             .collect::<Vec<_>>();
         points.sort_by_key(|point| point.timestamp);
+        points.retain(|point| point.timestamp < current_hour_start_millis());
         if points.len() > 24 {
             points.drain(..points.len() - 24);
         }
@@ -584,6 +590,7 @@ impl MarketService {
             })
             .collect::<Vec<_>>();
         aligned.sort_by_key(|point| point.0);
+        aligned.retain(|point| point.0 < current_hour_start_millis());
         if aligned.len() > 24 {
             aligned.drain(..aligned.len() - 24);
         }
