@@ -210,9 +210,14 @@ impl MarketService {
                     .then_some(opportunity)
             })
             .collect();
-        opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
-        let mut selected = Vec::with_capacity(10);
-        for opportunity in opportunities {
+        let (mut cross_opportunities, mut spot_candidates): (Vec<_>, Vec<_>) = opportunities
+            .into_iter()
+            .partition(|opportunity| opportunity.route_type == "cross_perpetual");
+        cross_opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
+        cross_opportunities.truncate(10);
+        spot_candidates.sort_by(|a, b| b.apy.total_cmp(&a.apy));
+        let mut spot_opportunities = Vec::with_capacity(10);
+        for opportunity in spot_candidates {
             if opportunity.short.exchange == "Binance" && opportunity.short.market == "spot" {
                 match self.binance_borrow_available(&opportunity.short.base).await {
                     Ok(true) => {}
@@ -226,12 +231,33 @@ impl MarketService {
                     }
                 }
             }
-            selected.push(opportunity);
-            if selected.len() == 10 {
+            spot_opportunities.push(opportunity);
+            if spot_opportunities.len() == 10 {
                 break;
             }
         }
-        let mut opportunities = selected;
+        self.enrich_opportunity_averages(&mut cross_opportunities)
+            .await;
+        self.enrich_opportunity_averages(&mut spot_opportunities)
+            .await;
+        spread_opportunities.sort_by(|a, b| b.spread.total_cmp(&a.spread));
+        let result = OpportunitiesResponse {
+            opportunities: cross_opportunities,
+            spot_opportunities,
+            spread_opportunities,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+            universe_size: b_map.len() + y_map.len() - matched.len(),
+            matched_pairs: matched.len(),
+            assumptions: FeeAssumptions {
+                binance_taker_fee: BINANCE_FEE,
+                bybit_taker_fee: BYBIT_FEE,
+            },
+        };
+        *self.cache.write().await = Some((Instant::now(), result.clone()));
+        Ok(result)
+    }
+
+    async fn enrich_opportunity_averages(&self, opportunities: &mut [Opportunity]) {
         let mut average_tasks = tokio::task::JoinSet::new();
         for (index, opportunity) in opportunities.iter().enumerate() {
             let service = self.clone();
@@ -265,20 +291,6 @@ impl MarketService {
                 Err(error) => tracing::warn!("24h spread-average task failed: {error}"),
             }
         }
-        spread_opportunities.sort_by(|a, b| b.spread.total_cmp(&a.spread));
-        let result = OpportunitiesResponse {
-            opportunities,
-            spread_opportunities,
-            updated_at: chrono::Utc::now().timestamp_millis(),
-            universe_size: b_map.len() + y_map.len() - matched.len(),
-            matched_pairs: matched.len(),
-            assumptions: FeeAssumptions {
-                binance_taker_fee: BINANCE_FEE,
-                bybit_taker_fee: BYBIT_FEE,
-            },
-        };
-        *self.cache.write().await = Some((Instant::now(), result.clone()));
-        Ok(result)
     }
 
     pub async fn position_quotes(&self) -> Result<Vec<PositionQuote>> {
@@ -472,11 +484,11 @@ impl MarketService {
         &self,
         opportunity_id: &str,
     ) -> Result<OpportunityHistoryResponse> {
-        let opportunity = self
-            .opportunities()
-            .await?
+        let snapshot = self.opportunities().await?;
+        let opportunity = snapshot
             .opportunities
             .into_iter()
+            .chain(snapshot.spot_opportunities)
             .find(|item| item.id == opportunity_id)
             .ok_or_else(|| anyhow!("opportunity is no longer available"))?;
         let (long_closes, short_closes, long_rates_result, short_rates_result) = tokio::join!(

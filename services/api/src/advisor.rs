@@ -86,7 +86,12 @@ impl AdvisorService {
         let now = chrono::Utc::now().timestamp_millis();
         let (snapshot, positions) =
             tokio::try_join!(self.market.opportunities(), self.trading.positions())?;
-        let recommendation = evaluate(now, &snapshot.opportunities, &positions);
+        let all_opportunities = snapshot
+            .opportunities
+            .into_iter()
+            .chain(snapshot.spot_opportunities)
+            .collect::<Vec<_>>();
+        let recommendation = evaluate(now, &all_opportunities, &positions);
         if recommendation.action != "hold" {
             *self.latest_actionable.write().await = Some(recommendation.clone());
             persist_latest_actionable(self.state_path.as_deref(), &recommendation)?;

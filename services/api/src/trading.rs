@@ -621,6 +621,11 @@ impl TradingService {
         }
         let positions = self.positions().await?;
         let opportunities = self.market.opportunities().await?;
+        let all_opportunities = opportunities
+            .opportunities
+            .into_iter()
+            .chain(opportunities.spot_opportunities)
+            .collect::<Vec<_>>();
         for rule in armed {
             let Some(position) = positions
                 .iter()
@@ -630,8 +635,7 @@ impl TradingService {
                     .await;
                 continue;
             };
-            let Some(current_apy_percent) =
-                held_route_apy_percent(position, &opportunities.opportunities)
+            let Some(current_apy_percent) = held_route_apy_percent(position, &all_opportunities)
             else {
                 // Absence means the token/route was not present in a complete
                 // market scan. It is missing data, never evidence of a 0% APY.
@@ -852,6 +856,7 @@ impl TradingService {
         snapshot
             .opportunities
             .into_iter()
+            .chain(snapshot.spot_opportunities)
             .chain(snapshot.spread_opportunities)
             .find(|x| x.id == opportunity_id)
             .ok_or_else(|| anyhow!("opportunity is no longer available"))

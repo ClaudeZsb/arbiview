@@ -611,7 +611,7 @@ impl TelegramBot {
     async fn show_opportunities(&self) -> Result<()> {
         let snapshot = self.state.market.opportunities().await?;
         let mut text = format!(
-            "<b>当前资费套利机会</b>\n更新时间：{}\n\n",
+            "<b>当前资费套利机会</b>\n更新时间：{}\n\n<b>跨所永续 TOP 10</b>\n",
             chrono::Local::now().format("%H:%M:%S")
         );
         let mut keyboard = vec![];
@@ -630,6 +630,35 @@ impl TelegramBot {
             keyboard.push(vec![button(
                 &format!(
                     "{} · {:+.1}%",
+                    opportunity.token.symbol,
+                    opportunity.apy * 100.0
+                ),
+                &format!(
+                    "o|{}|{}|{}",
+                    opportunity.token.symbol,
+                    short_exchange(&opportunity.long.exchange),
+                    short_exchange(&opportunity.short.exchange)
+                ),
+            )]);
+        }
+        text.push_str("\n<b>同所现货–永续 TOP 10</b>\n");
+        for (index, opportunity) in snapshot.spot_opportunities.iter().take(10).enumerate() {
+            text.push_str(&format!(
+                "{}. <b>{}</b>{} {} {}→{} {} · APY {:+.1}% · 价差 {:+.3}% · 回本 {}\n",
+                index + 1,
+                html(&opportunity.token.symbol),
+                telegram_tags(&opportunity.token.tags),
+                html(&opportunity.long.exchange),
+                html(&opportunity.long.market),
+                html(&opportunity.short.exchange),
+                html(&opportunity.short.market),
+                opportunity.apy * 100.0,
+                opportunity.spread * 100.0,
+                break_even(opportunity.break_even_hours)
+            ));
+            keyboard.push(vec![button(
+                &format!(
+                    "{} Spot/Perp · {:+.1}%",
                     opportunity.token.symbol,
                     opportunity.apy * 100.0
                 ),
@@ -1106,6 +1135,7 @@ impl TelegramBot {
         snapshot
             .opportunities
             .into_iter()
+            .chain(snapshot.spot_opportunities)
             .find(|opportunity| {
                 opportunity.token.symbol.eq_ignore_ascii_case(token)
                     && long.is_none_or(|exchange| {

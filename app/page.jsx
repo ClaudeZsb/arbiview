@@ -908,7 +908,7 @@ export default function Dashboard() {
     try {
       let response;
       if (adjustment.type === "increase") {
-        const opportunity = data?.opportunities?.find((item) =>
+        const opportunity = [...(data?.opportunities || []), ...(data?.spotOpportunities || [])].find((item) =>
           item.token.symbol === adjustment.position.token &&
           item.long.exchange === adjustment.position.long.exchange &&
           item.long.market === adjustment.position.long.market &&
@@ -954,7 +954,7 @@ export default function Dashboard() {
       let path;
       let body;
       if (batchPanel.type === "increase") {
-        const opportunity = data?.opportunities?.find((item) =>
+        const opportunity = [...(data?.opportunities || []), ...(data?.spotOpportunities || [])].find((item) =>
           item.token.symbol === batchPanel.position.token &&
           item.long.exchange === batchPanel.position.long.exchange &&
           item.long.market === batchPanel.position.long.market &&
@@ -1120,7 +1120,7 @@ export default function Dashboard() {
     if (opportunityHistories[position.id]) return;
     setHistoryLoading(position.id);
     try {
-      const opportunity = data?.opportunities?.find((item) =>
+      const opportunity = [...(data?.opportunities || []), ...(data?.spotOpportunities || [])].find((item) =>
         item.token.symbol === position.token &&
         item.long.exchange === position.long.exchange &&
         item.long.market === position.long.market &&
@@ -1151,6 +1151,16 @@ export default function Dashboard() {
       sort === "apy" ? b.apy - a.apy : a.breakEvenHours - b.breakEvenHours
     );
   }, [data, query, minApy, sort]);
+  const spotRows = useMemo(() => {
+    const list = (data?.spotOpportunities || []).filter((x) =>
+      [x.token.symbol, x.token.name, ...(x.token.tags || [])]
+        .some((value) => value.toLowerCase().includes(query.toLowerCase())) &&
+      x.apy * 100 >= minApy
+    );
+    return [...list].sort((a, b) =>
+      sort === "apy" ? b.apy - a.apy : a.breakEvenHours - b.breakEvenHours
+    );
+  }, [data, query, minApy, sort]);
   const spreadRows = useMemo(
     () => (data?.spreadOpportunities || [])
       .filter((item) => [item.token.symbol, item.token.name, ...(item.token.tags || [])]
@@ -1162,7 +1172,8 @@ export default function Dashboard() {
     setExpandedOpportunity("");
   }, [query, minApy, sort]);
 
-  const best = data?.opportunities?.[0];
+  const best = [...(data?.opportunities || []), ...(data?.spotOpportunities || [])]
+    .sort((a, b) => b.apy - a.apy)[0];
 
   return (
     <main>
@@ -1170,7 +1181,8 @@ export default function Dashboard() {
         <a className="brand" href="#"><span className="brand-mark">A</span>ARBIVIEW</a>
         <nav>
           <a href="#account">账户持仓</a>
-          <a className="active" href="#opportunities">套利机会</a>
+          <a className="active" href="#opportunities">跨所永续</a>
+          <a href="#spot-opportunities">现货–永续</a>
           <a href="#spread-arbitrage">价差套利</a>
           <a href="#methodology">计算说明</a>
         </nav>
@@ -1180,8 +1192,8 @@ export default function Dashboard() {
       <section className="hero">
         <div className="hero-copy">
           <div className="eyebrow"><Sparkles size={14} /> PERPETUAL FUNDING ARBITRAGE</div>
-          <h1>捕捉跨所<br /><em>资金费率差</em></h1>
-          <p>聚合 Binance 与 Bybit 共同支持的全部 USDT 永续合约，覆盖加密资产、股票与大宗商品。</p>
+          <h1>捕捉双腿<br /><em>资金费率差</em></h1>
+          <p>同时扫描 Binance 与 Bybit 跨所永续，以及同所现货–永续套利机会。</p>
         </div>
         <div className="hero-stats">
           <div><span>交易所合约</span><strong>{data?.universeSize ?? "—"}</strong><small>全部 USDT 永续</small></div>
@@ -1210,8 +1222,8 @@ export default function Dashboard() {
       <section className="workspace" id="opportunities">
         <div className="section-head">
           <div>
-            <div className="section-kicker"><TrendingUp size={15} /> LIVE OPPORTUNITIES</div>
-            <h2>当前套利机会 <span>{rows.length}</span></h2>
+            <div className="section-kicker"><TrendingUp size={15} /> CROSS-EXCHANGE PERPETUAL</div>
+            <h2>跨所永续套利 <span>{rows.length}</span></h2>
           </div>
           <div className="updated">
             <Clock3 size={15} />
@@ -1243,6 +1255,35 @@ export default function Dashboard() {
           {error && <div className="state error">行情连接失败：{error}<button onClick={load}>重试</button></div>}
           {!loading && !error && rows.length === 0 && <div className="state">当前筛选条件下暂无套利机会</div>}
           {rows.map((item, i) => <OpportunityCard
+            key={item.id}
+            item={item}
+            index={i}
+            onTrade={setTradeItem}
+            expanded={expandedOpportunity === item.id}
+            onToggle={() => toggleOpportunity(item)}
+            history={opportunityHistories[item.id]}
+            historyLoading={historyLoading === item.id}
+          />)}
+        </div>
+      </section>
+
+      <section className="workspace" id="spot-opportunities">
+        <div className="section-head">
+          <div>
+            <div className="section-kicker"><TrendingUp size={15} /> SPOT × PERPETUAL</div>
+            <h2>同所现货–永续套利 <span>{spotRows.length}</span></h2>
+          </div>
+          <div className="configured">净 APY 前 10 · 做空现货已过滤无可借库存</div>
+        </div>
+
+        <div className="column-head">
+          <span>资产</span><span>执行路径 / 双腿行情</span><span>资金 APY</span><span>当前 / 均值</span><span>预计回本</span>
+        </div>
+
+        <div className="cards">
+          {loading && !data && <div className="state"><RefreshCw className="spin" />正在扫描现货与永续市场…</div>}
+          {!loading && !error && spotRows.length === 0 && <div className="state">当前筛选条件下暂无同所现货–永续机会</div>}
+          {spotRows.map((item, i) => <OpportunityCard
             key={item.id}
             item={item}
             index={i}
