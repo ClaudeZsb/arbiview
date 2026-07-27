@@ -33,6 +33,7 @@ pub struct Config {
     pub position_tolerance_usdt: f64,
     pub telegram: Option<TelegramConfig>,
     pub auto_close_state_path: Option<PathBuf>,
+    pub managed_symbols_state_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -50,6 +51,19 @@ impl Config {
         if trading_mode == TradingMode::Live && (binance.is_none() || bybit.is_none()) {
             bail!("live mode requires BINANCE_API_KEY/SECRET and BYBIT_API_KEY/SECRET");
         }
+        let auto_close_state_path = std::env::var("AUTO_CLOSE_STATE_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
+        let managed_symbols_state_path = std::env::var("MANAGED_SYMBOLS_STATE_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                auto_close_state_path
+                    .as_ref()
+                    .map(|path| path.with_file_name("managed-symbols.json"))
+            });
         Ok(Self {
             port: std::env::var("PORT")
                 .ok()
@@ -70,10 +84,8 @@ impl Config {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(10.0),
             telegram: telegram_config()?,
-            auto_close_state_path: std::env::var("AUTO_CLOSE_STATE_PATH")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(PathBuf::from),
+            auto_close_state_path,
+            managed_symbols_state_path,
         })
     }
 }

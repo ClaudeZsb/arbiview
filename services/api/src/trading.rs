@@ -106,6 +106,7 @@ pub struct TradingService {
     income_refresh_lock: Arc<Mutex<()>>,
     batch_tasks: Arc<RwLock<HashMap<String, BatchIncreaseTask>>>,
     auto_close_rules: Arc<RwLock<HashMap<String, AutoCloseRule>>>,
+    managed_symbols: Arc<RwLock<HashSet<String>>>,
     protected_routes: Arc<RwLock<HashMap<String, ProtectedRoute>>>,
     protection_events: Arc<RwLock<Vec<HedgeProtectionEvent>>>,
     execution_lock: Arc<Mutex<()>>,
@@ -114,6 +115,12 @@ pub struct TradingService {
 impl TradingService {
     pub fn new(config: Config, market: MarketService) -> Result<Self> {
         let auto_close_rules = load_auto_close_rules(&config)?;
+        let mut managed_symbols = load_managed_symbols(&config)?;
+        managed_symbols.extend(
+            auto_close_rules
+                .values()
+                .map(|rule| format!("{}USDT", rule.token.to_ascii_uppercase())),
+        );
         Ok(Self {
             config,
             market,
@@ -123,6 +130,7 @@ impl TradingService {
             income_refresh_lock: Arc::new(Mutex::new(())),
             batch_tasks: Arc::new(RwLock::new(HashMap::new())),
             auto_close_rules: Arc::new(RwLock::new(auto_close_rules)),
+            managed_symbols: Arc::new(RwLock::new(managed_symbols)),
             protected_routes: Arc::new(RwLock::new(HashMap::new())),
             protection_events: Arc::new(RwLock::new(Vec::new())),
             execution_lock: Arc::new(Mutex::new(())),
@@ -720,6 +728,50 @@ impl TradingService {
         }
     }
 
+    async fn remember_managed_symbol(&self, symbol: &str) {
+        let symbol = symbol.trim().to_ascii_uppercase();
+        if symbol.is_empty() {
+            return;
+        }
+        let inserted = self.managed_symbols.write().await.insert(symbol);
+        if inserted {
+            self.persist_managed_symbols().await;
+        }
+    }
+
+    async fn persist_managed_symbols(&self) {
+        let Some(path) = self.config.managed_symbols_state_path.as_ref() else {
+            return;
+        };
+        let mut symbols = self
+            .managed_symbols
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        symbols.sort();
+        let data = match serde_json::to_vec_pretty(&symbols) {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::error!("failed to serialize managed symbols: {error}");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::error!("failed to create managed-symbol state directory: {error}");
+                return;
+            }
+        }
+        let temporary = path.with_extension("tmp");
+        if let Err(error) =
+            std::fs::write(&temporary, data).and_then(|_| std::fs::rename(&temporary, path))
+        {
+            tracing::error!("failed to persist managed symbols: {error}");
+        }
+    }
+
     pub async fn open(&self, request: OpenTradeRequest) -> Result<TradeResponse> {
         let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
         self.open_opportunity(opportunity, request).await
@@ -746,13 +798,18 @@ impl TradingService {
         if !(1..=20).contains(&request.leverage) {
             bail!("leverage must be between 1 and 20");
         }
-        match self.config.trading_mode {
+        let managed_symbol = opportunity.long.symbol.clone();
+        let result = match self.config.trading_mode {
             TradingMode::Paper => self.open_paper(opportunity, request).await,
             TradingMode::Live => {
                 let _guard = self.execution_lock.lock().await;
                 self.open_live(opportunity, request).await
             }
+        };
+        if result.is_ok() {
+            self.remember_managed_symbol(&managed_symbol).await;
         }
+        result
     }
 
     pub async fn start_batch_increase(
@@ -772,6 +829,7 @@ impl TradingService {
             bail!("leverage must be between 1 and 20");
         }
         let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
+        self.remember_managed_symbol(&opportunity.long.symbol).await;
         let mut tasks = self.batch_tasks.write().await;
         if let Some(existing) = tasks.values().find(|task| {
             task.action == "increase"
@@ -1265,7 +1323,7 @@ impl TradingService {
                 })
             })
             .count();
-        let managed_symbols = all_legs
+        let active_managed_symbols = all_legs
             .iter()
             .filter(|leg| {
                 all_legs.iter().any(|other| {
@@ -1276,6 +1334,10 @@ impl TradingService {
             })
             .map(|leg| leg.symbol.clone())
             .collect::<HashSet<_>>();
+        for symbol in &active_managed_symbols {
+            self.remember_managed_symbol(symbol).await;
+        }
+        let managed_symbols = self.managed_symbols.read().await.clone();
         let binance_income = binance_income.for_symbols(&managed_symbols);
         let bybit_income = bybit_income.for_symbols(&managed_symbols);
         let unrealized_pnl = all_legs.iter().map(|leg| leg.unrealized_pnl).sum();
@@ -3111,6 +3173,24 @@ fn load_auto_close_rules(config: &Config) -> Result<HashMap<String, AutoCloseRul
     Ok(rules
         .into_iter()
         .map(|rule| (rule.id.clone(), rule))
+        .collect())
+}
+
+fn load_managed_symbols(config: &Config) -> Result<HashSet<String>> {
+    let Some(path) = config.managed_symbols_state_path.as_ref() else {
+        return Ok(HashSet::new());
+    };
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(error).context("failed to read managed-symbol state"),
+    };
+    let symbols = serde_json::from_slice::<Vec<String>>(&data)
+        .context("failed to parse managed-symbol state")?;
+    Ok(symbols
+        .into_iter()
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
         .collect())
 }
 
