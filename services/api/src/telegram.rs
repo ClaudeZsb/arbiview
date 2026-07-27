@@ -1,4 +1,5 @@
 use crate::{
+    advisor::AdvisorResponse,
     config::TelegramConfig,
     models::{
         AdjustPositionRequest, BatchIncreaseRequest, BatchIncreaseTask, BatchReduceRequest,
@@ -86,11 +87,15 @@ pub fn spawn(config: TelegramConfig, state: Arc<AppState>) {
             .expect("Telegram HTTP client"),
         state,
     };
+    let polling_bot = bot.clone();
     tokio::spawn(async move {
         tracing::info!("Telegram bot enabled with long polling");
-        if let Err(error) = bot.run().await {
+        if let Err(error) = polling_bot.run().await {
             tracing::error!("Telegram bot stopped: {error:#}");
         }
+    });
+    tokio::spawn(async move {
+        bot.run_advisor_notifications().await;
     });
 }
 
@@ -106,6 +111,7 @@ impl TelegramBot {
                     {"command": "positions", "description": "查询和管理当前仓位"},
                     {"command": "account", "description": "查询账户余额和盈亏"},
                     {"command": "protection", "description": "查询双腿保护状态和事件"},
+                    {"command": "advisor", "description": "查询最新策略建议"},
                     {"command": "open", "description": "开仓：TOKEN 金额 [杠杆]"},
                     {"command": "batch_open", "description": "批量开仓：TOKEN 目标 单笔 间隔 [杠杆]"},
                     {"command": "reduce", "description": "减仓：TOKEN 金额"},
@@ -207,6 +213,7 @@ impl TelegramBot {
             "/positions" | "/status" => self.show_positions().await,
             "/account" | "/balance" => self.show_account().await,
             "/protection" => self.show_protection().await,
+            "/advisor" | "/advice" => self.show_advisor().await,
             "/open" => {
                 let token = parts
                     .next()
@@ -959,6 +966,35 @@ impl TelegramBot {
             .await
     }
 
+    async fn show_advisor(&self) -> Result<()> {
+        let recommendation = self.state.advisor.recommendation().await?;
+        self.send(&format_advisor(&recommendation), vec![]).await
+    }
+
+    async fn run_advisor_notifications(&self) {
+        let mut last_fingerprint = String::new();
+        // Allow market and account caches to warm before publishing the first result.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        loop {
+            match self.state.advisor.recommendation().await {
+                Ok(recommendation) => {
+                    let fingerprint = advisor_fingerprint(&recommendation);
+                    if fingerprint != last_fingerprint {
+                        if let Err(error) =
+                            self.send(&format_advisor(&recommendation), vec![]).await
+                        {
+                            tracing::warn!("Telegram advisor notification failed: {error:#}");
+                        } else {
+                            last_fingerprint = fingerprint;
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!("advisor evaluation failed: {error:#}"),
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    }
+
     async fn confirm_auto_close(
         &self,
         position: &Position,
@@ -1177,6 +1213,78 @@ fn position_keyboard(position: &Position) -> Keyboard {
             button("返回", "pos"),
         ],
     ]
+}
+
+fn advisor_fingerprint(recommendation: &AdvisorResponse) -> String {
+    let entry = recommendation
+        .entry
+        .as_ref()
+        .map(|entry| entry.opportunity_id.as_str())
+        .unwrap_or("-");
+    let allowed = recommendation
+        .positions
+        .iter()
+        .filter(|position| position.take_profit_allowed)
+        .map(|position| position.position_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{}|{}|{}|{}",
+        recommendation.action, recommendation.entry_window_open, entry, allowed
+    )
+}
+
+fn format_advisor(recommendation: &AdvisorResponse) -> String {
+    let settlement = chrono::DateTime::from_timestamp_millis(recommendation.next_settlement_at)
+        .map(|time| {
+            time.with_timezone(&chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid offset"))
+                .format("%H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "—".into());
+    let mut text = match recommendation.action.as_str() {
+        "enter" => {
+            let entry = recommendation.entry.as_ref().expect("entry recommendation");
+            format!(
+                "🟢 <b>策略建议：允许入场</b>\n<b>{}</b> · LONG {} / SHORT {}\nAPY：{:.2}%（结算候选第 {} 名）\n回本时间：{:.2} 小时\n当前价差：{:+.3}%\n下一结算：{}\n\n{}",
+                html(&entry.token),
+                html(&entry.long_exchange),
+                html(&entry.short_exchange),
+                entry.apy_percent,
+                entry.apy_rank,
+                entry.break_even_hours,
+                entry.spread_percent,
+                settlement,
+                html(&recommendation.reason)
+            )
+        }
+        "take_profit_allowed" => format!(
+            "🟠 <b>策略建议：允许止盈退出</b>\n{}",
+            html(&recommendation.reason)
+        ),
+        _ => format!(
+            "⚪️ <b>策略建议：继续等待</b>\n{}\n下一整点：{}",
+            html(&recommendation.reason),
+            settlement
+        ),
+    };
+    for position in &recommendation.positions {
+        text.push_str(&format!(
+            "\n\n<b>{}</b> · {}\n净收益 ${:+.2} / 门槛 ${:.2}\nFunding ${:+.2} + 未实现 ${:+.2} − 手续费 ${:.2}",
+            html(&position.token),
+            if position.take_profit_allowed {
+                "允许止盈"
+            } else {
+                "继续持有"
+            },
+            position.net_profit_usdt,
+            position.take_profit_threshold_usdt,
+            position.funding_received_usdt,
+            position.unrealized_pnl_usdt,
+            position.estimated_fees_usdt
+        ));
+    }
+    text
 }
 
 fn button(text: &str, callback_data: &str) -> Button {

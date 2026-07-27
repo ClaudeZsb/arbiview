@@ -465,6 +465,39 @@ function AutoCloseControl({ position, rule, busy, onSet, onCancel }) {
   );
 }
 
+function AdvisorCard({ recommendation }) {
+  if (!recommendation) return <section className="advisor-card loading"><RefreshCw className="spin" size={16} />正在生成最新策略建议…</section>;
+  const entry = recommendation.entry;
+  const actionText = {
+    enter: "允许入场",
+    take_profit_allowed: "允许止盈退出",
+    hold: "继续等待"
+  }[recommendation.action] || recommendation.action;
+  return <section className={`advisor-card ${recommendation.action}`}>
+    <div className="advisor-heading">
+      <div><span>STRATEGY ADVISOR</span><h3>最新策略建议</h3></div>
+      <b>{actionText}</b>
+    </div>
+    <p>{recommendation.reason}</p>
+    {entry && <div className="advisor-entry">
+      <strong>{entry.token}</strong>
+      <span>LONG {entry.longExchange} → SHORT {entry.shortExchange}</span>
+      <span>APY <b>{entry.apyPercent.toFixed(2)}%</b> · APY 排名 #{entry.apyRank}</span>
+      <span>回本 <b>{duration(entry.breakEvenHours)}</b> · 价差 <b>{entry.spreadPercent >= 0 ? "+" : ""}{entry.spreadPercent.toFixed(3)}%</b></span>
+    </div>}
+    {recommendation.positions?.map((position) => <div className="advisor-position" key={position.positionId}>
+      <strong>{position.token}</strong>
+      <span className={position.takeProfitAllowed ? "positive" : ""}>{position.takeProfitAllowed ? "允许止盈" : "继续持有"}</span>
+      <span>净收益 <b>{money(position.netProfitUsdt)}</b> / 门槛 {money(position.takeProfitThresholdUsdt)}</span>
+      <small>Funding {money(position.fundingReceivedUsdt)} + 未实现 {money(position.unrealizedPnlUsdt)} − 手续费 {money(position.estimatedFeesUsdt)}</small>
+    </div>)}
+    <div className="advisor-footer">
+      <span>下一整点 {new Date(recommendation.nextSettlementAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })} · {recommendation.entryWindowOpen ? "入场窗口已开启" : "整点前 5 分钟开启入场窗口"}</span>
+      <time>更新于 {new Date(recommendation.generatedAt).toLocaleTimeString("zh-CN", { hour12: false })}</time>
+    </div>
+  </section>;
+}
+
 function AccountBoard({ account, positions, protection, histories, historyLoading, onLoadHistory, autoCloseRules, onSetAutoClose, onCancelAutoClose, autoCloseBusy, onClose, onAdjust, busyId }) {
   return (
     <section className="account-board" id="account">
@@ -589,6 +622,7 @@ export default function Dashboard() {
   const [autoCloseRules, setAutoCloseRules] = useState([]);
   const [autoCloseBusy, setAutoCloseBusy] = useState("");
   const [protection, setProtection] = useState(null);
+  const [advisor, setAdvisor] = useState(null);
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
   const [adjustment, setAdjustment] = useState(null);
@@ -686,12 +720,25 @@ export default function Dashboard() {
     }
   }, []);
 
+  const loadAdvisor = useCallback(async () => {
+    try {
+      const response = await fetch("/backend/advisor/recommendation", { cache: "no-store" });
+      const recommendation = await readJson(response, "策略建议接口");
+      if (!response.ok) throw new Error(recommendation.error || `HTTP ${response.status}`);
+      setAdvisor(recommendation);
+    } catch (error) {
+      setNotice(`策略建议：${error.message}`);
+    }
+  }, []);
+
   useEffect(() => {
     load();
     loadAccount();
+    loadAdvisor();
     const opportunityTimer = window.setInterval(load, 20_000);
     const accountTimer = window.setInterval(loadAccountSummary, 20_000);
     const autoCloseTimer = window.setInterval(loadAutoCloseRules, 15_000);
+    const advisorTimer = window.setInterval(loadAdvisor, 15_000);
     const now = new Date();
     const nextFundingRefresh = new Date(now);
     nextFundingRefresh.setMinutes(2, 0, 0);
@@ -705,10 +752,11 @@ export default function Dashboard() {
       window.clearInterval(opportunityTimer);
       window.clearInterval(accountTimer);
       window.clearInterval(autoCloseTimer);
+      window.clearInterval(advisorTimer);
       window.clearTimeout(fundingTimer);
       if (fundingInterval) window.clearInterval(fundingInterval);
     };
-  }, [load, loadAccount, loadAccountSummary, loadAutoCloseRules, loadFullPositions]);
+  }, [load, loadAccount, loadAccountSummary, loadAdvisor, loadAutoCloseRules, loadFullPositions]);
 
   const positionSubscriptionKey = useMemo(
     () => account?.mode === "live" ? positions
@@ -1105,6 +1153,8 @@ export default function Dashboard() {
       </section>
 
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
+
+      <AdvisorCard recommendation={advisor} />
 
       <AccountBoard account={account} positions={positions} protection={protection} histories={opportunityHistories} historyLoading={historyLoading} onLoadHistory={loadPositionHistory} autoCloseRules={autoCloseRules} onSetAutoClose={setAutoClose} onCancelAutoClose={cancelAutoClose} autoCloseBusy={autoCloseBusy} onClose={closePosition} onAdjust={(position, type) => {
         if (type === "increase" || type === "reduce") {
