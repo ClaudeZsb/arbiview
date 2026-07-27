@@ -115,6 +115,25 @@ pub struct SpreadHistoryResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OpportunityHistoryPoint {
+    pub timestamp: i64,
+    pub long_close: f64,
+    pub short_close: f64,
+    pub directional_spread_percent: f64,
+    pub long_funding_rate: Option<f64>,
+    pub short_funding_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpportunityHistoryResponse {
+    pub opportunity_id: String,
+    pub funding_note: String,
+    pub points: Vec<OpportunityHistoryPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Position {
     pub id: String,
     pub token: String,

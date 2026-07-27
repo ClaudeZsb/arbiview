@@ -445,6 +445,66 @@ impl MarketService {
         })
     }
 
+    pub async fn opportunity_history(
+        &self,
+        opportunity_id: &str,
+    ) -> Result<OpportunityHistoryResponse> {
+        let opportunity = self
+            .opportunities()
+            .await?
+            .opportunities
+            .into_iter()
+            .find(|item| item.id == opportunity_id)
+            .ok_or_else(|| anyhow!("opportunity is no longer available"))?;
+        let (long_closes, short_closes, long_rates_result, short_rates_result) = tokio::join!(
+            self.hourly_closes(&opportunity.long),
+            self.hourly_closes(&opportunity.short),
+            self.funding_history(&opportunity.long),
+            self.funding_history(&opportunity.short),
+        );
+        let long_closes = long_closes?;
+        let short_closes = short_closes?;
+        let long_rates = long_rates_result.unwrap_or_else(|error| {
+            tracing::warn!(
+                id = opportunity.id,
+                "long-leg funding history unavailable: {error:#}"
+            );
+            Vec::new()
+        });
+        let short_rates = short_rates_result.unwrap_or_else(|error| {
+            tracing::warn!(
+                id = opportunity.id,
+                "short-leg funding history unavailable: {error:#}"
+            );
+            Vec::new()
+        });
+        let mut points = long_closes
+            .into_iter()
+            .filter_map(|(timestamp, long_close)| {
+                let short_close = *short_closes.get(&timestamp)?;
+                (long_close > 0.0 && short_close > 0.0).then_some(OpportunityHistoryPoint {
+                    timestamp,
+                    long_close,
+                    short_close,
+                    directional_spread_percent: (short_close - long_close) / long_close * 100.0,
+                    long_funding_rate: latest_rate_at(&long_rates, timestamp),
+                    short_funding_rate: latest_rate_at(&short_rates, timestamp),
+                })
+            })
+            .collect::<Vec<_>>();
+        points.sort_by_key(|point| point.timestamp);
+        points.retain(|point| point.timestamp < current_hour_start_millis());
+        if points.len() > 24 {
+            points.drain(..points.len() - 24);
+        }
+        Ok(OpportunityHistoryResponse {
+            opportunity_id: opportunity.id,
+            funding_note: "每小时展示截至该时刻永续腿最近一次已知结算费率；现货腿没有资金费率"
+                .into(),
+            points,
+        })
+    }
+
     pub async fn trading_legs(&self) -> Result<Vec<Leg>> {
         let (binance, bybit) = tokio::try_join!(self.binance_markets(), self.bybit_markets())?;
         Ok(binance.into_iter().chain(bybit).collect())
@@ -824,6 +884,56 @@ impl MarketService {
                 Some((timestamp, parse(&candle[4])?))
             })
             .collect())
+    }
+
+    async fn funding_history(&self, leg: &Leg) -> Result<Vec<(i64, f64)>> {
+        if leg.market != "perpetual" {
+            return Ok(Vec::new());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let start = now - 48 * 60 * 60 * 1000;
+        let response = match leg.exchange.as_str() {
+            "Binance" => {
+                self.get_json(format!(
+                    "https://fapi.binance.com/fapi/v1/fundingRate?symbol={}&startTime={start}&limit=1000",
+                    leg.symbol
+                ))
+                .await?
+            }
+            "Bybit" => {
+                self.get_json(format!(
+                    "https://api.bybit.com/v5/market/funding/history?category=linear&symbol={}&startTime={start}&endTime={now}&limit=200",
+                    leg.symbol
+                ))
+                .await?
+            }
+            _ => bail!("unsupported funding-history exchange"),
+        };
+        let empty = Vec::new();
+        let mut rates = if leg.exchange == "Binance" {
+            response
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(|item| {
+                    Some((item["fundingTime"].as_i64()?, parse(&item["fundingRate"])?))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            response["result"]["list"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(|item| {
+                    Some((
+                        item["fundingRateTimestamp"].as_str()?.parse().ok()?,
+                        parse(&item["fundingRate"])?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        rates.sort_by_key(|(timestamp, _)| *timestamp);
+        Ok(rates)
     }
 
     async fn spot_borrow_rate(&self, exchange: &str, asset: &str) -> Result<f64> {

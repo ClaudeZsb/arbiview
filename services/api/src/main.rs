@@ -70,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/advisor/latest", get(latest_advisor_recommendation))
         .route("/api/position-quotes", get(position_quotes))
         .route("/api/spread-history/:symbol", get(spread_history))
+        .route(
+            "/api/opportunity-history/:opportunity_id",
+            get(opportunity_history),
+        )
         .route("/api/account/summary", get(account_summary))
         .route("/api/account/hedge-protection", get(hedge_protection))
         .route("/api/auto-close", get(auto_close_rules))
@@ -127,6 +131,15 @@ async fn spread_history(
     Path(symbol): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.market.spread_history(&symbol).await?))
+}
+
+async fn opportunity_history(
+    State(state): State<Arc<AppState>>,
+    Path(opportunity_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        state.market.opportunity_history(&opportunity_id).await?,
+    ))
 }
 
 async fn account_summary(

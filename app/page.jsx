@@ -409,35 +409,30 @@ function PositionHistoryDetails({ position, data, loading }) {
 }
 
 function OpportunityHistoryDetails({ item, data, loading }) {
-  if (item.routeType === "spot_perpetual") {
-    return <div className="opportunity-history-loading">
-      同所 SPOT–PERP：{item.short.market === "spot" ? "永续做多、借币卖出现货" : "买入现货、永续做空"}；
-      24h 均值来自两市场最近 24 个完整小时收盘价。
-      {item.borrowInterestPerHour > 0 ? " APY 已扣除账户对应的小时借币利率。" : " 该方向不借币，不产生借币利息。"}
-    </div>;
-  }
   if (loading) return <div className="opportunity-history-loading"><RefreshCw className="spin" size={15} />读取 {item.token.symbol} 近 24 小时历史…</div>;
   if (!data?.points?.length) return <div className="opportunity-history-loading">暂无历史数据</div>;
-  const longIsBinance = item.long.exchange === "Binance";
   const points = data.points.map((point) => {
-    const longPrice = longIsBinance ? point.binanceClose : point.bybitClose;
-    const shortPrice = longIsBinance ? point.bybitClose : point.binanceClose;
     return {
       ...point,
-      directionalSpread: longPrice > 0 ? (shortPrice - longPrice) / longPrice * 100 : null,
-      binanceFundingPercent: Number.isFinite(point.binanceFundingRate) ? point.binanceFundingRate * 100 : null,
-      bybitFundingPercent: Number.isFinite(point.bybitFundingRate) ? point.bybitFundingRate * 100 : null
+      directionalSpread: point.directionalSpreadPercent,
+      longFundingPercent: Number.isFinite(point.longFundingRate) ? point.longFundingRate * 100 : null,
+      shortFundingPercent: Number.isFinite(point.shortFundingRate) ? point.shortFundingRate * 100 : null
     };
   });
+  const marketLabel = (leg) => `${leg.exchange} · ${leg.market === "spot" ? "SPOT" : "PERP"}`;
+  const fundingFields = [
+    item.long.market === "perpetual" && { key: "longFundingPercent", label: `${marketLabel(item.long)} · LONG`, color: "#d8a000" },
+    item.short.market === "perpetual" && { key: "shortFundingPercent", label: `${marketLabel(item.short)} · SHORT`, color: "#dc5d43" }
+  ].filter(Boolean);
   return <div className="opportunity-history">
-    <HistoryLineChart points={points} fields={[{ key: "directionalSpread", label: `${item.long.exchange} LONG → ${item.short.exchange} SHORT`, color: "#087d5a" }]}
+    <HistoryLineChart points={points} fields={[{ key: "directionalSpread", label: `${marketLabel(item.long)} LONG → ${marketLabel(item.short)} SHORT`, color: "#087d5a" }]}
       title={`${item.token.symbol} 近 24h 方向价差`}
       subtitle="每小时收盘；SHORT 价格高于 LONG 为正，低于 LONG 为负"
       valueLabel={(value) => `${value.toFixed(2)}%`} />
-    <HistoryLineChart points={points} fields={[
-      { key: "binanceFundingPercent", label: "Binance", color: "#d8a000" },
-      { key: "bybitFundingPercent", label: "Bybit", color: "#dc5d43" }
-    ]} title="两所历史资金费率" subtitle={data.fundingNote || "按小时展示最近一次已知结算费率"} valueLabel={(value) => `${value.toFixed(3)}%`} />
+    <HistoryLineChart points={points} fields={fundingFields}
+      title={item.routeType === "spot_perpetual" ? "永续腿历史资金费率" : "两所历史资金费率"}
+      subtitle={data.fundingNote || "按小时展示最近一次已知结算费率"}
+      valueLabel={(value) => `${value.toFixed(3)}%`} />
   </div>;
 }
 
@@ -1079,15 +1074,13 @@ export default function Dashboard() {
       return;
     }
     setExpandedOpportunity(item.id);
-    if (item.routeType === "spot_perpetual") return;
-    const symbol = item.long.symbol;
-    if (opportunityHistories[symbol]) return;
+    if (opportunityHistories[item.id]) return;
     setHistoryLoading(item.id);
     try {
-      const response = await fetch(`/backend/spread-history/${encodeURIComponent(symbol)}`, { cache: "no-store" });
-      const history = await response.json();
+      const response = await fetch(`/backend/opportunity-history/${encodeURIComponent(item.id)}`, { cache: "no-store" });
+      const history = await readJson(response, "机会历史接口");
       if (!response.ok) throw new Error(history.error);
-      setOpportunityHistories((current) => ({ ...current, [symbol]: history }));
+      setOpportunityHistories((current) => ({ ...current, [item.id]: history }));
     } catch (error) {
       setNotice(`${item.token.symbol} 历史行情：${error.message}`);
     } finally {
@@ -1219,7 +1212,7 @@ export default function Dashboard() {
             onTrade={setTradeItem}
             expanded={expandedOpportunity === item.id}
             onToggle={() => toggleOpportunity(item)}
-            history={opportunityHistories[item.long.symbol]}
+            history={opportunityHistories[item.id]}
             historyLoading={historyLoading === item.id}
           />)}
         </div>
