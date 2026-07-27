@@ -2638,6 +2638,15 @@ impl TradingService {
                 bail!("Bybit transaction log rejected: {}", json["retMsg"]);
             }
             for item in json["result"]["list"].as_array().unwrap_or(&vec![]) {
+                if let (Some(symbol), Some(cash_flow)) =
+                    (item["symbol"].as_str(), number(&item["cashFlow"]))
+                {
+                    *summary
+                        .closed_pnl_by_symbol
+                        .entry(symbol.to_string())
+                        .or_insert(0.0) += cash_flow;
+                    summary.closed_position_pnl += cash_flow;
+                }
                 if let (Some(symbol), Some(funding)) =
                     (item["symbol"].as_str(), number(&item["funding"]))
                 {
@@ -2658,42 +2667,6 @@ impl TradingService {
             cursor = json["result"]["nextPageCursor"]
                 .as_str()
                 .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            if cursor.is_none() {
-                break;
-            }
-        }
-        let mut cursor = None;
-        for _ in 0..20 {
-            let mut path = format!(
-                "/v5/position/closed-pnl?category=linear&startTime={start}&endTime={now}&limit=100"
-            );
-            if let Some(value) = cursor.as_deref() {
-                path.push_str("&cursor=");
-                path.push_str(value);
-            }
-            let json = self.bybit_signed(Method::GET, &path, None).await?;
-            if json["retCode"].as_i64().unwrap_or(-1) != 0 {
-                bail!("Bybit closed PnL rejected: {}", json["retMsg"]);
-            }
-            let records = json["result"]["list"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            for item in records {
-                if let (Some(symbol), Some(pnl)) =
-                    (item["symbol"].as_str(), number(&item["closedPnl"]))
-                {
-                    *summary
-                        .closed_pnl_by_symbol
-                        .entry(symbol.to_string())
-                        .or_insert(0.0) += pnl;
-                    summary.closed_position_pnl += pnl;
-                }
-            }
-            cursor = json["result"]["nextPageCursor"]
-                .as_str()
-                .filter(|value| !value.is_empty() && !records.is_empty())
                 .map(str::to_string);
             if cursor.is_none() {
                 break;
