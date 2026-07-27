@@ -613,7 +613,6 @@ export default function Dashboard() {
   const [sort, setSort] = useState("apy");
   const [query, setQuery] = useState("");
   const [minApy, setMinApy] = useState(0);
-  const [opportunityPage, setOpportunityPage] = useState(1);
   const [expandedOpportunity, setExpandedOpportunity] = useState("");
   const [opportunityHistories, setOpportunityHistories] = useState({});
   const [historyLoading, setHistoryLoading] = useState("");
@@ -1111,18 +1110,9 @@ export default function Dashboard() {
       .sort((a, b) => b.spread - a.spread),
     [data, query]
   );
-  const pageSize = 10;
-  const opportunityPageCount = Math.max(1, Math.ceil(rows.length / pageSize));
-  const pagedRows = rows.slice((opportunityPage - 1) * pageSize, opportunityPage * pageSize);
-
   useEffect(() => {
-    setOpportunityPage(1);
     setExpandedOpportunity("");
   }, [query, minApy, sort]);
-
-  useEffect(() => {
-    if (opportunityPage > opportunityPageCount) setOpportunityPage(opportunityPageCount);
-  }, [opportunityPage, opportunityPageCount]);
 
   const best = data?.opportunities?.[0];
 
@@ -1204,10 +1194,10 @@ export default function Dashboard() {
           {loading && !data && <div className="state"><RefreshCw className="spin" />正在扫描两个交易所的永续合约…</div>}
           {error && <div className="state error">行情连接失败：{error}<button onClick={load}>重试</button></div>}
           {!loading && !error && rows.length === 0 && <div className="state">当前筛选条件下暂无套利机会</div>}
-          {pagedRows.map((item, i) => <OpportunityCard
+          {rows.map((item, i) => <OpportunityCard
             key={item.id}
             item={item}
-            index={(opportunityPage - 1) * pageSize + i}
+            index={i}
             onTrade={setTradeItem}
             expanded={expandedOpportunity === item.id}
             onToggle={() => toggleOpportunity(item)}
@@ -1215,11 +1205,6 @@ export default function Dashboard() {
             historyLoading={historyLoading === item.id}
           />)}
         </div>
-        {rows.length > pageSize && <nav className="pagination" aria-label="套利机会分页">
-          <button disabled={opportunityPage === 1} onClick={() => { setOpportunityPage((page) => page - 1); setExpandedOpportunity(""); }}>上一页</button>
-          <span>第 {opportunityPage} / {opportunityPageCount} 页 · 共 {rows.length} 个机会</span>
-          <button disabled={opportunityPage === opportunityPageCount} onClick={() => { setOpportunityPage((page) => page + 1); setExpandedOpportunity(""); }}>下一页</button>
-        </nav>}
       </section>
 
       <section className="spread-workspace" id="spread-arbitrage">

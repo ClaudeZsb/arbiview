@@ -24,7 +24,6 @@ pub struct Leg {
     pub qty_step: f64,
     pub tags: Vec<String>,
     pub volume_24h_usdt: f64,
-    pub average_price_24h: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

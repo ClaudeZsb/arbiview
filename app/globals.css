@@ -150,10 +150,6 @@ h1 em { color: var(--green); font-style: normal; }
 .history-legend i { width: 8px; height: 8px; border-radius: 50%; }
 .opportunity-history-loading { border-top: 1px solid var(--line); min-height: 100px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 11px; background: #f8faf9; }
 .position-history { margin: 14px 0 2px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.pagination { margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 18px; }
-.pagination span { color: var(--muted); font: 500 10px DM Mono, monospace; }
-.pagination button { height: 34px; padding: 0 15px; border: 1px solid var(--line); background: white; color: var(--ink); font-size: 10px; border-radius: 3px; }
-.pagination button:disabled { opacity: .4; cursor: not-allowed; }
 .spread-workspace { padding: 42px 4vw 30px; max-width: 1500px; margin: 0 auto; }
 .spread-workspace h2 span { color: var(--green); font: 500 14px DM Mono, monospace; vertical-align: middle; }
 .spread-column-head { display: grid; grid-template-columns: 205px 1fr 150px 225px 180px 78px; gap: 14px; padding: 10px 20px 10px 58px; color: #8a9994; font: 500 9px DM Mono, monospace; letter-spacing: .08em; text-transform: uppercase; }
@@ -375,8 +371,6 @@ footer span { display: flex; align-items: center; gap: 7px; }
   .opportunity-history { padding: 9px; }
   .history-chart-title { display: grid; }
   .history-legend { justify-content: flex-start; }
-  .pagination { gap: 8px; }
-  .pagination span { font-size: 8px; }
   .spread-card { grid-template-columns: 20px 1fr; padding: 18px 16px 18px 5px; gap: 15px 10px; }
   .spread-card > .asset, .spread-route, .spread-stat, .spread-card > .trade-button { grid-column: 2; }
   .spread-stat { text-align: left; display: grid; grid-template-columns: 110px 1fr; }

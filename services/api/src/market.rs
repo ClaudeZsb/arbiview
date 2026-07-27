@@ -13,8 +13,8 @@ const BINANCE_FEE: f64 = 0.0005;
 const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
-type MarketStats = HashMap<String, (f64, f64)>;
-type VolumeCache = Option<(Instant, MarketStats)>;
+type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
+type SpreadAverageCache = HashMap<String, (Instant, f64, f64)>;
 
 fn latest_rate_at(rates: &[(i64, f64)], timestamp: i64) -> Option<f64> {
     rates
@@ -34,6 +34,7 @@ pub struct MarketService {
     quote_lock: Arc<Mutex<()>>,
     binance_volume_cache: Arc<RwLock<VolumeCache>>,
     binance_volume_lock: Arc<Mutex<()>>,
+    spread_average_cache: Arc<RwLock<SpreadAverageCache>>,
 }
 
 impl MarketService {
@@ -51,6 +52,7 @@ impl MarketService {
             quote_lock: Arc::new(Mutex::new(())),
             binance_volume_cache: Arc::new(RwLock::new(None)),
             binance_volume_lock: Arc::new(Mutex::new(())),
+            spread_average_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -119,6 +121,42 @@ impl MarketService {
             }
         }
         opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
+        opportunities.truncate(10);
+        let mut average_tasks = tokio::task::JoinSet::new();
+        for (index, opportunity) in opportunities.iter().enumerate() {
+            let service = self.clone();
+            let symbol = opportunity.long.symbol.clone();
+            average_tasks.spawn(async move {
+                (
+                    index,
+                    symbol.clone(),
+                    service.hourly_spread_averages(&symbol).await,
+                )
+            });
+        }
+        while let Some(result) = average_tasks.join_next().await {
+            match result {
+                Ok((index, _, Ok((binance_long, bybit_long)))) => {
+                    let opportunity = &mut opportunities[index];
+                    opportunity.average_spread_24h = if opportunity.long.exchange == "Binance" {
+                        binance_long
+                    } else {
+                        bybit_long
+                    };
+                    opportunity.spread_vs_average =
+                        opportunity.spread - opportunity.average_spread_24h;
+                    opportunity.break_even_hours = break_even_hours(
+                        opportunity.funding_per_hour,
+                        opportunity.fees,
+                        opportunity.spread_vs_average,
+                    );
+                }
+                Ok((_, symbol, Err(error))) => {
+                    tracing::warn!(symbol, "24h hourly spread average unavailable: {error:#}");
+                }
+                Err(error) => tracing::warn!("24h spread-average task failed: {error}"),
+            }
+        }
         spread_opportunities.sort_by(|a, b| b.spread.total_cmp(&a.spread));
         let result = OpportunitiesResponse {
             opportunities,
@@ -446,8 +484,7 @@ impl MarketService {
                     } else {
                         vec![]
                     },
-                    volume_24h_usdt: volumes.get(symbol).map(|stats| stats.0).unwrap_or(0.0),
-                    average_price_24h: volumes.get(symbol).map(|stats| stats.1).unwrap_or(0.0),
+                    volume_24h_usdt: volumes.get(symbol).copied().unwrap_or(0.0),
                 })
             })
             .collect())
@@ -487,8 +524,6 @@ impl MarketService {
             .filter_map(|x| {
                 let symbol = x["symbol"].as_str()?;
                 let (base, interval, step, is_tradefi) = *meta.get(symbol)?;
-                let turnover = parse(&x["turnover24h"]).unwrap_or(0.0);
-                let volume = parse(&x["volume24h"]).unwrap_or(0.0);
                 Some(Leg {
                     exchange: "Bybit".into(),
                     base: base.into(),
@@ -505,14 +540,67 @@ impl MarketService {
                     } else {
                         vec![]
                     },
-                    volume_24h_usdt: turnover,
-                    average_price_24h: if volume > 0.0 { turnover / volume } else { 0.0 },
+                    volume_24h_usdt: parse(&x["turnover24h"]).unwrap_or(0.0),
                 })
             })
             .collect())
     }
 
-    async fn binance_volumes(&self) -> Result<MarketStats> {
+    async fn hourly_spread_averages(&self, symbol: &str) -> Result<(f64, f64)> {
+        if let Some((at, binance_long, bybit_long)) =
+            self.spread_average_cache.read().await.get(symbol)
+        {
+            if at.elapsed() < Duration::from_secs(60 * 60) {
+                return Ok((*binance_long, *bybit_long));
+            }
+        }
+        let (binance, bybit): (Value, Value) = tokio::try_join!(
+            self.get_json(format!(
+                "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1h&limit=25"
+            )),
+            self.get_json(format!(
+                "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=60&limit=25"
+            ))
+        )?;
+        let binance_closes = binance
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|candle| Some((candle[0].as_i64()?, parse(&candle[4])?)))
+            .collect::<HashMap<_, _>>();
+        let mut aligned = bybit["result"]["list"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|candle| {
+                let timestamp = candle[0].as_str()?.parse::<i64>().ok()?;
+                let bybit_close = parse(&candle[4])?;
+                let binance_close = *binance_closes.get(&timestamp)?;
+                (binance_close > 0.0 && bybit_close > 0.0).then_some((
+                    timestamp,
+                    (bybit_close - binance_close) / binance_close,
+                    (binance_close - bybit_close) / bybit_close,
+                ))
+            })
+            .collect::<Vec<_>>();
+        aligned.sort_by_key(|point| point.0);
+        if aligned.len() > 24 {
+            aligned.drain(..aligned.len() - 24);
+        }
+        if aligned.is_empty() {
+            bail!("no aligned Binance/Bybit hourly candles");
+        }
+        let count = aligned.len() as f64;
+        let binance_long = aligned.iter().map(|point| point.1).sum::<f64>() / count;
+        let bybit_long = aligned.iter().map(|point| point.2).sum::<f64>() / count;
+        self.spread_average_cache.write().await.insert(
+            symbol.to_string(),
+            (Instant::now(), binance_long, bybit_long),
+        );
+        Ok((binance_long, bybit_long))
+    }
+
+    async fn binance_volumes(&self) -> Result<HashMap<String, f64>> {
         if let Some((at, volumes)) = self.binance_volume_cache.read().await.as_ref() {
             if at.elapsed() < Duration::from_secs(300) {
                 return Ok(volumes.clone());
@@ -534,10 +622,7 @@ impl MarketService {
             .filter_map(|item| {
                 Some((
                     item["symbol"].as_str()?.to_string(),
-                    (
-                        parse(&item["quoteVolume"])?,
-                        parse(&item["weightedAvgPrice"]).unwrap_or(0.0),
-                    ),
+                    parse(&item["quoteVolume"])?,
                 ))
             })
             .collect::<HashMap<_, _>>();
@@ -616,12 +701,8 @@ fn make_spread_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opp
 
 fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f64) -> Opportunity {
     let spread = (short.bid - long.ask) / long.ask;
-    let average_spread_24h = if long.average_price_24h > 0.0 && short.average_price_24h > 0.0 {
-        (short.average_price_24h - long.average_price_24h) / long.average_price_24h
-    } else {
-        spread
-    };
-    let spread_vs_average = spread - average_spread_24h;
+    let average_spread_24h = spread;
+    let spread_vs_average = 0.0;
     let fee = |exchange: &str| {
         if exchange == "Binance" {
             BINANCE_FEE
@@ -641,11 +722,15 @@ fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f
         average_spread_24h,
         spread_vs_average,
         fees,
-        break_even_hours: if funding_per_hour > 0.0 {
-            (fees - spread_vs_average).max(0.0) / funding_per_hour
-        } else {
-            0.0
-        },
+        break_even_hours: break_even_hours(funding_per_hour, fees, spread_vs_average),
+    }
+}
+
+fn break_even_hours(funding_per_hour: f64, fees: f64, spread_vs_average: f64) -> f64 {
+    if funding_per_hour > 0.0 {
+        (fees - spread_vs_average).max(0.0) / funding_per_hour
+    } else {
+        0.0
     }
 }
 
@@ -694,28 +779,8 @@ mod tests {
 
     #[test]
     fn break_even_uses_spread_deviation_from_24h_average() {
-        let token = Token {
-            symbol: "TEST".into(),
-            name: "Test".into(),
-            rank: None,
-            tags: vec![],
-        };
-        let mut long = test_leg("Binance", vec![]);
-        let mut short = test_leg("Bybit", vec![]);
-        long.ask = 100.0;
-        long.average_price_24h = 100.0;
-        short.bid = 102.0;
-        short.average_price_24h = 101.0;
-        let opportunity = build_opportunity(&token, &long, &short, 0.001);
-        assert!((opportunity.spread - 0.02).abs() < 1e-9);
-        assert!((opportunity.average_spread_24h - 0.01).abs() < 1e-9);
-        assert!((opportunity.spread_vs_average - 0.01).abs() < 1e-9);
-        assert_eq!(opportunity.break_even_hours, 0.0);
-
-        short.bid = 100.0;
-        let adverse = build_opportunity(&token, &long, &short, 0.001);
-        assert!((adverse.spread_vs_average + 0.01).abs() < 1e-9);
-        assert!((adverse.break_even_hours - 12.1).abs() < 1e-9);
+        assert_eq!(break_even_hours(0.001, 0.0021, 0.01), 0.0);
+        assert!((break_even_hours(0.001, 0.0021, -0.01) - 12.1).abs() < 1e-9);
     }
 
     fn test_leg(exchange: &str, tags: Vec<String>) -> Leg {
@@ -732,7 +797,6 @@ mod tests {
             qty_step: 0.01,
             tags,
             volume_24h_usdt: 1_000_000.0,
-            average_price_24h: 1.0,
         }
     }
 }

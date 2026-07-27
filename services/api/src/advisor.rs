@@ -225,7 +225,6 @@ mod tests {
             qty_step: 0.1,
             tags: vec![],
             volume_24h_usdt: 1_000_000.0,
-            average_price_24h: 10.0,
         };
         Opportunity {
             id: symbol.into(),
