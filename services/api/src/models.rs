@@ -24,6 +24,7 @@ pub struct Leg {
     pub qty_step: f64,
     pub tags: Vec<String>,
     pub volume_24h_usdt: f64,
+    pub average_price_24h: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +37,8 @@ pub struct Opportunity {
     pub funding_per_hour: f64,
     pub apy: f64,
     pub spread: f64,
+    pub average_spread_24h: f64,
+    pub spread_vs_average: f64,
     pub fees: f64,
     pub break_even_hours: f64,
 }

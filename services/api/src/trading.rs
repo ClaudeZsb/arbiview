@@ -3319,6 +3319,8 @@ mod tests {
             funding_per_hour: 0.001,
             apy: 4.0,
             spread: 0.0,
+            average_spread_24h: 0.0,
+            spread_vs_average: 0.0,
             fees: 0.0,
             break_even_hours: 0.0,
         };
@@ -3376,6 +3378,7 @@ mod tests {
             qty_step: 0.01,
             tags: vec![],
             volume_24h_usdt: 1_000_000.0,
+            average_price_24h: 10.0,
         }
     }
 

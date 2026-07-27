@@ -116,15 +116,15 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
           <strong>{pct(item.apy, 1)}</strong>
           <small>{pct(item.fundingPerHour, 4)} / 小时</small>
         </div>
-        <div className="metric spread">
-          <span className="metric-label">开仓价差</span>
-          <strong className={item.spread >= 0 ? "positive" : "negative"}>{pct(item.spread)}</strong>
-          <small>{item.spread >= 0 ? "顺价开仓" : "逆价开仓"}</small>
+      <div className="metric spread">
+        <span className="metric-label">当前 / 24h 平均价差</span>
+        <strong className={item.spread >= 0 ? "positive" : "negative"}>{pct(item.spread)}</strong>
+        <small>均值 {pct(item.averageSpread24h)} · 偏离 <b className={item.spreadVsAverage >= 0 ? "positive" : "negative"}>{pct(item.spreadVsAverage)}</b></small>
         </div>
-        <div className="metric breakeven">
-          <span className="metric-label">预计回本</span>
-          <strong>{duration(item.breakEvenHours)}</strong>
-          <small>含双边开平仓费</small>
+      <div className="metric breakeven">
+        <span className="metric-label">预计回本</span>
+        <strong>{duration(item.breakEvenHours)}</strong>
+        <small>覆盖价差偏离与双边费用</small>
         </div>
         <div className="opportunity-actions">
           <button className="trade-button" onClick={(event) => { event.stopPropagation(); onTrade(item); }}><Zap size={13} />开仓</button>
@@ -483,7 +483,7 @@ function AdvisorCard({ recommendation }) {
       <strong>{entry.token}</strong>
       <span>LONG {entry.longExchange} → SHORT {entry.shortExchange}</span>
       <span>APY <b>{entry.apyPercent.toFixed(2)}%</b> · APY 排名 #{entry.apyRank}</span>
-      <span>回本 <b>{duration(entry.breakEvenHours)}</b> · 价差 <b>{entry.spreadPercent >= 0 ? "+" : ""}{entry.spreadPercent.toFixed(3)}%</b></span>
+      <span>回本 <b>{duration(entry.breakEvenHours)}</b> · 价差偏离 <b>{entry.spreadVsAveragePercent >= 0 ? "+" : ""}{entry.spreadVsAveragePercent.toFixed(3)}%</b></span>
     </div>}
     {recommendation.positions?.map((position) => <div className="advisor-position" key={position.positionId}>
       <strong>{position.token}</strong>
@@ -1197,7 +1197,7 @@ export default function Dashboard() {
         </div>
 
         <div className="column-head">
-          <span>资产</span><span>执行路径 / 双腿行情</span><span>资金 APY</span><span>开仓价差</span><span>预计回本</span>
+          <span>资产</span><span>执行路径 / 双腿行情</span><span>资金 APY</span><span>当前 / 均值</span><span>预计回本</span>
         </div>
 
         <div className="cards">
@@ -1242,7 +1242,7 @@ export default function Dashboard() {
         <div className="method-title"><Info size={18} /><div><b>计算口径</b><span>帮助你正确理解展示数据</span></div></div>
         <div><span>01</span><p><b>可执行价格</b>Long 使用卖一价，Short 使用买一价；Long 低于 Short 时价差为正。</p></div>
         <div><span>02</span><p><b>资金 APY</b>按各合约实际结算周期换算小时净收益，再按 365 天单利年化。</p></div>
-        <div><span>03</span><p><b>预计回本</b>以资金费率覆盖价差与双腿开平仓 taker 手续费；Binance 0.05%，Bybit 0.055%。</p></div>
+        <div><span>03</span><p><b>预计回本</b>以资金费率覆盖“当前方向价差 − 24h 平均方向价差”及双腿开平仓 taker 手续费；Binance 0.05%，Bybit 0.055%。</p></div>
       </section>
 
       <footer><span><ShieldCheck size={15} />数据仅供研究，不构成投资建议</span><span>ARBIVIEW / 2026</span></footer>

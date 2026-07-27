@@ -129,6 +129,7 @@ h1 em { color: var(--green); font-style: normal; }
 .metric strong { font: 500 17px DM Mono, monospace; white-space: nowrap; }
 .metric.apy strong { color: var(--green); font-size: 21px; }
 .metric small { color: #96a49f; font-size: 8px; margin-top: 6px; white-space: nowrap; }
+.metric.spread small { white-space: normal; line-height: 1.45; }
 .trade-button { height: 36px; border: 0; background: var(--green); color: white; border-radius: 4px; display: flex; gap: 5px; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
 .trade-button:hover { background: var(--green-dark); }
 .opportunity-history { border-top: 1px solid var(--line); background: #f8faf9; padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }

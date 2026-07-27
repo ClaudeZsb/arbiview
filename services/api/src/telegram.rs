@@ -1246,7 +1246,7 @@ fn format_advisor(recommendation: &AdvisorResponse) -> String {
         "enter" => {
             let entry = recommendation.entry.as_ref().expect("entry recommendation");
             format!(
-                "🟢 <b>策略建议：允许入场</b>\n<b>{}</b> · LONG {} / SHORT {}\nAPY：{:.2}%（结算候选第 {} 名）\n回本时间：{:.2} 小时\n当前价差：{:+.3}%\n下一结算：{}\n\n{}",
+                "🟢 <b>策略建议：允许入场</b>\n<b>{}</b> · LONG {} / SHORT {}\nAPY：{:.2}%（结算候选第 {} 名）\n回本时间：{:.2} 小时\n价差：当前 {:+.3}% / 24h 均值 {:+.3}% / 偏离 {:+.3}%\n下一结算：{}\n\n{}",
                 html(&entry.token),
                 html(&entry.long_exchange),
                 html(&entry.short_exchange),
@@ -1254,6 +1254,8 @@ fn format_advisor(recommendation: &AdvisorResponse) -> String {
                 entry.apy_rank,
                 entry.break_even_hours,
                 entry.spread_percent,
+                entry.average_spread_24h_percent,
+                entry.spread_vs_average_percent,
                 settlement,
                 html(&recommendation.reason)
             )

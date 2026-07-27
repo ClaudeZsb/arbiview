@@ -41,6 +41,8 @@ pub struct EntryRecommendation {
     pub apy_percent: f64,
     pub break_even_hours: f64,
     pub spread_percent: f64,
+    pub average_spread_24h_percent: f64,
+    pub spread_vs_average_percent: f64,
     pub long_next_funding_time: i64,
     pub short_next_funding_time: i64,
     pub apy_rank: usize,
@@ -150,6 +152,8 @@ fn evaluate(now: i64, opportunities: &[Opportunity], positions: &[Position]) -> 
             apy_percent: opportunity.apy * 100.0,
             break_even_hours: opportunity.break_even_hours,
             spread_percent: opportunity.spread * 100.0,
+            average_spread_24h_percent: opportunity.average_spread_24h * 100.0,
+            spread_vs_average_percent: opportunity.spread_vs_average * 100.0,
             long_next_funding_time: opportunity.long.next_funding_time,
             short_next_funding_time: opportunity.short.next_funding_time,
             apy_rank: rank + 1,
@@ -221,6 +225,7 @@ mod tests {
             qty_step: 0.1,
             tags: vec![],
             volume_24h_usdt: 1_000_000.0,
+            average_price_24h: 10.0,
         };
         Opportunity {
             id: symbol.into(),
@@ -235,6 +240,8 @@ mod tests {
             funding_per_hour: apy / (365.0 * 24.0),
             apy,
             spread: 0.001,
+            average_spread_24h: 0.0,
+            spread_vs_average: 0.001,
             fees: 0.002,
             break_even_hours: break_even,
         }
