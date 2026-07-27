@@ -118,10 +118,9 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
         <div className="metric apy">
           <span className="metric-label">资金费率 APY</span>
           <strong>{pct(item.apy, 1)}</strong>
-          <small>
-            净收益 {pct(item.fundingPerHour, 4)} / 小时
-            {item.borrowInterestPerHour > 0 ? ` · 已扣借币 ${pct(item.borrowInterestPerHour, 4)}` : ""}
-          </small>
+          <small>净收益 {pct(item.fundingPerHour, 4)} / 小时</small>
+          {item.borrowInterestPerHour > 0 &&
+            <small className="borrow-cost">借币成本 −{pct(item.borrowInterestPerHour, 4).replace("+", "")} / 小时</small>}
         </div>
       <div className="metric spread">
         <span className="metric-label">当前 / 24h 平均价差</span>
