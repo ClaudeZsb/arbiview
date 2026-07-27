@@ -3,8 +3,10 @@ use crate::{
     models::{Opportunity, Position},
     trading::TradingService,
 };
-use anyhow::Result;
-use serde::Serialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::{path::Path, sync::Arc};
+use tokio::sync::RwLock;
 
 const ENTRY_WINDOW_MILLIS: i64 = 5 * 60 * 1_000;
 const HOUR_MILLIS: i64 = 60 * 60 * 1_000;
@@ -17,9 +19,11 @@ const BYBIT_TAKER_FEE: f64 = 0.00055;
 pub struct AdvisorService {
     market: MarketService,
     trading: TradingService,
+    latest_actionable: Arc<RwLock<Option<AdvisorResponse>>>,
+    state_path: Option<std::path::PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdvisorResponse {
     pub action: String,
@@ -31,7 +35,7 @@ pub struct AdvisorResponse {
     pub positions: Vec<PositionRecommendation>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntryRecommendation {
     pub opportunity_id: String,
@@ -48,7 +52,7 @@ pub struct EntryRecommendation {
     pub apy_rank: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PositionRecommendation {
     pub position_id: String,
@@ -64,16 +68,63 @@ pub struct PositionRecommendation {
 }
 
 impl AdvisorService {
-    pub fn new(market: MarketService, trading: TradingService) -> Self {
-        Self { market, trading }
+    pub fn new(
+        market: MarketService,
+        trading: TradingService,
+        state_path: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        let latest_actionable = load_latest_actionable(state_path.as_deref())?;
+        Ok(Self {
+            market,
+            trading,
+            latest_actionable: Arc::new(RwLock::new(latest_actionable)),
+            state_path,
+        })
     }
 
     pub async fn recommendation(&self) -> Result<AdvisorResponse> {
         let now = chrono::Utc::now().timestamp_millis();
         let (snapshot, positions) =
             tokio::try_join!(self.market.opportunities(), self.trading.positions())?;
-        Ok(evaluate(now, &snapshot.opportunities, &positions))
+        let recommendation = evaluate(now, &snapshot.opportunities, &positions);
+        if recommendation.action != "hold" {
+            *self.latest_actionable.write().await = Some(recommendation.clone());
+            persist_latest_actionable(self.state_path.as_deref(), &recommendation)?;
+        }
+        Ok(recommendation)
     }
+
+    pub async fn latest_actionable(&self) -> Result<Option<AdvisorResponse>> {
+        self.recommendation().await?;
+        Ok(self.latest_actionable.read().await.clone())
+    }
+}
+
+fn load_latest_actionable(path: Option<&Path>) -> Result<Option<AdvisorResponse>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match std::fs::read(path) {
+        Ok(data) => serde_json::from_slice(&data)
+            .map(Some)
+            .context("failed to parse latest advisor recommendation"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("failed to read latest advisor recommendation"),
+    }
+}
+
+fn persist_latest_actionable(path: Option<&Path>, recommendation: &AdvisorResponse) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("failed to create advisor state directory")?;
+    }
+    let data = serde_json::to_vec_pretty(recommendation)?;
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, data).context("failed to write advisor state")?;
+    std::fs::rename(&temporary, path).context("failed to replace advisor state")?;
+    Ok(())
 }
 
 fn evaluate(now: i64, opportunities: &[Opportunity], positions: &[Position]) -> AdvisorResponse {

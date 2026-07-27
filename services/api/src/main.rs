@@ -44,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let market = MarketService::new(config.clone())?;
     let trading = TradingService::new(config.clone(), market.clone())?;
-    let advisor = AdvisorService::new(market.clone(), trading.clone());
+    let advisor = AdvisorService::new(
+        market.clone(),
+        trading.clone(),
+        config.advisor_state_path.clone(),
+    )?;
     let state = Arc::new(AppState {
         market,
         trading,
@@ -63,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/api/opportunities", get(opportunities))
         .route("/api/advisor/recommendation", get(advisor_recommendation))
+        .route("/api/advisor/latest", get(latest_advisor_recommendation))
         .route("/api/position-quotes", get(position_quotes))
         .route("/api/spread-history/:symbol", get(spread_history))
         .route("/api/account/summary", get(account_summary))
@@ -103,6 +108,12 @@ async fn advisor_recommendation(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.advisor.recommendation().await?))
+}
+
+async fn latest_advisor_recommendation(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.advisor.latest_actionable().await?))
 }
 
 async fn position_quotes(

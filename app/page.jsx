@@ -466,7 +466,8 @@ function AutoCloseControl({ position, rule, busy, onSet, onCancel }) {
 }
 
 function AdvisorCard({ recommendation }) {
-  if (!recommendation) return <section className="advisor-card loading"><RefreshCw className="spin" size={16} />正在生成最新策略建议…</section>;
+  if (recommendation === undefined) return <section className="advisor-card loading"><RefreshCw className="spin" size={16} />正在读取最近一条策略建议…</section>;
+  if (recommendation === null) return <section className="advisor-card loading">暂无非等待策略建议；下一次出现入场或止盈建议后会保留在这里</section>;
   const entry = recommendation.entry;
   const actionText = {
     enter: "允许入场",
@@ -621,7 +622,7 @@ export default function Dashboard() {
   const [autoCloseRules, setAutoCloseRules] = useState([]);
   const [autoCloseBusy, setAutoCloseBusy] = useState("");
   const [protection, setProtection] = useState(null);
-  const [advisor, setAdvisor] = useState(null);
+  const [advisor, setAdvisor] = useState(undefined);
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
   const [adjustment, setAdjustment] = useState(null);
@@ -721,7 +722,7 @@ export default function Dashboard() {
 
   const loadAdvisor = useCallback(async () => {
     try {
-      const response = await fetch("/backend/advisor/recommendation", { cache: "no-store" });
+      const response = await fetch("/backend/advisor/latest", { cache: "no-store" });
       const recommendation = await readJson(response, "策略建议接口");
       if (!response.ok) throw new Error(recommendation.error || `HTTP ${response.status}`);
       setAdvisor(recommendation);

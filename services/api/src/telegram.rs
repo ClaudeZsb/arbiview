@@ -972,20 +972,38 @@ impl TelegramBot {
     }
 
     async fn run_advisor_notifications(&self) {
-        let mut last_fingerprint = String::new();
+        let mut notified_entry_settlement = None;
+        let mut notified_take_profit_positions = std::collections::HashSet::new();
         // Allow market and account caches to warm before publishing the first result.
         tokio::time::sleep(Duration::from_secs(8)).await;
         loop {
             match self.state.advisor.recommendation().await {
                 Ok(recommendation) => {
-                    let fingerprint = advisor_fingerprint(&recommendation);
-                    if fingerprint != last_fingerprint {
+                    let new_take_profit_positions = recommendation
+                        .positions
+                        .iter()
+                        .filter(|position| {
+                            position.take_profit_allowed
+                                && !notified_take_profit_positions.contains(&position.position_id)
+                        })
+                        .map(|position| position.position_id.clone())
+                        .collect::<Vec<_>>();
+                    let should_send = match recommendation.action.as_str() {
+                        "enter" => {
+                            notified_entry_settlement != Some(recommendation.next_settlement_at)
+                        }
+                        "take_profit_allowed" => !new_take_profit_positions.is_empty(),
+                        _ => false,
+                    };
+                    if should_send {
                         if let Err(error) =
                             self.send(&format_advisor(&recommendation), vec![]).await
                         {
                             tracing::warn!("Telegram advisor notification failed: {error:#}");
+                        } else if recommendation.action == "enter" {
+                            notified_entry_settlement = Some(recommendation.next_settlement_at);
                         } else {
-                            last_fingerprint = fingerprint;
+                            notified_take_profit_positions.extend(new_take_profit_positions);
                         }
                     }
                 }
@@ -1213,25 +1231,6 @@ fn position_keyboard(position: &Position) -> Keyboard {
             button("返回", "pos"),
         ],
     ]
-}
-
-fn advisor_fingerprint(recommendation: &AdvisorResponse) -> String {
-    let entry = recommendation
-        .entry
-        .as_ref()
-        .map(|entry| entry.opportunity_id.as_str())
-        .unwrap_or("-");
-    let allowed = recommendation
-        .positions
-        .iter()
-        .filter(|position| position.take_profit_allowed)
-        .map(|position| position.position_id.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{}|{}|{}|{}",
-        recommendation.action, recommendation.entry_window_open, entry, allowed
-    )
 }
 
 fn format_advisor(recommendation: &AdvisorResponse) -> String {
