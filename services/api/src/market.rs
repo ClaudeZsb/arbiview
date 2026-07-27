@@ -211,31 +211,27 @@ impl MarketService {
             })
             .collect();
         opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
-        opportunities.truncate(10);
-        let mut availability_tasks = tokio::task::JoinSet::new();
-        for (index, opportunity) in opportunities.iter().enumerate() {
+        let mut selected = Vec::with_capacity(10);
+        for opportunity in opportunities {
             if opportunity.short.exchange == "Binance" && opportunity.short.market == "spot" {
-                let service = self.clone();
-                let asset = opportunity.short.base.clone();
-                availability_tasks
-                    .spawn(async move { (index, service.binance_borrow_available(&asset).await) });
+                match self.binance_borrow_available(&opportunity.short.base).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            id = opportunity.id,
+                            "Binance borrow availability unavailable; excluding route: {error:#}"
+                        );
+                        continue;
+                    }
+                }
+            }
+            selected.push(opportunity);
+            if selected.len() == 10 {
+                break;
             }
         }
-        while let Some(result) = availability_tasks.join_next().await {
-            match result {
-                Ok((index, Ok(available))) => {
-                    opportunities[index].execution_supported &= available;
-                }
-                Ok((index, Err(error))) => {
-                    opportunities[index].execution_supported = false;
-                    tracing::warn!(
-                        id = opportunities[index].id,
-                        "Binance borrow availability unavailable: {error:#}"
-                    );
-                }
-                Err(error) => tracing::warn!("borrow availability task failed: {error}"),
-            }
-        }
+        let mut opportunities = selected;
         let mut average_tasks = tokio::task::JoinSet::new();
         for (index, opportunity) in opportunities.iter().enumerate() {
             let service = self.clone();
