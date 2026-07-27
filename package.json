@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "concurrently --kill-others --names api,web --prefix-colors cyan,green \"npm:dev:api\" \"npm:dev:web\"",
-    "dev:web": "env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy next dev --port 3000",
+    "dev:web": "bash scripts/dev-web-with-tunnel.sh",
     "dev:api": "cargo run -p arbiview-api",
     "build": "next build",
     "build:api": "cargo build --release -p arbiview-api",
