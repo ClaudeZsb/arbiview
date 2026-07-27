@@ -1,7 +1,9 @@
 use crate::{config::Config, models::*};
 use anyhow::{anyhow, bail, Context, Result};
+use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde_json::Value;
+use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -15,6 +17,7 @@ const YEAR_HOURS: f64 = 365.0 * 24.0;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 type SpreadAverageCache = HashMap<String, (Instant, f64)>;
+type BorrowRateCache = HashMap<String, (Instant, f64)>;
 
 fn latest_rate_at(rates: &[(i64, f64)], timestamp: i64) -> Option<f64> {
     rates
@@ -40,6 +43,7 @@ pub struct MarketService {
     binance_volume_cache: Arc<RwLock<VolumeCache>>,
     binance_volume_lock: Arc<Mutex<()>>,
     spread_average_cache: Arc<RwLock<SpreadAverageCache>>,
+    borrow_rate_cache: Arc<RwLock<BorrowRateCache>>,
 }
 
 impl MarketService {
@@ -58,6 +62,7 @@ impl MarketService {
             binance_volume_cache: Arc::new(RwLock::new(None)),
             binance_volume_lock: Arc::new(Mutex::new(())),
             spread_average_cache: Arc::new(RwLock::new(HashMap::new())),
+            borrow_rate_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -145,7 +150,10 @@ impl MarketService {
             }
             if let Some(spot) = b_spot_map.get(symbol) {
                 let token = classify_token(symbol, cmc.get(symbol), b, b);
-                if let Some(opportunity) = make_spot_perpetual_opportunity(&token, b, spot) {
+                if let Some(opportunity) = make_spot_short_perpetual_long(&token, b, spot) {
+                    opportunities.push(opportunity);
+                }
+                if let Some(opportunity) = make_spot_long_perpetual_short(&token, b, spot) {
                     opportunities.push(opportunity);
                 }
             }
@@ -153,12 +161,52 @@ impl MarketService {
         for (symbol, perpetual) in &y_map {
             if let Some(spot) = y_spot_map.get(symbol) {
                 let token = classify_token(symbol, cmc.get(symbol), perpetual, perpetual);
-                if let Some(opportunity) = make_spot_perpetual_opportunity(&token, perpetual, spot)
-                {
+                if let Some(opportunity) = make_spot_short_perpetual_long(&token, perpetual, spot) {
+                    opportunities.push(opportunity);
+                }
+                if let Some(opportunity) = make_spot_long_perpetual_short(&token, perpetual, spot) {
                     opportunities.push(opportunity);
                 }
             }
         }
+        let mut borrow_tasks = tokio::task::JoinSet::new();
+        for (index, opportunity) in opportunities.iter().enumerate() {
+            if opportunity.short.market == "spot" {
+                let service = self.clone();
+                let exchange = opportunity.short.exchange.clone();
+                let asset = opportunity.short.base.clone();
+                borrow_tasks.spawn(async move {
+                    (index, service.spot_borrow_rate(&exchange, &asset).await)
+                });
+            }
+        }
+        let mut unavailable_borrow_rates = HashSet::new();
+        while let Some(result) = borrow_tasks.join_next().await {
+            match result {
+                Ok((index, Ok(rate))) => {
+                    let opportunity = &mut opportunities[index];
+                    opportunity.borrow_interest_per_hour = rate;
+                    opportunity.funding_per_hour -= rate;
+                    opportunity.apy = opportunity.funding_per_hour * YEAR_HOURS;
+                }
+                Ok((index, Err(error))) => {
+                    tracing::warn!(
+                        id = opportunities[index].id,
+                        "spot borrow rate unavailable; excluding route: {error:#}"
+                    );
+                    unavailable_borrow_rates.insert(index);
+                }
+                Err(error) => tracing::warn!("spot borrow-rate task failed: {error}"),
+            }
+        }
+        opportunities = opportunities
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, opportunity)| {
+                (!unavailable_borrow_rates.contains(&index) && opportunity.funding_per_hour > 0.0)
+                    .then_some(opportunity)
+            })
+            .collect();
         opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
         opportunities.truncate(10);
         let mut average_tasks = tokio::task::JoinSet::new();
@@ -778,6 +826,92 @@ impl MarketService {
             .collect())
     }
 
+    async fn spot_borrow_rate(&self, exchange: &str, asset: &str) -> Result<f64> {
+        let key = format!("{exchange}:{asset}");
+        if let Some((at, rate)) = self.borrow_rate_cache.read().await.get(&key) {
+            if at.elapsed() < Duration::from_secs(60 * 60) {
+                return Ok(*rate);
+            }
+        }
+        let rate = match exchange {
+            "Binance" => {
+                let credentials = self
+                    .config
+                    .binance
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Binance credentials missing"))?;
+                let query = format!(
+                    "asset={asset}&timestamp={}&recvWindow=10000",
+                    chrono::Utc::now().timestamp_millis()
+                );
+                let signature = hmac_sign(&credentials.api_secret, &query);
+                let url = format!(
+                    "https://api.binance.com/sapi/v1/margin/interestRateHistory?{query}&signature={signature}"
+                );
+                let value = self
+                    .client
+                    .get(url)
+                    .header("X-MBX-APIKEY", &credentials.api_key)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<Value>()
+                    .await?;
+                let daily = value
+                    .as_array()
+                    .and_then(|rates| rates.first())
+                    .and_then(|item| parse(&item["dailyInterestRate"]))
+                    .ok_or_else(|| anyhow!("Binance returned no borrow rate for {asset}"))?;
+                daily / 24.0
+            }
+            "Bybit" => {
+                let credentials = self
+                    .config
+                    .bybit
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Bybit credentials missing"))?;
+                let timestamp = chrono::Utc::now().timestamp_millis().to_string();
+                let recv_window = "5000";
+                let query = format!("currency={asset}");
+                let signature = hmac_sign(
+                    &credentials.api_secret,
+                    &format!("{timestamp}{}{recv_window}{query}", credentials.api_key),
+                );
+                let value = self
+                    .client
+                    .get(format!(
+                        "https://api.bybit.com/v5/spot-margin-trade/interest-rate-history?{query}"
+                    ))
+                    .header("X-BAPI-API-KEY", &credentials.api_key)
+                    .header("X-BAPI-SIGN", signature)
+                    .header("X-BAPI-TIMESTAMP", timestamp)
+                    .header("X-BAPI-RECV-WINDOW", recv_window)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<Value>()
+                    .await?;
+                if value["retCode"].as_i64().unwrap_or(-1) != 0 {
+                    bail!(
+                        "Bybit borrow-rate request rejected: {}",
+                        value["retMsg"].as_str().unwrap_or("unknown error")
+                    );
+                }
+                value["result"]["list"]
+                    .as_array()
+                    .and_then(|rates| rates.first())
+                    .and_then(|item| parse(&item["hourlyBorrowRate"]))
+                    .ok_or_else(|| anyhow!("Bybit returned no borrow rate for {asset}"))?
+            }
+            _ => bail!("unsupported spot borrow-rate exchange"),
+        };
+        self.borrow_rate_cache
+            .write()
+            .await
+            .insert(key, (Instant::now(), rate));
+        Ok(rate)
+    }
+
     async fn binance_volumes(&self) -> Result<HashMap<String, f64>> {
         if let Some((at, volumes)) = self.binance_volume_cache.read().await.as_ref() {
             if at.elapsed() < Duration::from_secs(300) {
@@ -839,7 +973,7 @@ fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunit
     Some(build_opportunity(token, long, short, funding_per_hour))
 }
 
-fn make_spot_perpetual_opportunity(
+fn make_spot_short_perpetual_long(
     token: &Token,
     perpetual: &Leg,
     spot: &Leg,
@@ -854,6 +988,24 @@ fn make_spot_perpetual_opportunity(
         perpetual,
         &spot,
         -perpetual.rate / perpetual.interval_hours,
+    ))
+}
+
+fn make_spot_long_perpetual_short(
+    token: &Token,
+    perpetual: &Leg,
+    spot: &Leg,
+) -> Option<Opportunity> {
+    if perpetual.rate <= 0.0 || perpetual.interval_hours <= 0.0 {
+        return None;
+    }
+    let mut spot = spot.clone();
+    spot.next_funding_time = perpetual.next_funding_time;
+    Some(build_opportunity(
+        token,
+        &spot,
+        perpetual,
+        perpetual.rate / perpetual.interval_hours,
     ))
 }
 
@@ -916,6 +1068,7 @@ fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f
         long: long.clone(),
         short: short.clone(),
         funding_per_hour,
+        borrow_interest_per_hour: 0.0,
         apy: funding_per_hour * YEAR_HOURS,
         spread,
         average_spread_24h,
@@ -948,6 +1101,12 @@ fn parse(value: &Value) -> Option<f64> {
 
 fn host(url: &str) -> &str {
     url.split('/').nth(2).unwrap_or("upstream")
+}
+
+fn hmac_sign(secret: &str, message: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+    mac.update(message.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 #[cfg(test)]
@@ -1002,7 +1161,7 @@ mod tests {
         spot.market = "spot".into();
         spot.bid = 1.01;
         let opportunity =
-            make_spot_perpetual_opportunity(&token, &perpetual, &spot).expect("opportunity");
+            make_spot_short_perpetual_long(&token, &perpetual, &spot).expect("opportunity");
         assert!((opportunity.funding_per_hour - 0.001).abs() < 1e-12);
         assert_eq!(opportunity.route_type, "spot_perpetual");
         assert!(!opportunity.execution_supported);
@@ -1010,7 +1169,7 @@ mod tests {
         assert_eq!(opportunity.short.market, "spot");
 
         perpetual.rate = 0.001;
-        assert!(make_spot_perpetual_opportunity(&token, &perpetual, &spot).is_none());
+        assert!(make_spot_short_perpetual_long(&token, &perpetual, &spot).is_none());
     }
 
     fn test_leg(exchange: &str, tags: Vec<String>) -> Leg {

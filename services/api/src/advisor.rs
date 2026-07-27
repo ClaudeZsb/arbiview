@@ -290,6 +290,7 @@ mod tests {
             long: leg("Binance"),
             short: leg("Bybit"),
             funding_per_hour: apy / (365.0 * 24.0),
+            borrow_interest_per_hour: 0.0,
             apy,
             spread: 0.001,
             average_spread_24h: 0.0,

@@ -3327,6 +3327,7 @@ mod tests {
             long: test_market_leg("Bybit"),
             short: test_market_leg("Binance"),
             funding_per_hour: 0.001,
+            borrow_interest_per_hour: 0.0,
             apy: 4.0,
             spread: 0.0,
             average_spread_24h: 0.0,

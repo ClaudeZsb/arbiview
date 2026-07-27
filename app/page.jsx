@@ -74,7 +74,7 @@ function Leg({ type, leg }) {
       <div className="leg-price">{price(type === "long" ? leg.ask : leg.bid)}</div>
       <div className="leg-meta">
         {leg.market === "spot"
-          ? <span>现货腿 <b>借币卖出</b></span>
+          ? <span>现货腿 <b>{type === "long" ? "买入持有" : "借币卖出"}</b></span>
           : <span>资金费率 <b className={leg.rate < 0 ? "positive" : ""}>{pct(leg.rate, 4)}</b> / {leg.intervalHours}h</span>}
         <span>下次结算 <b>{time(leg.nextFundingTime)}</b></span>
         <span>24h 成交额 <b>{compactMoney(leg.volume24hUsdt)}</b></span>
@@ -118,7 +118,10 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
         <div className="metric apy">
           <span className="metric-label">资金费率 APY</span>
           <strong>{pct(item.apy, 1)}</strong>
-          <small>{pct(item.fundingPerHour, 4)} / 小时</small>
+          <small>
+            净收益 {pct(item.fundingPerHour, 4)} / 小时
+            {item.borrowInterestPerHour > 0 ? ` · 已扣借币 ${pct(item.borrowInterestPerHour, 4)}` : ""}
+          </small>
         </div>
       <div className="metric spread">
         <span className="metric-label">当前 / 24h 平均价差</span>
@@ -409,7 +412,9 @@ function PositionHistoryDetails({ position, data, loading }) {
 function OpportunityHistoryDetails({ item, data, loading }) {
   if (item.routeType === "spot_perpetual") {
     return <div className="opportunity-history-loading">
-      同所 SPOT–PERP：永续做多、借币卖出现货；24h 均值来自两市场最近 24 个完整小时收盘价。当前为行情观察，APY 暂未扣除实际借币利息。
+      同所 SPOT–PERP：{item.short.market === "spot" ? "永续做多、借币卖出现货" : "买入现货、永续做空"}；
+      24h 均值来自两市场最近 24 个完整小时收盘价。
+      {item.borrowInterestPerHour > 0 ? " APY 已扣除账户对应的小时借币利率。" : " 该方向不借币，不产生借币利息。"}
     </div>;
   }
   if (loading) return <div className="opportunity-history-loading"><RefreshCw className="spin" size={15} />读取 {item.token.symbol} 近 24 小时历史…</div>;
