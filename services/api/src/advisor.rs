@@ -168,6 +168,7 @@ fn evaluate(now: i64, opportunities: &[Opportunity], positions: &[Position]) -> 
 
     let mut ranked = opportunities
         .iter()
+        .filter(|opportunity| opportunity.execution_supported)
         .filter(|opportunity| settles_at(opportunity.long.next_funding_time, next_settlement_at))
         .filter(|opportunity| settles_at(opportunity.short.next_funding_time, next_settlement_at))
         .collect::<Vec<_>>();
@@ -265,6 +266,7 @@ mod tests {
     fn opportunity(symbol: &str, apy: f64, break_even: f64, settlement: i64) -> Opportunity {
         let leg = |exchange: &str| Leg {
             exchange: exchange.into(),
+            market: "perpetual".into(),
             base: symbol.into(),
             symbol: format!("{symbol}USDT"),
             bid: 10.0,
@@ -294,6 +296,8 @@ mod tests {
             spread_vs_average: 0.001,
             fees: 0.002,
             break_even_hours: break_even,
+            route_type: "cross_perpetual".into(),
+            execution_supported: true,
         }
     }
 

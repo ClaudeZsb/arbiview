@@ -64,15 +64,18 @@ function ExchangeLogo({ name }) {
 }
 
 function Leg({ type, leg }) {
+  const market = leg.market === "spot" ? "SPOT" : "PERP";
   return (
     <div className="leg">
       <div className="leg-head">
         <span className={`side ${type}`}>{type === "long" ? "LONG" : "SHORT"}</span>
-        <span className="exchange"><ExchangeLogo name={leg.exchange} />{leg.exchange}</span>
+        <span className="exchange"><ExchangeLogo name={leg.exchange} />{leg.exchange} · {market}</span>
       </div>
       <div className="leg-price">{price(type === "long" ? leg.ask : leg.bid)}</div>
       <div className="leg-meta">
-        <span>资金费率 <b className={leg.rate < 0 ? "positive" : ""}>{pct(leg.rate, 4)}</b> / {leg.intervalHours}h</span>
+        {leg.market === "spot"
+          ? <span>现货腿 <b>借币卖出</b></span>
+          : <span>资金费率 <b className={leg.rate < 0 ? "positive" : ""}>{pct(leg.rate, 4)}</b> / {leg.intervalHours}h</span>}
         <span>下次结算 <b>{time(leg.nextFundingTime)}</b></span>
         <span>24h 成交额 <b>{compactMoney(leg.volume24hUsdt)}</b></span>
       </div>
@@ -93,6 +96,7 @@ function AssetMeta({ token }) {
 }
 
 function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, historyLoading }) {
+  const executable = item.executionSupported !== false;
   return (
     <article className={`opportunity-shell ${expanded ? "expanded" : ""}`}>
       <div className="opportunity-card" role="button" tabIndex={0} onClick={onToggle} onKeyDown={(event) => {
@@ -127,7 +131,10 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
         <small>覆盖价差偏离与双边费用</small>
         </div>
         <div className="opportunity-actions">
-          <button className="trade-button" onClick={(event) => { event.stopPropagation(); onTrade(item); }}><Zap size={13} />开仓</button>
+          <button className="trade-button" disabled={!executable} title={executable ? "" : "现货保证金借币与还币执行尚未接入"}
+            onClick={(event) => { event.stopPropagation(); if (executable) onTrade(item); }}>
+            <Zap size={13} />{executable ? "开仓" : "仅观察"}
+          </button>
           <ChevronDown className="opportunity-chevron" size={16} />
         </div>
       </div>
@@ -400,6 +407,11 @@ function PositionHistoryDetails({ position, data, loading }) {
 }
 
 function OpportunityHistoryDetails({ item, data, loading }) {
+  if (item.routeType === "spot_perpetual") {
+    return <div className="opportunity-history-loading">
+      同所 SPOT–PERP：永续做多、借币卖出现货；24h 均值来自两市场最近 24 个完整小时收盘价。当前为行情观察，APY 暂未扣除实际借币利息。
+    </div>;
+  }
   if (loading) return <div className="opportunity-history-loading"><RefreshCw className="spin" size={15} />读取 {item.token.symbol} 近 24 小时历史…</div>;
   if (!data?.points?.length) return <div className="opportunity-history-loading">暂无历史数据</div>;
   const longIsBinance = item.long.exchange === "Binance";
@@ -1063,6 +1075,7 @@ export default function Dashboard() {
       return;
     }
     setExpandedOpportunity(item.id);
+    if (item.routeType === "spot_perpetual") return;
     const symbol = item.long.symbol;
     if (opportunityHistories[symbol]) return;
     setHistoryLoading(item.id);

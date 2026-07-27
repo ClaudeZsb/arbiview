@@ -13,6 +13,7 @@ pub struct Token {
 #[serde(rename_all = "camelCase")]
 pub struct Leg {
     pub exchange: String,
+    pub market: String,
     pub base: String,
     pub symbol: String,
     pub bid: f64,
@@ -40,6 +41,8 @@ pub struct Opportunity {
     pub spread_vs_average: f64,
     pub fees: f64,
     pub break_even_hours: f64,
+    pub route_type: String,
+    pub execution_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

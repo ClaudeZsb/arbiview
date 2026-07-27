@@ -792,6 +792,11 @@ impl TradingService {
         opportunity: Opportunity,
         request: OpenTradeRequest,
     ) -> Result<TradeResponse> {
+        if !opportunity.execution_supported {
+            bail!(
+                "spot-perpetual opportunities are observation-only; spot margin borrowing and repayment are not implemented"
+            );
+        }
         if !(10.0..=1_000_000.0).contains(&request.notional_usdt) {
             bail!("notionalUsdt must be between 10 and 1,000,000");
         }
@@ -829,6 +834,11 @@ impl TradingService {
             bail!("leverage must be between 1 and 20");
         }
         let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
+        if !opportunity.execution_supported {
+            bail!(
+                "spot-perpetual opportunities are observation-only; spot margin borrowing and repayment are not implemented"
+            );
+        }
         self.remember_managed_symbol(&opportunity.long.symbol).await;
         let mut tasks = self.batch_tasks.write().await;
         if let Some(existing) = tasks.values().find(|task| {
@@ -3323,6 +3333,8 @@ mod tests {
             spread_vs_average: 0.0,
             fees: 0.0,
             break_even_hours: 0.0,
+            route_type: "cross_perpetual".into(),
+            execution_supported: true,
         };
         assert_eq!(held_route_apy_percent(&position, &[reverse]), Some(-400.0));
     }
@@ -3367,6 +3379,7 @@ mod tests {
     fn test_market_leg(exchange: &str) -> Leg {
         Leg {
             exchange: exchange.into(),
+            market: "perpetual".into(),
             base: "DEXE".into(),
             symbol: "DEXEUSDT".into(),
             bid: 10.0,

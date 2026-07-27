@@ -14,7 +14,7 @@ const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
-type SpreadAverageCache = HashMap<String, (Instant, f64, f64)>;
+type SpreadAverageCache = HashMap<String, (Instant, f64)>;
 
 fn latest_rate_at(rates: &[(i64, f64)], timestamp: i64) -> Option<f64> {
     rates
@@ -75,10 +75,21 @@ impl MarketService {
                 return Ok(value.clone());
             }
         }
-        let (tokens_result, markets_result) = tokio::join!(self.top_tokens(), async {
-            tokio::try_join!(self.binance_markets(), self.bybit_markets())
+        let (tokens_result, perpetual_result, binance_spot_result, bybit_spot_result) = tokio::join!(
+            self.top_tokens(),
+            async { tokio::try_join!(self.binance_markets(), self.bybit_markets()) },
+            self.binance_spot_markets(),
+            self.bybit_spot_markets()
+        );
+        let (binance, bybit) = perpetual_result?;
+        let binance_spot = binance_spot_result.unwrap_or_else(|error| {
+            tracing::warn!("Binance spot markets unavailable: {error:#}");
+            Vec::new()
         });
-        let (binance, bybit) = markets_result?;
+        let bybit_spot = bybit_spot_result.unwrap_or_else(|error| {
+            tracing::warn!("Bybit spot markets unavailable: {error:#}");
+            Vec::new()
+        });
         let cmc = match tokens_result {
             Ok(tokens) => tokens
                 .into_iter()
@@ -92,6 +103,14 @@ impl MarketService {
         let b_map: HashMap<String, Leg> =
             binance.into_iter().map(|x| (x.base.clone(), x)).collect();
         let y_map: HashMap<String, Leg> = bybit.into_iter().map(|x| (x.base.clone(), x)).collect();
+        let b_spot_map: HashMap<String, Leg> = binance_spot
+            .into_iter()
+            .map(|x| (x.base.clone(), x))
+            .collect();
+        let y_spot_map: HashMap<String, Leg> = bybit_spot
+            .into_iter()
+            .map(|x| (x.base.clone(), x))
+            .collect();
         let mut opportunities = vec![];
         let mut spread_opportunities = vec![];
         let mut matched = HashSet::new();
@@ -124,30 +143,43 @@ impl MarketService {
                     spread_opportunities.push(best);
                 }
             }
+            if let Some(spot) = b_spot_map.get(symbol) {
+                let token = classify_token(symbol, cmc.get(symbol), b, b);
+                if let Some(opportunity) = make_spot_perpetual_opportunity(&token, b, spot) {
+                    opportunities.push(opportunity);
+                }
+            }
+        }
+        for (symbol, perpetual) in &y_map {
+            if let Some(spot) = y_spot_map.get(symbol) {
+                let token = classify_token(symbol, cmc.get(symbol), perpetual, perpetual);
+                if let Some(opportunity) = make_spot_perpetual_opportunity(&token, perpetual, spot)
+                {
+                    opportunities.push(opportunity);
+                }
+            }
         }
         opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
         opportunities.truncate(10);
         let mut average_tasks = tokio::task::JoinSet::new();
         for (index, opportunity) in opportunities.iter().enumerate() {
             let service = self.clone();
+            let long = opportunity.long.clone();
+            let short = opportunity.short.clone();
             let symbol = opportunity.long.symbol.clone();
             average_tasks.spawn(async move {
                 (
                     index,
                     symbol.clone(),
-                    service.hourly_spread_averages(&symbol).await,
+                    service.hourly_spread_averages(&long, &short).await,
                 )
             });
         }
         while let Some(result) = average_tasks.join_next().await {
             match result {
-                Ok((index, _, Ok((binance_long, bybit_long)))) => {
+                Ok((index, _, Ok(average))) => {
                     let opportunity = &mut opportunities[index];
-                    opportunity.average_spread_24h = if opportunity.long.exchange == "Binance" {
-                        binance_long
-                    } else {
-                        bybit_long
-                    };
+                    opportunity.average_spread_24h = average;
                     opportunity.spread_vs_average =
                         opportunity.spread - opportunity.average_spread_24h;
                     opportunity.break_even_hours = break_even_hours(
@@ -476,6 +508,7 @@ impl MarketService {
                 let b = books.get(symbol)?;
                 Some(Leg {
                     exchange: "Binance".into(),
+                    market: "perpetual".into(),
                     base: base.into(),
                     symbol: symbol.into(),
                     bid: parse(&b["bidPrice"])?,
@@ -532,6 +565,7 @@ impl MarketService {
                 let (base, interval, step, is_tradefi) = *meta.get(symbol)?;
                 Some(Leg {
                     exchange: "Bybit".into(),
+                    market: "perpetual".into(),
                     base: base.into(),
                     symbol: symbol.into(),
                     bid: parse(&x["bid1Price"])?,
@@ -552,41 +586,153 @@ impl MarketService {
             .collect())
     }
 
-    async fn hourly_spread_averages(&self, symbol: &str) -> Result<(f64, f64)> {
-        if let Some((at, binance_long, bybit_long)) =
-            self.spread_average_cache.read().await.get(symbol)
-        {
+    async fn binance_spot_markets(&self) -> Result<Vec<Leg>> {
+        let (exchange, book, tickers): (Value, Value, Value) = tokio::try_join!(
+            self.get_json("https://api.binance.com/api/v3/exchangeInfo".into()),
+            self.get_json("https://api.binance.com/api/v3/ticker/bookTicker".into()),
+            self.get_json("https://api.binance.com/api/v3/ticker/24hr?type=MINI".into()),
+        )?;
+        let empty = Vec::new();
+        let books = book
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|x| {
+                Some((
+                    x["symbol"].as_str()?.to_string(),
+                    (parse(&x["bidPrice"])?, parse(&x["askPrice"])?),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let volumes = tickers
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|x| {
+                Some((
+                    x["symbol"].as_str()?.to_string(),
+                    (
+                        parse(&x["quoteVolume"]).unwrap_or(0.0),
+                        parse(&x["lastPrice"]).unwrap_or(0.0),
+                    ),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        Ok(exchange["symbols"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|x| {
+                if x["quoteAsset"] != "USDT"
+                    || x["status"] != "TRADING"
+                    || !x["isMarginTradingAllowed"].as_bool().unwrap_or(false)
+                {
+                    return None;
+                }
+                let symbol = x["symbol"].as_str()?;
+                let base = x["baseAsset"].as_str()?;
+                let (bid, ask) = *books.get(symbol)?;
+                let (volume, last) = volumes.get(symbol).copied().unwrap_or_default();
+                let step = x["filters"]
+                    .as_array()
+                    .and_then(|filters| {
+                        filters
+                            .iter()
+                            .find(|filter| filter["filterType"] == "LOT_SIZE")
+                    })
+                    .and_then(|filter| filter["stepSize"].as_str())
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0.001);
+                Some(Leg {
+                    exchange: "Binance".into(),
+                    market: "spot".into(),
+                    base: base.into(),
+                    symbol: symbol.into(),
+                    bid,
+                    ask,
+                    mark: if last > 0.0 { last } else { (bid + ask) / 2.0 },
+                    rate: 0.0,
+                    interval_hours: 0.0,
+                    next_funding_time: 0,
+                    qty_step: step,
+                    tags: vec![],
+                    volume_24h_usdt: volume,
+                })
+            })
+            .collect())
+    }
+
+    async fn bybit_spot_markets(&self) -> Result<Vec<Leg>> {
+        let (instruments, tickers): (Value, Value) = tokio::try_join!(
+            self.get_json(
+                "https://api.bybit.com/v5/market/instruments-info?category=spot&limit=1000".into()
+            ),
+            self.get_json("https://api.bybit.com/v5/market/tickers?category=spot".into()),
+        )?;
+        let empty = Vec::new();
+        let ticker_map = tickers["result"]["list"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|x| Some((x["symbol"].as_str()?.to_string(), x)))
+            .collect::<HashMap<_, _>>();
+        Ok(instruments["result"]["list"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|x| {
+                if x["quoteCoin"] != "USDT"
+                    || x["status"] != "Trading"
+                    || matches!(x["marginTrading"].as_str(), None | Some("" | "none"))
+                {
+                    return None;
+                }
+                let symbol = x["symbol"].as_str()?;
+                let ticker = *ticker_map.get(symbol)?;
+                let bid = parse(&ticker["bid1Price"])?;
+                let ask = parse(&ticker["ask1Price"])?;
+                let last = parse(&ticker["lastPrice"]).unwrap_or((bid + ask) / 2.0);
+                let step = x["lotSizeFilter"]["basePrecision"]
+                    .as_str()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0.001);
+                Some(Leg {
+                    exchange: "Bybit".into(),
+                    market: "spot".into(),
+                    base: x["baseCoin"].as_str()?.into(),
+                    symbol: symbol.into(),
+                    bid,
+                    ask,
+                    mark: last,
+                    rate: 0.0,
+                    interval_hours: 0.0,
+                    next_funding_time: 0,
+                    qty_step: step,
+                    tags: vec![],
+                    volume_24h_usdt: parse(&ticker["turnover24h"]).unwrap_or(0.0),
+                })
+            })
+            .collect())
+    }
+
+    async fn hourly_spread_averages(&self, long: &Leg, short: &Leg) -> Result<f64> {
+        let key = format!(
+            "{}:{}:{}|{}:{}:{}",
+            long.exchange, long.market, long.symbol, short.exchange, short.market, short.symbol
+        );
+        if let Some((at, average)) = self.spread_average_cache.read().await.get(&key) {
             if at.elapsed() < Duration::from_secs(60 * 60) {
-                return Ok((*binance_long, *bybit_long));
+                return Ok(*average);
             }
         }
-        let (binance, bybit): (Value, Value) = tokio::try_join!(
-            self.get_json(format!(
-                "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1h&limit=25"
-            )),
-            self.get_json(format!(
-                "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=60&limit=25"
-            ))
-        )?;
-        let binance_closes = binance
-            .as_array()
-            .unwrap_or(&vec![])
+        let (long_closes, short_closes) =
+            tokio::try_join!(self.hourly_closes(long), self.hourly_closes(short))?;
+        let mut aligned = long_closes
             .iter()
-            .filter_map(|candle| Some((candle[0].as_i64()?, parse(&candle[4])?)))
-            .collect::<HashMap<_, _>>();
-        let mut aligned = bybit["result"]["list"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .filter_map(|candle| {
-                let timestamp = candle[0].as_str()?.parse::<i64>().ok()?;
-                let bybit_close = parse(&candle[4])?;
-                let binance_close = *binance_closes.get(&timestamp)?;
-                (binance_close > 0.0 && bybit_close > 0.0).then_some((
-                    timestamp,
-                    (bybit_close - binance_close) / binance_close,
-                    (binance_close - bybit_close) / bybit_close,
-                ))
+            .filter_map(|(timestamp, long_close)| {
+                let short_close = short_closes.get(timestamp)?;
+                (*long_close > 0.0 && *short_close > 0.0)
+                    .then_some((*timestamp, (*short_close - *long_close) / *long_close))
             })
             .collect::<Vec<_>>();
         aligned.sort_by_key(|point| point.0);
@@ -597,14 +743,39 @@ impl MarketService {
         if aligned.is_empty() {
             bail!("no aligned Binance/Bybit hourly candles");
         }
-        let count = aligned.len() as f64;
-        let binance_long = aligned.iter().map(|point| point.1).sum::<f64>() / count;
-        let bybit_long = aligned.iter().map(|point| point.2).sum::<f64>() / count;
-        self.spread_average_cache.write().await.insert(
-            symbol.to_string(),
-            (Instant::now(), binance_long, bybit_long),
-        );
-        Ok((binance_long, bybit_long))
+        let average = aligned.iter().map(|point| point.1).sum::<f64>() / aligned.len() as f64;
+        self.spread_average_cache
+            .write()
+            .await
+            .insert(key, (Instant::now(), average));
+        Ok(average)
+    }
+
+    async fn hourly_closes(&self, leg: &Leg) -> Result<HashMap<i64, f64>> {
+        let url = match (leg.exchange.as_str(), leg.market.as_str()) {
+            ("Binance", "perpetual") => format!("https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=1h&limit=25", leg.symbol),
+            ("Binance", "spot") => format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1h&limit=25", leg.symbol),
+            ("Bybit", "perpetual") => format!("https://api.bybit.com/v5/market/kline?category=linear&symbol={}&interval=60&limit=25", leg.symbol),
+            ("Bybit", "spot") => format!("https://api.bybit.com/v5/market/kline?category=spot&symbol={}&interval=60&limit=25", leg.symbol),
+            _ => bail!("unsupported market history route"),
+        };
+        let response = self.get_json(url).await?;
+        let candles = if leg.exchange == "Binance" {
+            response.as_array()
+        } else {
+            response["result"]["list"].as_array()
+        };
+        let empty = Vec::new();
+        Ok(candles
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|candle| {
+                let timestamp = candle[0]
+                    .as_i64()
+                    .or_else(|| candle[0].as_str().and_then(|value| value.parse().ok()))?;
+                Some((timestamp, parse(&candle[4])?))
+            })
+            .collect())
     }
 
     async fn binance_volumes(&self) -> Result<HashMap<String, f64>> {
@@ -668,6 +839,24 @@ fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunit
     Some(build_opportunity(token, long, short, funding_per_hour))
 }
 
+fn make_spot_perpetual_opportunity(
+    token: &Token,
+    perpetual: &Leg,
+    spot: &Leg,
+) -> Option<Opportunity> {
+    if perpetual.rate >= 0.0 || perpetual.interval_hours <= 0.0 {
+        return None;
+    }
+    let mut spot = spot.clone();
+    spot.next_funding_time = perpetual.next_funding_time;
+    Some(build_opportunity(
+        token,
+        perpetual,
+        &spot,
+        -perpetual.rate / perpetual.interval_hours,
+    ))
+}
+
 fn classify_token(symbol: &str, cmc: Option<&Token>, binance: &Leg, bybit: &Leg) -> Token {
     let mut tags = Vec::new();
     let tradefi = is_tradefi(binance) && is_tradefi(bybit);
@@ -719,7 +908,10 @@ fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f
     };
     let fees = 2.0 * (fee(&long.exchange) + fee(&short.exchange));
     Opportunity {
-        id: format!("{}-{}-{}", token.symbol, long.exchange, short.exchange),
+        id: format!(
+            "{}-{}-{}-{}-{}",
+            token.symbol, long.exchange, long.market, short.exchange, short.market
+        ),
         token: token.clone(),
         long: long.clone(),
         short: short.clone(),
@@ -730,6 +922,12 @@ fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f
         spread_vs_average,
         fees,
         break_even_hours: break_even_hours(funding_per_hour, fees, spread_vs_average),
+        route_type: if long.market == "perpetual" && short.market == "perpetual" {
+            "cross_perpetual".into()
+        } else {
+            "spot_perpetual".into()
+        },
+        execution_supported: long.market == "perpetual" && short.market == "perpetual",
     }
 }
 
@@ -790,9 +988,35 @@ mod tests {
         assert!((break_even_hours(0.001, 0.0021, -0.01) - 12.1).abs() < 1e-9);
     }
 
+    #[test]
+    fn spot_perpetual_requires_negative_funding_and_is_observation_only() {
+        let token = Token {
+            symbol: "TEST".into(),
+            name: "Test".into(),
+            rank: None,
+            tags: vec![],
+        };
+        let mut perpetual = test_leg("Binance", vec![]);
+        perpetual.rate = -0.008;
+        let mut spot = test_leg("Binance", vec![]);
+        spot.market = "spot".into();
+        spot.bid = 1.01;
+        let opportunity =
+            make_spot_perpetual_opportunity(&token, &perpetual, &spot).expect("opportunity");
+        assert!((opportunity.funding_per_hour - 0.001).abs() < 1e-12);
+        assert_eq!(opportunity.route_type, "spot_perpetual");
+        assert!(!opportunity.execution_supported);
+        assert_eq!(opportunity.long.market, "perpetual");
+        assert_eq!(opportunity.short.market, "spot");
+
+        perpetual.rate = 0.001;
+        assert!(make_spot_perpetual_opportunity(&token, &perpetual, &spot).is_none());
+    }
+
     fn test_leg(exchange: &str, tags: Vec<String>) -> Leg {
         Leg {
             exchange: exchange.into(),
+            market: "perpetual".into(),
             base: "TEST".into(),
             symbol: "TESTUSDT".into(),
             bid: 1.0,
