@@ -1421,6 +1421,7 @@ mod tests {
     fn test_leg(exchange: &str, side: &str) -> crate::models::PositionLeg {
         crate::models::PositionLeg {
             exchange: exchange.into(),
+            market: "perpetual".into(),
             symbol: "TESTUSDT".into(),
             side: side.into(),
             quantity: 1.0,

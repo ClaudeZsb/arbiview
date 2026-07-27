@@ -97,6 +97,9 @@ function AssetMeta({ token }) {
 
 function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, historyLoading }) {
   const executable = item.executionSupported !== false;
+  const disabledReason = item.short.market === "spot"
+    ? "当前币种没有可用的 Binance 杠杆借币额度"
+    : "该现货交易方向尚未接入真实执行";
   return (
     <article className={`opportunity-shell ${expanded ? "expanded" : ""}`}>
       <div className="opportunity-card" role="button" tabIndex={0} onClick={onToggle} onKeyDown={(event) => {
@@ -133,7 +136,7 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
         <small>覆盖价差偏离与双边费用</small>
         </div>
         <div className="opportunity-actions">
-          <button className="trade-button" disabled={!executable} title={executable ? "" : "现货保证金借币与还币执行尚未接入"}
+          <button className="trade-button" disabled={!executable} title={executable ? "" : disabledReason}
             onClick={(event) => { event.stopPropagation(); if (executable) onTrade(item); }}>
             <Zap size={13} />{executable ? "开仓" : "仅观察"}
           </button>
@@ -265,9 +268,9 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
         <button className="batch-close" disabled={active} title={active ? "任务运行中，请先停止或等待完成" : "关闭"} onClick={onClose}><X size={18} /></button>
       </div>
       <div className="batch-route">
-        <span><i className="side-dot long" />LONG · {position.long.exchange}</span>
+        <span><i className="side-dot long" />LONG · {position.long.exchange} · {position.long.market === "spot" ? "SPOT" : "PERP"}</span>
         <ArrowRight size={14} />
-        <span><i className="side-dot short" />SHORT · {position.short.exchange}</span>
+        <span><i className="side-dot short" />SHORT · {position.short.exchange} · {position.short.market === "spot" ? "SPOT" : "PERP"}</span>
       </div>
       {!task && <>
         <label>每腿目标{isReduce ? "减仓" : "加仓"}金额（USDT）<input type="number" min="10" max={isReduce ? maximumReduction : undefined} step="100" value={target} onChange={(event) => setTarget(Number(event.target.value))} /></label>
@@ -386,6 +389,27 @@ function HistoryLineChart({ points, fields, title, subtitle, valueLabel }) {
 function PositionHistoryDetails({ position, data, loading }) {
   if (loading) return <div className="opportunity-history-loading"><RefreshCw className="spin" size={15} />读取 {position.token} 近 24 小时价差与资金费…</div>;
   if (!data?.points?.length) return <div className="opportunity-history-loading">展开后读取近 24 小时价差与资金费历史</div>;
+  if (data.opportunityId) {
+    const points = data.points.map((point) => ({
+      ...point,
+      directionalSpread: point.directionalSpreadPercent,
+      longFundingPercent: Number.isFinite(point.longFundingRate) ? point.longFundingRate * 100 : null,
+      shortFundingPercent: Number.isFinite(point.shortFundingRate) ? point.shortFundingRate * 100 : null
+    }));
+    const marketLabel = (leg) => `${leg.exchange} · ${leg.market === "spot" ? "SPOT" : "PERP"}`;
+    const fundingFields = [
+      position.long.market === "perpetual" && { key: "longFundingPercent", label: `${marketLabel(position.long)} · LONG`, color: "#d8a000" },
+      position.short.market === "perpetual" && { key: "shortFundingPercent", label: `${marketLabel(position.short)} · SHORT`, color: "#dc5d43" }
+    ].filter(Boolean);
+    return <div className="position-history">
+      <HistoryLineChart points={points} fields={[
+        { key: "directionalSpread", label: `${marketLabel(position.long)} LONG → ${marketLabel(position.short)} SHORT`, color: "#087d5a" }
+      ]} title={`${position.token} 近 24h 方向价差`} subtitle="每小时收盘；SHORT 价格高于 LONG 为正，低于 LONG 为负" valueLabel={(value) => `${value.toFixed(3)}%`} />
+      <HistoryLineChart points={points} fields={fundingFields}
+        title={position.long.market === "spot" || position.short.market === "spot" ? "永续腿历史资金费率" : "两所历史资金费率"}
+        subtitle={data.fundingNote || "每小时展示最近一次已知结算费率"} valueLabel={(value) => `${value.toFixed(4)}%`} />
+    </div>;
+  }
   const longIsBinance = position.long.exchange === "Binance";
   const points = data.points.map((point) => {
     const longPrice = longIsBinance ? point.binanceClose : point.bybitClose;
@@ -565,8 +589,8 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
           }}>
             <summary className="position-row">
               <div className="position-token"><ChevronDown size={14} /><div><b>{p.token}/USDT</b><span>{p.openedAt > 0 ? new Date(p.openedAt).toLocaleString("zh-CN") : "交易所实时仓位"}</span></div></div>
-              <div><span>LONG · {p.long.exchange}</span><b>{p.long.quantity} @ {price(p.long.entryPrice)}</b></div>
-              <div><span>SHORT · {p.short.exchange}</span><b>{p.short.quantity} @ {price(p.short.entryPrice)}</b></div>
+              <div><span>LONG · {p.long.exchange} · {p.long.market === "spot" ? "SPOT" : "PERP"}</span><b>{p.long.quantity} @ {price(p.long.entryPrice)}</b></div>
+              <div><span>SHORT · {p.short.exchange} · {p.short.market === "spot" ? "SPOT" : "PERP"}</span><b>{p.short.quantity} @ {price(p.short.entryPrice)}</b></div>
               <div><span>名义价值 / 杠杆</span><b>{price(p.notionalUsdt)} · {p.long.leverage === p.short.leverage ? `${p.long.leverage}×` : `${p.long.leverage}× / ${p.short.leverage}×`}</b></div>
               <div><span>未实现盈亏</span><b className={p.unrealizedPnl >= 0 ? "positive" : "negative"}>{price(p.unrealizedPnl)}</b></div>
               <div className="position-actions">
@@ -586,11 +610,11 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
                 <span>仓位数量</span>
                 <span>Funding Rate</span>
                 <span>未实现收益</span>
-                <span>累计 Funding</span>
+                <span>累计 Funding / 借币利息</span>
               </div>
               {[p.long, p.short].map((leg) => (
-                <div className="position-leg-detail" key={`${leg.exchange}-${leg.side}`}>
-                  <div className="leg-detail-title"><i className={`side-dot ${leg.side}`} /><b>{leg.side.toUpperCase()} · {leg.exchange}</b></div>
+                <div className="position-leg-detail" key={`${leg.exchange}-${leg.market}-${leg.side}`}>
+                  <div className="leg-detail-title"><i className={`side-dot ${leg.side}`} /><b>{leg.side.toUpperCase()} · {leg.exchange} · {leg.market === "spot" ? "SPOT" : "PERP"}</b></div>
                   <b>{price(leg.closePrice ?? leg.markPrice)}</b>
                   <b title={leg.usesLastPrice ? `Mark ${price(leg.rawMarkPrice)} 与 Last 偏差超过 0.1%，已使用 Last` : "使用 Mark Price"}>{price(leg.markPrice)}{leg.usesLastPrice ? " · LAST" : ""}</b>
                   <b>{price(leg.lastPrice ?? leg.markPrice)}</b>
@@ -601,7 +625,7 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
                   <b className={leg.fundingEarned >= 0 ? "positive" : "negative"}>{money(leg.fundingEarned)}</b>
                 </div>
               ))}
-              <p>Funding 为交易所账户近 7 日该合约资金费净额；正数表示收到，负数表示支付。</p>
+              <p>永续腿显示近 7 日 Funding；现货杠杆腿显示当前累计借币利息折算值。正数表示收到，负数表示成本。</p>
               <AutoCloseControl
                 position={p}
                 rule={autoCloseRules.find((rule) => rule.positionId === p.id && ["armed", "triggered", "closing"].includes(rule.status)) || autoCloseRules.find((rule) => rule.positionId === p.id)}
@@ -609,7 +633,7 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
                 onSet={onSetAutoClose}
                 onCancel={onCancelAutoClose}
               />
-              <PositionHistoryDetails position={p} data={histories[p.long.symbol]} loading={historyLoading === p.id} />
+              <PositionHistoryDetails position={p} data={histories[p.id] || histories[p.long.symbol]} loading={historyLoading === p.id} />
             </div>
           </details>
         ))}
@@ -887,7 +911,9 @@ export default function Dashboard() {
         const opportunity = data?.opportunities?.find((item) =>
           item.token.symbol === adjustment.position.token &&
           item.long.exchange === adjustment.position.long.exchange &&
+          item.long.market === adjustment.position.long.market &&
           item.short.exchange === adjustment.position.short.exchange
+          && item.short.market === adjustment.position.short.market
         );
         if (!opportunity) throw new Error("当前机会列表中没有与该持仓方向一致的机会，无法安全加仓");
         response = await fetch("/backend/trades/open", {
@@ -931,7 +957,9 @@ export default function Dashboard() {
         const opportunity = data?.opportunities?.find((item) =>
           item.token.symbol === batchPanel.position.token &&
           item.long.exchange === batchPanel.position.long.exchange &&
+          item.long.market === batchPanel.position.long.market &&
           item.short.exchange === batchPanel.position.short.exchange
+          && item.short.market === batchPanel.position.short.market
         );
         if (!opportunity) throw new Error("当前机会列表中没有与该持仓方向一致的机会，无法安全加仓");
         path = "/backend/trades/batch-increase";
@@ -1089,14 +1117,23 @@ export default function Dashboard() {
   }
 
   async function loadPositionHistory(position) {
-    const symbol = position.long.symbol;
-    if (opportunityHistories[symbol]) return;
+    if (opportunityHistories[position.id]) return;
     setHistoryLoading(position.id);
     try {
-      const response = await fetch(`/backend/spread-history/${encodeURIComponent(symbol)}`, { cache: "no-store" });
-      const history = await response.json();
+      const opportunity = data?.opportunities?.find((item) =>
+        item.token.symbol === position.token &&
+        item.long.exchange === position.long.exchange &&
+        item.long.market === position.long.market &&
+        item.short.exchange === position.short.exchange &&
+        item.short.market === position.short.market
+      );
+      const endpoint = opportunity
+        ? `/backend/opportunity-history/${encodeURIComponent(opportunity.id)}`
+        : `/backend/spread-history/${encodeURIComponent(position.long.symbol)}`;
+      const response = await fetch(endpoint, { cache: "no-store" });
+      const history = await readJson(response, "持仓历史接口");
       if (!response.ok) throw new Error(history.error);
-      setOpportunityHistories((current) => ({ ...current, [symbol]: history }));
+      setOpportunityHistories((current) => ({ ...current, [position.id]: history }));
     } catch (error) {
       setNotice(`${position.token} 资金费历史：${error.message}`);
     } finally {

@@ -339,6 +339,7 @@ mod tests {
     fn position_requires_net_profit_above_one_percent() {
         let leg = |exchange: &str, side: &str| crate::models::PositionLeg {
             exchange: exchange.into(),
+            market: "perpetual".into(),
             symbol: "AAAUSDT".into(),
             side: side.into(),
             quantity: 100.0,

@@ -68,6 +68,7 @@ pub struct FeeAssumptions {
 #[serde(rename_all = "camelCase")]
 pub struct PositionLeg {
     pub exchange: String,
+    pub market: String,
     pub symbol: String,
     pub side: String,
     pub quantity: f64,

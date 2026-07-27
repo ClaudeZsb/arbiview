@@ -18,6 +18,7 @@ type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 type SpreadAverageCache = HashMap<String, (Instant, f64)>;
 type BorrowRateCache = HashMap<String, (Instant, f64)>;
+type BorrowAvailabilityCache = HashMap<String, (Instant, bool)>;
 
 fn latest_rate_at(rates: &[(i64, f64)], timestamp: i64) -> Option<f64> {
     rates
@@ -44,6 +45,7 @@ pub struct MarketService {
     binance_volume_lock: Arc<Mutex<()>>,
     spread_average_cache: Arc<RwLock<SpreadAverageCache>>,
     borrow_rate_cache: Arc<RwLock<BorrowRateCache>>,
+    borrow_availability_cache: Arc<RwLock<BorrowAvailabilityCache>>,
 }
 
 impl MarketService {
@@ -63,6 +65,7 @@ impl MarketService {
             binance_volume_lock: Arc::new(Mutex::new(())),
             spread_average_cache: Arc::new(RwLock::new(HashMap::new())),
             borrow_rate_cache: Arc::new(RwLock::new(HashMap::new())),
+            borrow_availability_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -209,6 +212,30 @@ impl MarketService {
             .collect();
         opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
         opportunities.truncate(10);
+        let mut availability_tasks = tokio::task::JoinSet::new();
+        for (index, opportunity) in opportunities.iter().enumerate() {
+            if opportunity.short.exchange == "Binance" && opportunity.short.market == "spot" {
+                let service = self.clone();
+                let asset = opportunity.short.base.clone();
+                availability_tasks
+                    .spawn(async move { (index, service.binance_borrow_available(&asset).await) });
+            }
+        }
+        while let Some(result) = availability_tasks.join_next().await {
+            match result {
+                Ok((index, Ok(available))) => {
+                    opportunities[index].execution_supported &= available;
+                }
+                Ok((index, Err(error))) => {
+                    opportunities[index].execution_supported = false;
+                    tracing::warn!(
+                        id = opportunities[index].id,
+                        "Binance borrow availability unavailable: {error:#}"
+                    );
+                }
+                Err(error) => tracing::warn!("borrow availability task failed: {error}"),
+            }
+        }
         let mut average_tasks = tokio::task::JoinSet::new();
         for (index, opportunity) in opportunities.iter().enumerate() {
             let service = self.clone();
@@ -506,8 +533,16 @@ impl MarketService {
     }
 
     pub async fn trading_legs(&self) -> Result<Vec<Leg>> {
-        let (binance, bybit) = tokio::try_join!(self.binance_markets(), self.bybit_markets())?;
-        Ok(binance.into_iter().chain(bybit).collect())
+        let (binance, bybit, binance_spot) = tokio::try_join!(
+            self.binance_markets(),
+            self.bybit_markets(),
+            self.binance_spot_markets()
+        )?;
+        Ok(binance
+            .into_iter()
+            .chain(bybit)
+            .chain(binance_spot)
+            .collect())
     }
 
     async fn top_tokens(&self) -> Result<Vec<Token>> {
@@ -1007,11 +1042,12 @@ impl MarketService {
                         value["retMsg"].as_str().unwrap_or("unknown error")
                     );
                 }
-                value["result"]["list"]
+                let rate = value["result"]["list"]
                     .as_array()
                     .and_then(|rates| rates.first())
                     .and_then(|item| parse(&item["hourlyBorrowRate"]))
-                    .ok_or_else(|| anyhow!("Bybit returned no borrow rate for {asset}"))?
+                    .ok_or_else(|| anyhow!("Bybit returned no borrow rate for {asset}"))?;
+                rate
             }
             _ => bail!("unsupported spot borrow-rate exchange"),
         };
@@ -1020,6 +1056,42 @@ impl MarketService {
             .await
             .insert(key, (Instant::now(), rate));
         Ok(rate)
+    }
+
+    async fn binance_borrow_available(&self, asset: &str) -> Result<bool> {
+        if let Some((at, available)) = self.borrow_availability_cache.read().await.get(asset) {
+            if at.elapsed() < Duration::from_secs(5 * 60) {
+                return Ok(*available);
+            }
+        }
+        let credentials = self
+            .config
+            .binance
+            .as_ref()
+            .ok_or_else(|| anyhow!("Binance credentials missing"))?;
+        let query = format!(
+            "asset={asset}&timestamp={}&recvWindow=10000",
+            chrono::Utc::now().timestamp_millis()
+        );
+        let signature = hmac_sign(&credentials.api_secret, &query);
+        let response = self
+            .client
+            .get(format!(
+                "https://api.binance.com/sapi/v1/margin/maxBorrowable?{query}&signature={signature}"
+            ))
+            .header("X-MBX-APIKEY", &credentials.api_key)
+            .send()
+            .await?;
+        let available = if response.status().is_success() {
+            parse(&response.json::<Value>().await?["amount"]).unwrap_or(0.0) > 0.0
+        } else {
+            false
+        };
+        self.borrow_availability_cache
+            .write()
+            .await
+            .insert(asset.into(), (Instant::now(), available));
+        Ok(available)
     }
 
     async fn binance_volumes(&self) -> Result<HashMap<String, f64>> {
@@ -1190,7 +1262,11 @@ fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f
         } else {
             "spot_perpetual".into()
         },
-        execution_supported: long.market == "perpetual" && short.market == "perpetual",
+        execution_supported: (long.market == "perpetual" && short.market == "perpetual")
+            || (long.exchange == "Binance"
+                && long.market == "perpetual"
+                && short.exchange == "Binance"
+                && short.market == "spot"),
     }
 }
 
@@ -1258,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn spot_perpetual_requires_negative_funding_and_is_observation_only() {
+    fn binance_spot_short_perpetual_long_is_execution_eligible() {
         let token = Token {
             symbol: "TEST".into(),
             name: "Test".into(),
@@ -1274,7 +1350,7 @@ mod tests {
             make_spot_short_perpetual_long(&token, &perpetual, &spot).expect("opportunity");
         assert!((opportunity.funding_per_hour - 0.001).abs() < 1e-12);
         assert_eq!(opportunity.route_type, "spot_perpetual");
-        assert!(!opportunity.execution_supported);
+        assert!(opportunity.execution_supported);
         assert_eq!(opportunity.long.market, "perpetual");
         assert_eq!(opportunity.short.market, "spot");
 

@@ -11,7 +11,7 @@ use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -19,6 +19,7 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 type FundingTotals = HashMap<String, f64>;
 type FundingCache = Option<(i64, IncomeSummary, IncomeSummary)>;
+type MarginPositionCache = Option<(Instant, Vec<PositionLeg>)>;
 
 #[derive(Clone, Default)]
 struct IncomeSummary {
@@ -93,7 +94,9 @@ struct ProtectedRoute {
     token: String,
     symbol: String,
     long_exchange: String,
+    long_market: String,
     short_exchange: String,
+    short_market: String,
 }
 
 #[derive(Clone)]
@@ -103,6 +106,8 @@ pub struct TradingService {
     market: MarketService,
     paper_positions: Arc<RwLock<HashMap<String, Position>>>,
     funding_cache: Arc<RwLock<FundingCache>>,
+    margin_position_cache: Arc<RwLock<MarginPositionCache>>,
+    margin_position_lock: Arc<Mutex<()>>,
     income_refresh_lock: Arc<Mutex<()>>,
     batch_tasks: Arc<RwLock<HashMap<String, BatchIncreaseTask>>>,
     auto_close_rules: Arc<RwLock<HashMap<String, AutoCloseRule>>>,
@@ -127,6 +132,8 @@ impl TradingService {
             client: Client::builder().timeout(Duration::from_secs(15)).build()?,
             paper_positions: Arc::new(RwLock::new(HashMap::new())),
             funding_cache: Arc::new(RwLock::new(None)),
+            margin_position_cache: Arc::new(RwLock::new(None)),
+            margin_position_lock: Arc::new(Mutex::new(())),
             income_refresh_lock: Arc::new(Mutex::new(())),
             batch_tasks: Arc::new(RwLock::new(HashMap::new())),
             auto_close_rules: Arc::new(RwLock::new(auto_close_rules)),
@@ -189,12 +196,17 @@ impl TradingService {
     }
 
     async fn inspect_hedge_protection(&self) -> Result<()> {
-        let (binance, bybit, quotes) = tokio::try_join!(
+        let (binance, bybit, margin, quotes) = tokio::try_join!(
             self.binance_positions(),
             self.bybit_positions(),
+            self.binance_margin_positions(),
             self.market.position_quotes()
         )?;
-        let mut legs = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+        let mut legs = binance
+            .into_iter()
+            .chain(bybit)
+            .chain(margin)
+            .collect::<Vec<_>>();
         apply_position_quotes(&mut legs, &quotes);
         self.remember_protected_routes(&legs).await;
         if self
@@ -214,8 +226,20 @@ impl TradingService {
             .cloned()
             .collect::<Vec<_>>();
         for route in routes {
-            let long = find_route_leg(&legs, &route.long_exchange, &route.symbol, "long");
-            let short = find_route_leg(&legs, &route.short_exchange, &route.symbol, "short");
+            let long = find_route_leg(
+                &legs,
+                &route.long_exchange,
+                &route.long_market,
+                &route.symbol,
+                "long",
+            );
+            let short = find_route_leg(
+                &legs,
+                &route.short_exchange,
+                &route.short_market,
+                &route.symbol,
+                "short",
+            );
             let needs_protection = match (&long, &short) {
                 (Some(long), Some(short)) => hedge_notional_needs_protection(long, short),
                 (Some(_), None) | (None, Some(_)) => true,
@@ -229,15 +253,32 @@ impl TradingService {
             };
             // Re-read under the execution lock. A normal trade may have completed
             // between the initial observation and acquiring the lock.
-            let (binance, bybit, quotes) = tokio::try_join!(
+            let (binance, bybit, margin, quotes) = tokio::try_join!(
                 self.binance_positions(),
                 self.bybit_positions(),
+                self.binance_margin_positions(),
                 self.market.position_quotes()
             )?;
-            let mut actual = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+            let mut actual = binance
+                .into_iter()
+                .chain(bybit)
+                .chain(margin)
+                .collect::<Vec<_>>();
             apply_position_quotes(&mut actual, &quotes);
-            let long = find_route_leg(&actual, &route.long_exchange, &route.symbol, "long");
-            let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
+            let long = find_route_leg(
+                &actual,
+                &route.long_exchange,
+                &route.long_market,
+                &route.symbol,
+                "long",
+            );
+            let short = find_route_leg(
+                &actual,
+                &route.short_exchange,
+                &route.short_market,
+                &route.symbol,
+                "short",
+            );
             let still_unbalanced = match (&long, &short) {
                 (Some(long), Some(short)) => hedge_notional_needs_protection(long, short),
                 (Some(_), None) | (None, Some(_)) => true,
@@ -254,7 +295,9 @@ impl TradingService {
         let mut routes = self.protected_routes.write().await;
         for long in legs.iter().filter(|leg| leg.side == "long") {
             if let Some(short) = legs.iter().find(|leg| {
-                leg.symbol == long.symbol && leg.side == "short" && leg.exchange != long.exchange
+                leg.symbol == long.symbol
+                    && leg.side == "short"
+                    && (leg.exchange != long.exchange || leg.market != long.market)
             }) {
                 let token = long.symbol.trim_end_matches("USDT").to_string();
                 routes.insert(
@@ -263,7 +306,9 @@ impl TradingService {
                         token,
                         symbol: long.symbol.clone(),
                         long_exchange: long.exchange.clone(),
+                        long_market: long.market.clone(),
                         short_exchange: short.exchange.clone(),
+                        short_market: short.market.clone(),
                     },
                 );
             }
@@ -300,10 +345,15 @@ impl TradingService {
             let actual = match tokio::try_join!(
                 self.binance_positions(),
                 self.bybit_positions(),
+                self.binance_margin_positions(),
                 self.market.position_quotes()
             ) {
-                Ok((binance, bybit, quotes)) => {
-                    let mut legs = binance.into_iter().chain(bybit).collect::<Vec<_>>();
+                Ok((binance, bybit, margin, quotes)) => {
+                    let mut legs = binance
+                        .into_iter()
+                        .chain(bybit)
+                        .chain(margin)
+                        .collect::<Vec<_>>();
                     apply_position_quotes(&mut legs, &quotes);
                     legs
                 }
@@ -313,8 +363,20 @@ impl TradingService {
                     return;
                 }
             };
-            let long = find_route_leg(&actual, &route.long_exchange, &route.symbol, "long");
-            let short = find_route_leg(&actual, &route.short_exchange, &route.symbol, "short");
+            let long = find_route_leg(
+                &actual,
+                &route.long_exchange,
+                &route.long_market,
+                &route.symbol,
+                "long",
+            );
+            let short = find_route_leg(
+                &actual,
+                &route.short_exchange,
+                &route.short_market,
+                &route.symbol,
+                "short",
+            );
             let long_notional = long.as_ref().map(position_notional).unwrap_or(0.0);
             let short_notional = short.as_ref().map(position_notional).unwrap_or(0.0);
             self.update_protection_event(&event_id, |event| {
@@ -371,10 +433,11 @@ impl TradingService {
             } else {
                 (current_notional - other_notional).max(0.0)
             };
-            let metadata = match market_legs
-                .iter()
-                .find(|leg| leg.exchange == target.exchange && leg.symbol == target.symbol)
-            {
+            let metadata = match market_legs.iter().find(|leg| {
+                leg.exchange == target.exchange
+                    && leg.market == target.market
+                    && leg.symbol == target.symbol
+            }) {
                 Some(metadata) => metadata,
                 None => {
                     self.fail_protection_event(&event_id, "找不到剩余腿的合约元数据".into())
@@ -395,7 +458,14 @@ impl TradingService {
             }
             let side = if target.side == "long" { "Sell" } else { "Buy" };
             match self
-                .place(&target.exchange, &target.symbol, side, quantity, true, 0.0)
+                .place(
+                    &target.exchange,
+                    &target.market,
+                    &target.symbol,
+                    side,
+                    quantity,
+                    true,
+                )
                 .await
             {
                 Ok(order) => {
@@ -793,9 +863,7 @@ impl TradingService {
         request: OpenTradeRequest,
     ) -> Result<TradeResponse> {
         if !opportunity.execution_supported {
-            bail!(
-                "spot-perpetual opportunities are observation-only; spot margin borrowing and repayment are not implemented"
-            );
+            bail!("this opportunity is observation-only or currently has no borrowable liquidity");
         }
         if !(10.0..=1_000_000.0).contains(&request.notional_usdt) {
             bail!("notionalUsdt must be between 10 and 1,000,000");
@@ -835,9 +903,7 @@ impl TradingService {
         }
         let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
         if !opportunity.execution_supported {
-            bail!(
-                "spot-perpetual opportunities are observation-only; spot margin borrowing and repayment are not implemented"
-            );
+            bail!("this opportunity is observation-only or currently has no borrowable liquidity");
         }
         self.remember_managed_symbol(&opportunity.long.symbol).await;
         let mut tasks = self.batch_tasks.write().await;
@@ -1240,8 +1306,18 @@ impl TradingService {
                     .find(|position| position.id == id)
                     .ok_or_else(|| anyhow!("position not found"))?;
                 tokio::try_join!(
-                    self.set_leverage(&position.long.exchange, &position.long.symbol, leverage),
-                    self.set_leverage(&position.short.exchange, &position.short.symbol, leverage)
+                    self.set_leverage(
+                        &position.long.exchange,
+                        &position.long.market,
+                        &position.long.symbol,
+                        leverage
+                    ),
+                    self.set_leverage(
+                        &position.short.exchange,
+                        &position.short.market,
+                        &position.short.symbol,
+                        leverage
+                    )
                 )
                 .context("failed to adjust both legs' leverage")?;
                 let mut adjusted = position;
@@ -1307,6 +1383,7 @@ impl TradingService {
             bybit,
             mut binance_legs,
             mut bybit_legs,
+            margin_legs,
             (binance_income, bybit_income),
             quotes,
         ) = tokio::try_join!(
@@ -1314,11 +1391,13 @@ impl TradingService {
             self.bybit_balance(),
             self.binance_positions(),
             self.bybit_positions(),
+            self.binance_margin_positions(),
             self.income_summary(),
             self.market.position_quotes()
         )?;
         apply_position_quotes(&mut binance_legs, &quotes);
         apply_position_quotes(&mut bybit_legs, &quotes);
+        binance_legs.extend(margin_legs);
         let binance_effective_upl = binance_legs.iter().map(|leg| leg.unrealized_pnl).sum();
         let bybit_effective_upl = bybit_legs.iter().map(|leg| leg.unrealized_pnl).sum();
         let all_legs: Vec<PositionLeg> = binance_legs.into_iter().chain(bybit_legs).collect();
@@ -1329,7 +1408,7 @@ impl TradingService {
                 all_legs.iter().any(|other| {
                     other.symbol == leg.symbol
                         && other.side == "short"
-                        && other.exchange != leg.exchange
+                        && (other.exchange != leg.exchange || other.market != leg.market)
                 })
             })
             .count();
@@ -1339,7 +1418,7 @@ impl TradingService {
                 all_legs.iter().any(|other| {
                     other.symbol == leg.symbol
                         && other.side != leg.side
-                        && other.exchange != leg.exchange
+                        && (other.exchange != leg.exchange || other.market != leg.market)
                 })
             })
             .map(|leg| leg.symbol.clone())
@@ -1355,7 +1434,7 @@ impl TradingService {
             .iter()
             .filter(|leg| {
                 !all_legs.iter().any(|other| {
-                    other.exchange != leg.exchange
+                    (other.exchange != leg.exchange || other.market != leg.market)
                         && other.symbol == leg.symbol
                         && other.side != leg.side
                 })
@@ -1418,7 +1497,9 @@ impl TradingService {
         if let Some(position) = positions.values_mut().find(|position| {
             position.token == opportunity.token.symbol
                 && position.long.exchange == opportunity.long.exchange
+                && position.long.market == opportunity.long.market
                 && position.short.exchange == opportunity.short.exchange
+                && position.short.market == opportunity.short.market
         }) {
             let long_total = position.long.quantity + quantity_long;
             let short_total = position.short.quantity + quantity_short;
@@ -1453,6 +1534,7 @@ impl TradingService {
             leverage: request.leverage,
             long: PositionLeg {
                 exchange: opportunity.long.exchange,
+                market: opportunity.long.market,
                 symbol: opportunity.long.symbol,
                 side: "long".into(),
                 quantity: quantity_long,
@@ -1465,6 +1547,7 @@ impl TradingService {
             },
             short: PositionLeg {
                 exchange: opportunity.short.exchange,
+                market: opportunity.short.market,
                 symbol: opportunity.short.symbol,
                 side: "short".into(),
                 quantity: quantity_short,
@@ -1511,7 +1594,39 @@ impl TradingService {
                 );
             }
         }
+        if opportunity.short.exchange == "Binance" && opportunity.short.market == "spot" {
+            let required_quantity = request.notional_usdt / opportunity.short.bid;
+            let maximum = self
+                .binance_margin_max_borrowable(&opportunity.short.base)
+                .await
+                .context("Binance margin borrow preflight failed; no orders were sent")?;
+            if maximum + opportunity.short.qty_step < required_quantity {
+                bail!(
+                    "Binance margin maximum borrowable {} is below required {} {}; no orders were sent",
+                    format_qty(maximum),
+                    format_qty(required_quantity),
+                    opportunity.short.base
+                );
+            }
+        }
         Ok(())
+    }
+
+    async fn binance_margin_max_borrowable(&self, asset: &str) -> Result<f64> {
+        let creds = self
+            .config
+            .binance
+            .as_ref()
+            .ok_or_else(|| anyhow!("Binance credentials missing"))?;
+        let query = format!(
+            "asset={asset}&timestamp={}",
+            chrono::Utc::now().timestamp_millis()
+        );
+        let response = self
+            .binance_spot_signed(Method::GET, "/sapi/v1/margin/maxBorrowable", &query, creds)
+            .await?;
+        number(&response["amount"])
+            .ok_or_else(|| anyhow!("Binance returned no maxBorrowable amount for {asset}"))
     }
 
     fn ensure_slippage(
@@ -1584,11 +1699,13 @@ impl TradingService {
         tokio::try_join!(
             self.set_leverage(
                 &opportunity.long.exchange,
+                &opportunity.long.market,
                 &opportunity.long.symbol,
                 request.leverage
             ),
             self.set_leverage(
                 &opportunity.short.exchange,
+                &opportunity.short.market,
                 &opportunity.short.symbol,
                 request.leverage
             )
@@ -1620,19 +1737,19 @@ impl TradingService {
         let (long_result, short_result) = tokio::join!(
             self.place(
                 &opportunity.long.exchange,
+                &opportunity.long.market,
                 &opportunity.long.symbol,
                 "Buy",
                 long_qty,
                 false,
-                opportunity.long.ask,
             ),
             self.place(
                 &opportunity.short.exchange,
+                &opportunity.short.market,
                 &opportunity.short.symbol,
                 "Sell",
                 short_qty,
                 false,
-                opportunity.short.bid,
             )
         );
         match long_result {
@@ -1778,11 +1895,11 @@ impl TradingService {
             match self
                 .place(
                     &leg.exchange,
+                    &leg.market,
                     &leg.symbol,
                     order_side,
                     quantity,
                     false,
-                    reference,
                 )
                 .await
             {
@@ -1877,7 +1994,14 @@ impl TradingService {
                 continue;
             }
             match self
-                .place(&leg.exchange, &leg.symbol, side, quantity, true, 0.0)
+                .place(
+                    &leg.exchange,
+                    &leg.market,
+                    &leg.symbol,
+                    side,
+                    quantity,
+                    true,
+                )
                 .await
             {
                 Ok(order) => result.orders.push(order),
@@ -1944,14 +2068,18 @@ impl TradingService {
         let long_leg = legs
             .iter()
             .find(|leg| {
-                leg.exchange == position.long.exchange && leg.symbol == position.long.symbol
+                leg.exchange == position.long.exchange
+                    && leg.symbol == position.long.symbol
+                    && leg.market == position.long.market
             })
             .cloned()
             .ok_or_else(|| anyhow!("long contract metadata unavailable"))?;
         let short_leg = legs
             .iter()
             .find(|leg| {
-                leg.exchange == position.short.exchange && leg.symbol == position.short.symbol
+                leg.exchange == position.short.exchange
+                    && leg.symbol == position.short.symbol
+                    && leg.market == position.short.market
             })
             .cloned()
             .ok_or_else(|| anyhow!("short contract metadata unavailable"))?;
@@ -1988,19 +2116,19 @@ impl TradingService {
         let (long_result, short_result) = tokio::join!(
             self.place(
                 &position.long.exchange,
+                &position.long.market,
                 &position.long.symbol,
                 "Sell",
                 long_qty,
-                true,
-                0.0
+                true
             ),
             self.place(
                 &position.short.exchange,
+                &position.short.market,
                 &position.short.symbol,
                 "Buy",
                 short_qty,
-                true,
-                0.0
+                true
             )
         );
         for result in [long_result, short_result] {
@@ -2110,22 +2238,22 @@ impl TradingService {
         let long_close = self
             .place(
                 &position.long.exchange,
+                &position.long.market,
                 &position.long.symbol,
                 "Sell",
                 position.long.quantity,
                 true,
-                0.0,
             )
             .await?;
         report.orders.push(long_close);
         match self
             .place(
                 &position.short.exchange,
+                &position.short.market,
                 &position.short.symbol,
                 "Buy",
                 position.short.quantity,
                 true,
-                0.0,
             )
             .await
         {
@@ -2134,6 +2262,40 @@ impl TradingService {
                 return Err(error.context(
                     "NAKED_EXPOSURE: long leg close confirmed, short leg close failed; manual intervention required",
                 ));
+            }
+        }
+        if position.short.market == "spot" {
+            let metadata = self
+                .market
+                .trading_legs()
+                .await?
+                .into_iter()
+                .find(|leg| {
+                    leg.exchange == position.short.exchange
+                        && leg.market == position.short.market
+                        && leg.symbol == position.short.symbol
+                })
+                .ok_or_else(|| anyhow!("spot margin metadata unavailable after close"))?;
+            for _ in 0..MAX_RECONCILIATION_ATTEMPTS {
+                let Some(residual) = self.actual_leg(&metadata, "short").await? else {
+                    break;
+                };
+                let quantity = ceil_step(residual.quantity, metadata.qty_step);
+                let order = self
+                    .place(
+                        &metadata.exchange,
+                        &metadata.market,
+                        &metadata.symbol,
+                        "Buy",
+                        quantity,
+                        true,
+                    )
+                    .await
+                    .context("Binance margin residual debt repayment failed")?;
+                report.supplement_orders.push(order);
+            }
+            if self.actual_leg(&metadata, "short").await?.is_some() {
+                bail!("Binance margin debt remains after three repayment attempts");
             }
         }
         report.outcome = "closed".into();
@@ -2150,15 +2312,15 @@ impl TradingService {
     async fn place(
         &self,
         exchange: &str,
+        market: &str,
         symbol: &str,
         side: &str,
         quantity: f64,
         reduce_only: bool,
-        _expected_price: f64,
     ) -> Result<OrderExecution> {
         let client_order_id = format!("av{}", Uuid::new_v4().simple());
-        match exchange {
-            "Binance" => {
+        match (exchange, market) {
+            ("Binance", "perpetual") => {
                 self.binance_order(
                     symbol,
                     if side == "Buy" { "BUY" } else { "SELL" },
@@ -2168,15 +2330,34 @@ impl TradingService {
                 )
                 .await
             }
-            "Bybit" => {
+            ("Binance", "spot") => {
+                self.binance_margin_order(
+                    symbol,
+                    if side == "Buy" { "BUY" } else { "SELL" },
+                    quantity,
+                    reduce_only,
+                    &client_order_id,
+                )
+                .await
+            }
+            ("Bybit", "perpetual") => {
                 self.bybit_order(symbol, side, quantity, reduce_only, &client_order_id)
                     .await
             }
-            _ => bail!("unsupported exchange {exchange}"),
+            _ => bail!("unsupported {exchange} {market} market"),
         }
     }
 
-    async fn set_leverage(&self, exchange: &str, symbol: &str, leverage: u8) -> Result<()> {
+    async fn set_leverage(
+        &self,
+        exchange: &str,
+        market: &str,
+        symbol: &str,
+        leverage: u8,
+    ) -> Result<()> {
+        if market == "spot" {
+            return Ok(());
+        }
         match exchange {
             "Binance" => {
                 let creds = self
@@ -2306,6 +2487,98 @@ impl TradingService {
         })
     }
 
+    async fn binance_margin_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        qty: f64,
+        reduce_only: bool,
+        client_order_id: &str,
+    ) -> Result<OrderExecution> {
+        let creds = self
+            .config
+            .binance
+            .as_ref()
+            .ok_or_else(|| anyhow!("Binance credentials missing"))?;
+        if (!reduce_only && side != "SELL") || (reduce_only && side != "BUY") {
+            bail!("Binance spot-margin route only supports opening SELL and repayment BUY");
+        }
+        let side_effect = if reduce_only {
+            "AUTO_REPAY"
+        } else {
+            "AUTO_BORROW_REPAY"
+        };
+        let query = format!(
+            "symbol={symbol}&isIsolated=FALSE&side={side}&type=MARKET&quantity={}&sideEffectType={side_effect}&newClientOrderId={client_order_id}&newOrderRespType=FULL&timestamp={}",
+            format_qty(qty),
+            chrono::Utc::now().timestamp_millis()
+        );
+        let mut response = match self
+            .binance_spot_signed(Method::POST, "/sapi/v1/margin/order", &query, creds)
+            .await
+        {
+            Ok(response) => response,
+            Err(submit_error) => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let status_query = format!(
+                    "symbol={symbol}&isIsolated=FALSE&origClientOrderId={client_order_id}&timestamp={}",
+                    chrono::Utc::now().timestamp_millis()
+                );
+                self.binance_spot_signed(
+                    Method::GET,
+                    "/sapi/v1/margin/order",
+                    &status_query,
+                    creds,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Binance margin submit result unknown ({submit_error:#}); query clientOrderId={client_order_id} before any retry"
+                    )
+                })?
+            }
+        };
+        let status_query = || {
+            format!(
+                "symbol={symbol}&isIsolated=FALSE&origClientOrderId={client_order_id}&timestamp={}",
+                chrono::Utc::now().timestamp_millis()
+            )
+        };
+        let mut fill = binance_spot_fill(&response);
+        if fill.1 <= 0.0 || fill.2 <= 0.0 {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                response = self
+                    .binance_spot_signed(
+                        Method::GET,
+                        "/sapi/v1/margin/order",
+                        &status_query(),
+                        creds,
+                    )
+                    .await?;
+                fill = binance_spot_fill(&response);
+                if fill.0 == "FILLED" && fill.1 > 0.0 && fill.2 > 0.0 {
+                    break;
+                }
+            }
+        }
+        if fill.1 <= 0.0 || fill.2 <= 0.0 {
+            bail!(
+                "Binance margin fill data unavailable: status={}, clientOrderId={client_order_id}",
+                fill.0
+            );
+        }
+        *self.margin_position_cache.write().await = None;
+        Ok(OrderExecution {
+            exchange: "Binance Spot Margin".into(),
+            client_order_id: client_order_id.into(),
+            order_id: response["orderId"].to_string().trim_matches('"').into(),
+            status: fill.0,
+            executed_quantity: fill.1,
+            average_price: fill.2,
+        })
+    }
+
     async fn bybit_order(
         &self,
         symbol: &str,
@@ -2408,6 +2681,12 @@ impl TradingService {
     }
 
     async fn actual_leg(&self, leg: &Leg, side: &str) -> Result<Option<PositionLeg>> {
+        if leg.exchange == "Binance" && leg.market == "spot" {
+            if side != "short" {
+                return Ok(None);
+            }
+            return self.binance_margin_short_position(leg).await;
+        }
         let mut positions = match leg.exchange.as_str() {
             "Binance" => self.binance_positions().await?,
             "Bybit" => self.bybit_positions().await?,
@@ -2420,10 +2699,61 @@ impl TradingService {
             .find(|position| position.symbol == leg.symbol && position.side == side))
     }
 
+    async fn binance_margin_short_position(&self, leg: &Leg) -> Result<Option<PositionLeg>> {
+        let creds = self
+            .config
+            .binance
+            .as_ref()
+            .ok_or_else(|| anyhow!("Binance credentials missing"))?;
+        let query = format!("timestamp={}", chrono::Utc::now().timestamp_millis());
+        let account = self
+            .binance_spot_signed(Method::GET, "/sapi/v1/margin/account", &query, creds)
+            .await?;
+        let asset = account["userAssets"]
+            .as_array()
+            .and_then(|assets| assets.iter().find(|item| item["asset"] == leg.base))
+            .ok_or_else(|| anyhow!("Binance margin asset {} is unavailable", leg.base))?;
+        let borrowed = number(&asset["borrowed"]).unwrap_or(0.0);
+        let interest = number(&asset["interest"]).unwrap_or(0.0);
+        let debt = borrowed + interest;
+        if debt <= leg.qty_step / 2.0 {
+            return Ok(None);
+        }
+        let trade_query = format!(
+            "symbol={}&limit=500&timestamp={}",
+            leg.symbol,
+            chrono::Utc::now().timestamp_millis()
+        );
+        let trades = self
+            .binance_spot_signed(Method::GET, "/sapi/v1/margin/myTrades", &trade_query, creds)
+            .await
+            .unwrap_or(Value::Null);
+        let entry_price = margin_short_entry_price(&trades, debt).unwrap_or(leg.mark);
+        let mark_price = if leg.mark > 0.0 {
+            leg.mark
+        } else {
+            (leg.bid + leg.ask) / 2.0
+        };
+        Ok(Some(PositionLeg {
+            exchange: "Binance".into(),
+            market: "spot".into(),
+            symbol: leg.symbol.clone(),
+            side: "short".into(),
+            quantity: debt,
+            entry_price,
+            mark_price,
+            unrealized_pnl: (entry_price - mark_price) * debt,
+            funding_earned: -interest * mark_price,
+            funding_rate: 0.0,
+            leverage: 1,
+        }))
+    }
+
     async fn live_positions(&self) -> Result<Vec<Position>> {
-        let (mut binance, mut bybit, (binance_income, bybit_income), quotes) = tokio::try_join!(
+        let (mut binance, mut bybit, margin, (binance_income, bybit_income), quotes) = tokio::try_join!(
             self.binance_positions(),
             self.bybit_positions(),
+            self.binance_margin_positions(),
             self.income_summary(),
             self.market.position_quotes()
         )?;
@@ -2456,6 +2786,7 @@ impl TradingService {
                 .get(&format!("Bybit:{}", leg.symbol))
                 .unwrap_or(&0.0);
         }
+        binance.extend(margin);
         let mut grouped: HashMap<String, Vec<PositionLeg>> = HashMap::new();
         for leg in binance.into_iter().chain(bybit) {
             grouped
@@ -2486,6 +2817,99 @@ impl TradingService {
             .collect())
     }
 
+    async fn binance_margin_positions(&self) -> Result<Vec<PositionLeg>> {
+        if let Some((at, positions)) = self.margin_position_cache.read().await.as_ref() {
+            if at.elapsed() < Duration::from_millis(1500) {
+                return Ok(positions.clone());
+            }
+        }
+        let _guard = self.margin_position_lock.lock().await;
+        if let Some((at, positions)) = self.margin_position_cache.read().await.as_ref() {
+            if at.elapsed() < Duration::from_millis(1500) {
+                return Ok(positions.clone());
+            }
+        }
+        let managed = self.managed_symbols.read().await.clone();
+        if managed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let creds = self
+            .config
+            .binance
+            .as_ref()
+            .ok_or_else(|| anyhow!("Binance credentials missing"))?;
+        let query = format!("timestamp={}", chrono::Utc::now().timestamp_millis());
+        let (account, books) = tokio::try_join!(
+            self.binance_spot_signed(Method::GET, "/sapi/v1/margin/account", &query, creds),
+            async {
+                self.client
+                    .get("https://api.binance.com/api/v3/ticker/bookTicker")
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<Value>()
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+        )?;
+        let empty = Vec::new();
+        let book_map = books
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|item| {
+                Some((
+                    item["symbol"].as_str()?.to_string(),
+                    (number(&item["bidPrice"])?, number(&item["askPrice"])?),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut positions = Vec::new();
+        for symbol in managed {
+            let base = symbol.trim_end_matches("USDT");
+            let Some(asset) = account["userAssets"]
+                .as_array()
+                .and_then(|assets| assets.iter().find(|item| item["asset"] == base))
+            else {
+                continue;
+            };
+            let borrowed = number(&asset["borrowed"]).unwrap_or(0.0);
+            let interest = number(&asset["interest"]).unwrap_or(0.0);
+            let debt = borrowed + interest;
+            if debt <= 0.0 {
+                continue;
+            }
+            let Some((bid, ask)) = book_map.get(&symbol).copied() else {
+                continue;
+            };
+            let trade_query = format!(
+                "symbol={symbol}&limit=500&timestamp={}",
+                chrono::Utc::now().timestamp_millis()
+            );
+            let trades = self
+                .binance_spot_signed(Method::GET, "/sapi/v1/margin/myTrades", &trade_query, creds)
+                .await
+                .unwrap_or(Value::Null);
+            let mark_price = (bid + ask) / 2.0;
+            let entry_price = margin_short_entry_price(&trades, debt).unwrap_or(mark_price);
+            positions.push(PositionLeg {
+                exchange: "Binance".into(),
+                market: "spot".into(),
+                symbol,
+                side: "short".into(),
+                quantity: debt,
+                entry_price,
+                mark_price,
+                unrealized_pnl: (entry_price - mark_price) * debt,
+                funding_earned: -interest * mark_price,
+                funding_rate: 0.0,
+                leverage: 1,
+            });
+        }
+        *self.margin_position_cache.write().await = Some((Instant::now(), positions.clone()));
+        Ok(positions)
+    }
+
     async fn binance_positions(&self) -> Result<Vec<PositionLeg>> {
         let creds = self
             .config
@@ -2507,6 +2931,7 @@ impl TradingService {
                 }
                 Some(PositionLeg {
                     exchange: "Binance".into(),
+                    market: "perpetual".into(),
                     symbol: x["symbol"].as_str()?.into(),
                     side: if amount > 0.0 { "long" } else { "short" }.into(),
                     quantity: amount.abs(),
@@ -2540,6 +2965,7 @@ impl TradingService {
                 }
                 Some(PositionLeg {
                     exchange: "Bybit".into(),
+                    market: "perpetual".into(),
                     symbol: x["symbol"].as_str()?.into(),
                     side: if x["side"] == "Buy" { "long" } else { "short" }.into(),
                     quantity: qty,
@@ -2754,6 +3180,44 @@ impl TradingService {
         serde_json::from_str(&body).context("invalid Binance API response")
     }
 
+    async fn binance_spot_signed(
+        &self,
+        method: Method,
+        path: &str,
+        query: &str,
+        creds: &ExchangeCredentials,
+    ) -> Result<Value> {
+        let signed_query = if query.contains("recvWindow=") {
+            query.to_string()
+        } else {
+            format!("{query}&recvWindow=10000")
+        };
+        let signature = sign(&creds.api_secret, &signed_query);
+        let url = format!("https://api.binance.com{path}?{signed_query}&signature={signature}");
+        let response = self
+            .client
+            .request(method, url)
+            .header("X-MBX-APIKEY", &creds.api_key)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "Binance Spot Margin request failed: {}",
+                    error.without_url()
+                )
+            })?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            let detail = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|json| json["msg"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "request rejected".into());
+            bail!("Binance Spot Margin API HTTP {status}: {detail}");
+        }
+        serde_json::from_str(&body).context("invalid Binance Spot Margin API response")
+    }
+
     async fn bybit_signed(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         let creds = self
             .config
@@ -2816,7 +3280,9 @@ fn batch_logs(
             .chain(&report.rebalance_orders)
             .chain(&report.compensation_orders)
             .map(|order| {
-                let side = if order.exchange == opportunity.long.exchange {
+                let side = if order.exchange.contains("Spot Margin") {
+                    "short"
+                } else if order.exchange == opportunity.long.exchange {
                     "long"
                 } else if order.exchange == opportunity.short.exchange {
                     "short"
@@ -2891,7 +3357,9 @@ fn batch_reduce_logs(
             .chain(&report.rebalance_orders)
             .chain(&report.compensation_orders)
             .map(|order| {
-                let side = if order.exchange == position.long.exchange {
+                let side = if order.exchange.contains("Spot Margin") {
+                    "short"
+                } else if order.exchange == position.long.exchange {
                     "long"
                 } else if order.exchange == position.short.exchange {
                     "short"
@@ -2990,6 +3458,14 @@ fn floor_step(value: f64, step: f64) -> f64 {
     }
 }
 
+fn ceil_step(value: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        value
+    } else {
+        ((value / step).ceil() * step * 1e12).round() / 1e12
+    }
+}
+
 fn format_qty(value: f64) -> String {
     let result = format!("{value:.12}");
     result
@@ -3018,6 +3494,53 @@ fn binance_fill(response: &Value) -> (String, f64, f64) {
         })
         .unwrap_or(0.0);
     (status, quantity, average_price)
+}
+
+fn binance_spot_fill(response: &Value) -> (String, f64, f64) {
+    let status = response["status"].as_str().unwrap_or("UNKNOWN").to_string();
+    let quantity = number(&response["executedQty"]).unwrap_or(0.0);
+    let average_price = number(&response["cummulativeQuoteQty"])
+        .filter(|quote| *quote > 0.0)
+        .and_then(|quote| (quantity > 0.0).then_some(quote / quantity))
+        .or_else(|| {
+            let fills = response["fills"].as_array()?;
+            let (quote, quantity) = fills.iter().fold((0.0, 0.0), |totals, fill| {
+                let qty = number(&fill["qty"]).unwrap_or(0.0);
+                let price = number(&fill["price"]).unwrap_or(0.0);
+                (totals.0 + qty * price, totals.1 + qty)
+            });
+            (quantity > 0.0).then_some(quote / quantity)
+        })
+        .unwrap_or(0.0);
+    (status, quantity, average_price)
+}
+
+fn margin_short_entry_price(trades: &Value, current_debt: f64) -> Option<f64> {
+    let mut rows = trades.as_array()?.iter().collect::<Vec<_>>();
+    rows.sort_by_key(|trade| trade["time"].as_i64().unwrap_or(0));
+    let mut short_quantity = 0.0;
+    let mut short_proceeds = 0.0;
+    for trade in rows {
+        let quantity = number(&trade["qty"]).unwrap_or(0.0);
+        let quote = number(&trade["quoteQty"])
+            .unwrap_or_else(|| quantity * number(&trade["price"]).unwrap_or(0.0));
+        if trade["isBuyer"].as_bool().unwrap_or(false) {
+            if short_quantity > 0.0 {
+                let reduced = quantity.min(short_quantity);
+                let average = short_proceeds / short_quantity;
+                short_quantity -= reduced;
+                short_proceeds = (short_proceeds - reduced * average).max(0.0);
+            }
+        } else {
+            short_quantity += quantity;
+            short_proceeds += quote;
+        }
+    }
+    if short_quantity <= 0.0 || current_debt <= 0.0 {
+        None
+    } else {
+        Some(short_proceeds / short_quantity)
+    }
 }
 
 fn position_notional(leg: &PositionLeg) -> f64 {
@@ -3090,12 +3613,14 @@ fn paired_positions_are_balanced(long: Option<&PositionLeg>, short: Option<&Posi
 fn find_route_leg(
     legs: &[PositionLeg],
     exchange: &str,
+    market: &str,
     symbol: &str,
     side: &str,
 ) -> Option<PositionLeg> {
     legs.iter()
         .find(|leg| {
             leg.exchange == exchange
+                && leg.market == market
                 && leg.symbol == symbol
                 && leg.side == side
                 && position_notional(leg) > f64::EPSILON
@@ -3181,7 +3706,9 @@ fn held_route_apy_percent(position: &Position, opportunities: &[Opportunity]) ->
     if let Some(opportunity) = opportunities.iter().find(|opportunity| {
         opportunity.token.symbol == position.token
             && opportunity.long.exchange == position.long.exchange
+            && opportunity.long.market == position.long.market
             && opportunity.short.exchange == position.short.exchange
+            && opportunity.short.market == position.short.market
     }) {
         return Some(opportunity.apy * 100.0);
     }
@@ -3192,7 +3719,9 @@ fn held_route_apy_percent(position: &Position, opportunities: &[Opportunity]) ->
         .find(|opportunity| {
             opportunity.token.symbol == position.token
                 && opportunity.long.exchange == position.short.exchange
+                && opportunity.long.market == position.short.market
                 && opportunity.short.exchange == position.long.exchange
+                && opportunity.short.market == position.long.market
         })
         .map(|opportunity| -opportunity.apy * 100.0)
 }
@@ -3228,6 +3757,30 @@ mod tests {
         assert_eq!(status, "FILLED");
         assert!((quantity - 34.57).abs() < 1e-9);
         assert!((average_price - 2.887).abs() < 1e-9);
+    }
+
+    #[test]
+    fn binance_spot_fill_uses_cummulative_quote_quantity() {
+        let response = json!({
+            "status": "FILLED",
+            "executedQty": "10",
+            "cummulativeQuoteQty": "25"
+        });
+        let (status, quantity, average_price) = binance_spot_fill(&response);
+        assert_eq!(status, "FILLED");
+        assert_eq!(quantity, 10.0);
+        assert_eq!(average_price, 2.5);
+    }
+
+    #[test]
+    fn margin_short_entry_tracks_remaining_sell_inventory() {
+        let trades = json!([
+            {"time": 1, "isBuyer": false, "qty": "10", "quoteQty": "20"},
+            {"time": 2, "isBuyer": true, "qty": "4", "quoteQty": "9"},
+            {"time": 3, "isBuyer": false, "qty": "2", "quoteQty": "6"}
+        ]);
+        let entry = margin_short_entry_price(&trades, 8.0).unwrap();
+        assert!((entry - 2.25).abs() < 1e-9);
     }
 
     #[test]
@@ -3350,6 +3903,7 @@ mod tests {
             leverage: 1,
             long: PositionLeg {
                 exchange: "Binance".into(),
+                market: "perpetual".into(),
                 symbol: "DEXEUSDT".into(),
                 side: "long".into(),
                 quantity: 10.0,
@@ -3362,6 +3916,7 @@ mod tests {
             },
             short: PositionLeg {
                 exchange: "Bybit".into(),
+                market: "perpetual".into(),
                 symbol: "DEXEUSDT".into(),
                 side: "short".into(),
                 quantity: 10.0,
