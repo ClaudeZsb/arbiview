@@ -501,16 +501,6 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
           <small>已保护：{protection.protectedTokens?.join("、") || "等待识别双腿仓位"}</small>
         </div>
       )}
-      {(protection?.events || []).filter((event) => event.orders.length > 0 || event.status === "failed").slice(-3).reverse().map((event) => (
-        <div className={`protection-event ${event.status}`} key={event.id}>
-          <b>{event.token} · {event.status === "failed" ? "保护失败" : event.status === "completed" ? "保护完成" : "正在保护"}</b>
-          {event.initialLongNotionalUsdt != null
-            ? <span>LONG {money(event.initialLongNotionalUsdt)} → {money(event.finalLongNotionalUsdt)} · SHORT {money(event.initialShortNotionalUsdt)} → {money(event.finalShortNotionalUsdt)}</span>
-            : <span>{event.message}</span>}
-          {event.status === "failed" && <span>{event.message}</span>}
-          <small>{event.orders.length} 笔 reduceOnly 订单</small>
-        </div>
-      ))}
       {(account?.unhedgedLegs || []).length > 0 && (
         <div className="risk-alert">
           <b>检测到未对冲仓位</b>

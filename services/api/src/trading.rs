@@ -68,7 +68,8 @@ impl IncomeSummary {
 const MAX_RECONCILIATION_ATTEMPTS: u8 = 3;
 const HEDGE_PROTECTION_ORDER_USDT: f64 = 100.0;
 const HEDGE_PROTECTION_INTERVAL_SECONDS: f64 = 1.0;
-const HEDGE_PROTECTION_TOLERANCE_RATIO: f64 = 0.01;
+const HEDGE_PROTECTION_TOLERANCE_RATIO: f64 = 0.03;
+const POSITION_RECONCILIATION_TOLERANCE_RATIO: f64 = 0.01;
 const HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT: f64 = 10.0;
 const FUNDING_REFRESH_DELAY_SECONDS: i64 = 2 * 60;
 
@@ -1776,7 +1777,11 @@ impl TradingService {
             result.long = long;
             result.short = short;
             if let (Some(long), Some(short)) = (&result.long, &result.short) {
-                if !hedge_notional_needs_protection(long, short) {
+                if !hedge_notional_mismatch_exceeds(
+                    long,
+                    short,
+                    POSITION_RECONCILIATION_TOLERANCE_RATIO,
+                ) {
                     break;
                 }
             } else if long_notional <= f64::EPSILON && short_notional <= f64::EPSILON {
@@ -3016,13 +3021,25 @@ fn hedge_notional_imbalance_ratio(long: &PositionLeg, short: &PositionLeg) -> f6
 }
 
 fn hedge_notional_needs_protection(long: &PositionLeg, short: &PositionLeg) -> bool {
+    hedge_notional_mismatch_exceeds(long, short, HEDGE_PROTECTION_TOLERANCE_RATIO)
+}
+
+fn hedge_notional_mismatch_exceeds(
+    long: &PositionLeg,
+    short: &PositionLeg,
+    tolerance_ratio: f64,
+) -> bool {
     let difference = (position_notional(long) - position_notional(short)).abs();
     difference > HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT
-        && hedge_notional_imbalance_ratio(long, short) > HEDGE_PROTECTION_TOLERANCE_RATIO
+        && hedge_notional_imbalance_ratio(long, short) > tolerance_ratio
 }
 
 fn paired_positions_are_balanced(long: Option<&PositionLeg>, short: Option<&PositionLeg>) -> bool {
-    matches!((long, short), (Some(long), Some(short)) if !hedge_notional_needs_protection(long, short))
+    matches!((long, short), (Some(long), Some(short)) if !hedge_notional_mismatch_exceeds(
+        long,
+        short,
+        POSITION_RECONCILIATION_TOLERANCE_RATIO
+    ))
 }
 
 fn find_route_leg(
@@ -3196,6 +3213,20 @@ mod tests {
         assert!(!hedge_notional_needs_protection(&long, &short));
 
         long.quantity = 2.01;
+        assert!(hedge_notional_needs_protection(&long, &short));
+    }
+
+    #[test]
+    fn hedge_protection_requires_more_than_three_percent_imbalance() {
+        let mut long = test_position().long;
+        let mut short = test_position().short;
+        long.mark_price = 10.0;
+        short.mark_price = 10.0;
+        long.quantity = 100.0;
+        short.quantity = 98.0;
+        assert!(!hedge_notional_needs_protection(&long, &short));
+
+        short.quantity = 96.0;
         assert!(hedge_notional_needs_protection(&long, &short));
     }
 
