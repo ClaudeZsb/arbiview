@@ -19,6 +19,7 @@ type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 type SpreadAverageCache = HashMap<String, (Instant, f64)>;
 type BorrowRateCache = HashMap<String, (Instant, f64)>;
 type BorrowAvailabilityCache = HashMap<String, (Instant, bool)>;
+type RouteLegCache = HashMap<String, Leg>;
 
 fn latest_rate_at(rates: &[(i64, f64)], timestamp: i64) -> Option<f64> {
     rates
@@ -46,6 +47,7 @@ pub struct MarketService {
     spread_average_cache: Arc<RwLock<SpreadAverageCache>>,
     borrow_rate_cache: Arc<RwLock<BorrowRateCache>>,
     borrow_availability_cache: Arc<RwLock<BorrowAvailabilityCache>>,
+    route_leg_cache: Arc<RwLock<RouteLegCache>>,
 }
 
 impl MarketService {
@@ -66,6 +68,7 @@ impl MarketService {
             spread_average_cache: Arc::new(RwLock::new(HashMap::new())),
             borrow_rate_cache: Arc::new(RwLock::new(HashMap::new())),
             borrow_availability_cache: Arc::new(RwLock::new(HashMap::new())),
+            route_leg_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -119,6 +122,19 @@ impl MarketService {
             .into_iter()
             .map(|x| (x.base.clone(), x))
             .collect();
+        let route_legs = b_map
+            .values()
+            .chain(y_map.values())
+            .chain(b_spot_map.values())
+            .chain(y_spot_map.values())
+            .map(|leg| {
+                (
+                    route_leg_key(&leg.exchange, &leg.market, &leg.symbol),
+                    leg.clone(),
+                )
+            })
+            .collect();
+        *self.route_leg_cache.write().await = route_legs;
         let mut opportunities = vec![];
         let mut spread_opportunities = vec![];
         let mut matched = HashSet::new();
@@ -255,6 +271,46 @@ impl MarketService {
         };
         *self.cache.write().await = Some((Instant::now(), result.clone()));
         Ok(result)
+    }
+
+    pub async fn position_market_metrics(&self, position: &Position) -> Result<(f64, f64, f64)> {
+        self.opportunities().await?;
+        let (long, short) = {
+            let legs = self.route_leg_cache.read().await;
+            let long = legs
+                .get(&route_leg_key(
+                    &position.long.exchange,
+                    &position.long.market,
+                    &position.long.symbol,
+                ))
+                .cloned()
+                .ok_or_else(|| anyhow!("long-leg market data is unavailable"))?;
+            let short = legs
+                .get(&route_leg_key(
+                    &position.short.exchange,
+                    &position.short.market,
+                    &position.short.symbol,
+                ))
+                .cloned()
+                .ok_or_else(|| anyhow!("short-leg market data is unavailable"))?;
+            (long, short)
+        };
+        let funding_per_hour = match (long.market.as_str(), short.market.as_str()) {
+            ("perpetual", "perpetual") => {
+                short.rate / short.interval_hours - long.rate / long.interval_hours
+            }
+            ("perpetual", "spot") => {
+                let borrow_rate = self.spot_borrow_rate(&short.exchange, &short.base).await?;
+                -long.rate / long.interval_hours - borrow_rate
+            }
+            ("spot", "perpetual") => short.rate / short.interval_hours,
+            _ => bail!("unsupported held-route market combination"),
+        };
+        if long.ask <= 0.0 {
+            bail!("long-leg ask price is unavailable");
+        }
+        let spread = (short.bid - long.ask) / long.ask;
+        Ok((funding_per_hour, spread, funding_per_hour * YEAR_HOURS))
     }
 
     async fn enrich_opportunity_averages(&self, opportunities: &mut [Opportunity]) {
@@ -1284,6 +1340,10 @@ fn break_even_hours(funding_per_hour: f64, fees: f64, spread_vs_average: f64) ->
     } else {
         0.0
     }
+}
+
+fn route_leg_key(exchange: &str, market: &str, symbol: &str) -> String {
+    format!("{exchange}:{market}:{symbol}")
 }
 
 fn parse(value: &Value) -> Option<f64> {

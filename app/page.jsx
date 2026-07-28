@@ -601,6 +601,11 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
               </div>
             </summary>
             <div className="position-details">
+              <div className="position-market-metrics">
+                <span>当前资费净差 <b>{p.currentFundingPerHour == null ? "行情暂不可用" : `${pct(p.currentFundingPerHour, 4)} / 小时`}</b></span>
+                <span>当前方向价差 <b className={(p.currentSpread ?? 0) >= 0 ? "positive" : "negative"}>{p.currentSpread == null ? "行情暂不可用" : pct(p.currentSpread, 3)}</b></span>
+                <span>当前净 APY <b className={(p.currentApy ?? 0) >= 0 ? "positive" : "negative"}>{p.currentApy == null ? "行情暂不可用" : pct(p.currentApy, 1)}</b></span>
+              </div>
               <div className="position-detail-head">
                 <span>方向 / 交易所</span>
                 <span>可平仓价</span>

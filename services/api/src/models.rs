@@ -147,6 +147,9 @@ pub struct Position {
     pub short: PositionLeg,
     pub funding_earned: f64,
     pub unrealized_pnl: f64,
+    pub current_funding_per_hour: Option<f64>,
+    pub current_spread: Option<f64>,
+    pub current_apy: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

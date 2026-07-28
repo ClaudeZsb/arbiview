@@ -366,6 +366,9 @@ mod tests {
             short: leg("Bybit", "short"),
             funding_earned: 30.0,
             unrealized_pnl: 0.0,
+            current_funding_per_hour: None,
+            current_spread: None,
+            current_apy: None,
         };
         assert!(evaluate_position(&position).take_profit_allowed);
         position.funding_earned = 20.0;

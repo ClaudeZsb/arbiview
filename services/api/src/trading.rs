@@ -620,12 +620,6 @@ impl TradingService {
             return Ok(());
         }
         let positions = self.positions().await?;
-        let opportunities = self.market.opportunities().await?;
-        let all_opportunities = opportunities
-            .opportunities
-            .into_iter()
-            .chain(opportunities.spot_opportunities)
-            .collect::<Vec<_>>();
         for rule in armed {
             let Some(position) = positions
                 .iter()
@@ -635,8 +629,7 @@ impl TradingService {
                     .await;
                 continue;
             };
-            let Some(current_apy_percent) = held_route_apy_percent(position, &all_opportunities)
-            else {
+            let Some(current_apy_percent) = position.current_apy.map(|apy| apy * 100.0) else {
                 // Absence means the token/route was not present in a complete
                 // market scan. It is missing data, never evidence of a 0% APY.
                 self.update_auto_close(&rule.id, |rule| {
@@ -1340,7 +1333,7 @@ impl TradingService {
     }
 
     pub async fn positions(&self) -> Result<Vec<Position>> {
-        match self.config.trading_mode {
+        let mut positions = match self.config.trading_mode {
             TradingMode::Paper => Ok(self
                 .paper_positions
                 .read()
@@ -1349,7 +1342,26 @@ impl TradingService {
                 .cloned()
                 .collect()),
             TradingMode::Live => self.live_positions().await,
+        }?;
+        for position in &mut positions {
+            match self.market.position_market_metrics(position).await {
+                Ok((funding_per_hour, spread, apy)) => {
+                    position.current_funding_per_hour = Some(funding_per_hour);
+                    position.current_spread = Some(spread);
+                    position.current_apy = Some(apy);
+                }
+                Err(error) => {
+                    position.current_funding_per_hour = None;
+                    position.current_spread = None;
+                    position.current_apy = None;
+                    tracing::warn!(
+                        token = %position.token,
+                        "held-route market metrics unavailable: {error:#}"
+                    );
+                }
+            }
         }
+        Ok(positions)
     }
 
     pub async fn account_summary(&self) -> Result<AccountSummary> {
@@ -1565,6 +1577,9 @@ impl TradingService {
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            current_funding_per_hour: None,
+            current_spread: None,
+            current_apy: None,
         };
         positions.insert(position.id.clone(), position.clone());
         Ok(TradeResponse {
@@ -1839,6 +1854,9 @@ impl TradingService {
             short,
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            current_funding_per_hour: None,
+            current_spread: None,
+            current_apy: None,
         };
         Ok(TradeResponse {
             position,
@@ -2202,6 +2220,9 @@ impl TradingService {
             leverage: position.leverage,
             funding_earned: position.funding_earned,
             unrealized_pnl: long.unrealized_pnl + short.unrealized_pnl,
+            current_funding_per_hour: position.current_funding_per_hour,
+            current_spread: position.current_spread,
+            current_apy: position.current_apy,
             long,
             short,
         };
@@ -2817,6 +2838,9 @@ impl TradingService {
                     short,
                     funding_earned,
                     unrealized_pnl: pnl,
+                    current_funding_per_hour: None,
+                    current_spread: None,
+                    current_apy: None,
                 })
             })
             .collect())
@@ -3707,6 +3731,7 @@ fn load_managed_symbols(config: &Config) -> Result<HashSet<String>> {
         .collect())
 }
 
+#[cfg(test)]
 fn held_route_apy_percent(position: &Position, opportunities: &[Opportunity]) -> Option<f64> {
     if let Some(opportunity) = opportunities.iter().find(|opportunity| {
         opportunity.token.symbol == position.token
@@ -3934,6 +3959,9 @@ mod tests {
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            current_funding_per_hour: None,
+            current_spread: None,
+            current_apy: None,
         }
     }
 
