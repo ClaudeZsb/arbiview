@@ -881,21 +881,31 @@ impl TelegramBot {
     }
 
     async fn show_positions(&self) -> Result<()> {
-        let positions = self.state.trading.positions().await?;
+        let (positions, snapshot) = tokio::try_join!(
+            self.state.trading.positions(),
+            self.state.market.opportunities()
+        )?;
         if positions.is_empty() {
             return self
                 .send("当前没有套利仓位。", vec![vec![button("查看机会", "opps")]])
                 .await;
         }
+        let opportunities = snapshot
+            .opportunities
+            .iter()
+            .chain(snapshot.spot_opportunities.iter())
+            .collect::<Vec<_>>();
         let mut text = String::from("<b>当前套利仓位</b>\n\n");
         let mut keyboard = vec![];
         for position in &positions {
+            let market_metrics = position_market_metrics(position, &opportunities);
             text.push_str(&format!(
-                "<b>{}</b> · ${:.2} · {}× · 未实现 {:+.2}\n",
+                "<b>{}</b> · ${:.2} · {}× · 未实现 {:+.2}\n{}\n",
                 html(&position.token),
                 position.notional_usdt,
                 position.leverage,
-                position.unrealized_pnl
+                position.unrealized_pnl,
+                market_metrics
             ));
             keyboard.push(vec![button(
                 &format!("管理 {}", position.token),
@@ -907,9 +917,15 @@ impl TelegramBot {
     }
 
     async fn show_position(&self, position: &Position) -> Result<()> {
+        let snapshot = self.state.market.opportunities().await?;
+        let opportunities = snapshot
+            .opportunities
+            .iter()
+            .chain(snapshot.spot_opportunities.iter())
+            .collect::<Vec<_>>();
         self.send(
             &format!(
-                "<b>{}/USDT</b> · 每腿约 ${:.2} · {}×\n\n🟢 LONG {}: {:.6} @ {:.6}\n🔴 SHORT {}: {:.6} @ {:.6}\n未实现盈亏：{:+.4} USDT\n累计 Funding：{:+.4} USDT",
+                "<b>{}/USDT</b> · 每腿约 ${:.2} · {}×\n\n🟢 LONG {}: {:.6} @ {:.6}\n🔴 SHORT {}: {:.6} @ {:.6}\n未实现盈亏：{:+.4} USDT\n累计 Funding：{:+.4} USDT\n{}",
                 html(&position.token),
                 position.notional_usdt,
                 position.leverage,
@@ -920,7 +936,8 @@ impl TelegramBot {
                 position.short.quantity,
                 position.short.mark_price,
                 position.unrealized_pnl,
-                position.funding_earned
+                position.funding_earned,
+                position_market_metrics(position, &opportunities)
             ),
             position_keyboard(position),
         )
@@ -1360,6 +1377,43 @@ fn batch_status(status: &str) -> &str {
         "failed" => "失败",
         _ => status,
     }
+}
+
+fn position_market_metrics(position: &Position, opportunities: &[&Opportunity]) -> String {
+    if let Some(opportunity) = opportunities.iter().find(|opportunity| {
+        opportunity.token.symbol == position.token
+            && opportunity.long.exchange == position.long.exchange
+            && opportunity.long.market == position.long.market
+            && opportunity.short.exchange == position.short.exchange
+            && opportunity.short.market == position.short.market
+    }) {
+        return format!(
+            "资费净差 {:+.4}%/h · 价差 {:+.3}% · APY {:+.1}%",
+            opportunity.funding_per_hour * 100.0,
+            opportunity.spread * 100.0,
+            opportunity.apy * 100.0
+        );
+    }
+    if let Some(opportunity) = opportunities.iter().find(|opportunity| {
+        opportunity.token.symbol == position.token
+            && opportunity.long.exchange == position.short.exchange
+            && opportunity.long.market == position.short.market
+            && opportunity.short.exchange == position.long.exchange
+            && opportunity.short.market == position.long.market
+    }) {
+        let spread = if opportunity.short.ask > 0.0 {
+            (opportunity.long.bid - opportunity.short.ask) / opportunity.short.ask
+        } else {
+            0.0
+        };
+        return format!(
+            "资费净差 {:+.4}%/h · 价差 {:+.3}% · APY {:+.1}%",
+            -opportunity.funding_per_hour * 100.0,
+            spread * 100.0,
+            -opportunity.apy * 100.0
+        );
+    }
+    "资费净差 / 价差 / APY：当前 TOP 10 行情中不可用".into()
 }
 
 fn telegram_tags(tags: &[String]) -> String {
