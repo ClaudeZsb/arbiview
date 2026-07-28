@@ -353,6 +353,28 @@ impl TelegramBot {
                     .await?;
                 self.show_opportunity(&opportunity).await
             }
+            ["oh", token, long, short] => {
+                let opportunity = self
+                    .find_opportunity(token, Some(long), Some(short))
+                    .await?;
+                let history = self
+                    .state
+                    .market
+                    .opportunity_history(&opportunity.id)
+                    .await?;
+                self.show_market_history(
+                    &opportunity.token.symbol,
+                    &history,
+                    &format!("o|{token}|{long}|{short}"),
+                )
+                .await
+            }
+            ["ph", id] => {
+                let position = self.find_position(id).await?;
+                let history = self.state.market.position_history(&position).await?;
+                self.show_market_history(&position.token, &history, &format!("p|{id}"))
+                    .await
+            }
             ["oc", token, long, short, amount, leverage] => {
                 let opportunity = self
                     .find_opportunity(token, Some(long), Some(short))
@@ -705,9 +727,58 @@ impl TelegramBot {
                 button("开仓 $1000", &format!("oc|{route}|1000|1")),
                 button("刷新机会", &format!("o|{route}")),
             ],
+            vec![button("查看 24h 价差与资费", &format!("oh|{route}"))],
             vec![button("返回列表", "opps")],
         ];
         self.send(&text, keyboard).await
+    }
+
+    async fn show_market_history(
+        &self,
+        token: &str,
+        history: &crate::models::OpportunityHistoryResponse,
+        back_callback: &str,
+    ) -> Result<()> {
+        let mut table = String::from("时间   价差%    Long%   Short%\n");
+        for point in &history.points {
+            let time = chrono::DateTime::from_timestamp_millis(point.timestamp)
+                .map(|value| {
+                    value
+                        .with_timezone(
+                            &chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid timezone"),
+                        )
+                        .format("%m-%d %H")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "—".into());
+            table.push_str(&format!(
+                "{} {:+7.3} {:>7} {:>7}\n",
+                time,
+                point.directional_spread_percent,
+                history_rate(point.long_funding_rate),
+                history_rate(point.short_funding_rate)
+            ));
+        }
+        let text = format!(
+            "<b>{}/USDT · 过去 24 小时</b>\n方向：SHORT − LONG；正值表示 SHORT 价格更高\n资金费率为截至该小时最近一次已知结算费率\n\n<pre>{}</pre>",
+            html(token),
+            html(table.trim_end())
+        );
+        let refresh_callback = if let Some(route) = back_callback.strip_prefix("o|") {
+            format!("oh|{route}")
+        } else if let Some(id) = back_callback.strip_prefix("p|") {
+            format!("ph|{id}")
+        } else {
+            back_callback.into()
+        };
+        self.send(
+            &text,
+            vec![vec![
+                button("刷新历史", &refresh_callback),
+                button("返回", back_callback),
+            ]],
+        )
+        .await
     }
 
     async fn confirm_open(
@@ -1249,6 +1320,7 @@ fn position_keyboard(position: &Position) -> Keyboard {
             button("加仓 $500", &format!("ac|{id}|500")),
         ],
         vec![button("APY<300% 自动全平", &format!("auc|{id}|300|100|2"))],
+        vec![button("查看 24h 价差与资费", &format!("ph|{id}"))],
         vec![
             button("减仓 $100", &format!("rc|{id}|100")),
             button("减仓 $500", &format!("rc|{id}|500")),
@@ -1264,6 +1336,11 @@ fn position_keyboard(position: &Position) -> Keyboard {
             button("返回", "pos"),
         ],
     ]
+}
+
+fn history_rate(rate: Option<f64>) -> String {
+    rate.map(|value| format!("{:+.3}", value * 100.0))
+        .unwrap_or_else(|| "—".into())
 }
 
 fn format_advisor(recommendation: &AdvisorResponse) -> String {

@@ -547,26 +547,59 @@ impl MarketService {
             .chain(snapshot.spot_opportunities)
             .find(|item| item.id == opportunity_id)
             .ok_or_else(|| anyhow!("opportunity is no longer available"))?;
+        self.history_for_legs(opportunity.id, &opportunity.long, &opportunity.short)
+            .await
+    }
+
+    pub async fn position_history(
+        &self,
+        position: &Position,
+    ) -> Result<OpportunityHistoryResponse> {
+        self.opportunities().await?;
+        let (long, short) = {
+            let legs = self.route_leg_cache.read().await;
+            let long = legs
+                .get(&route_leg_key(
+                    &position.long.exchange,
+                    &position.long.market,
+                    &position.long.symbol,
+                ))
+                .cloned()
+                .ok_or_else(|| anyhow!("long-leg market data is unavailable"))?;
+            let short = legs
+                .get(&route_leg_key(
+                    &position.short.exchange,
+                    &position.short.market,
+                    &position.short.symbol,
+                ))
+                .cloned()
+                .ok_or_else(|| anyhow!("short-leg market data is unavailable"))?;
+            (long, short)
+        };
+        self.history_for_legs(position.id.clone(), &long, &short)
+            .await
+    }
+
+    async fn history_for_legs(
+        &self,
+        id: String,
+        long: &Leg,
+        short: &Leg,
+    ) -> Result<OpportunityHistoryResponse> {
         let (long_closes, short_closes, long_rates_result, short_rates_result) = tokio::join!(
-            self.hourly_closes(&opportunity.long),
-            self.hourly_closes(&opportunity.short),
-            self.funding_history(&opportunity.long),
-            self.funding_history(&opportunity.short),
+            self.hourly_closes(long),
+            self.hourly_closes(short),
+            self.funding_history(long),
+            self.funding_history(short),
         );
         let long_closes = long_closes?;
         let short_closes = short_closes?;
         let long_rates = long_rates_result.unwrap_or_else(|error| {
-            tracing::warn!(
-                id = opportunity.id,
-                "long-leg funding history unavailable: {error:#}"
-            );
+            tracing::warn!(%id, "long-leg funding history unavailable: {error:#}");
             Vec::new()
         });
         let short_rates = short_rates_result.unwrap_or_else(|error| {
-            tracing::warn!(
-                id = opportunity.id,
-                "short-leg funding history unavailable: {error:#}"
-            );
+            tracing::warn!(%id, "short-leg funding history unavailable: {error:#}");
             Vec::new()
         });
         let mut points = long_closes
@@ -589,7 +622,7 @@ impl MarketService {
             points.drain(..points.len() - 24);
         }
         Ok(OpportunityHistoryResponse {
-            opportunity_id: opportunity.id,
+            opportunity_id: id,
             funding_note: "每小时展示截至该时刻永续腿最近一次已知结算费率；现货腿没有资金费率"
                 .into(),
             points,
