@@ -222,7 +222,14 @@ impl TelegramBot {
                     .next()
                     .ok_or_else(|| anyhow!("用法：/open TOKEN 金额 [杠杆]"))?;
                 let notional = parse_f64(parts.next(), "金额")?;
-                let leverage = parts.next().unwrap_or("1").parse::<u8>()?;
+                let leverage = match parts.next() {
+                    Some(value) => value.parse::<u8>()?,
+                    None => self
+                        .find_position_by_token(token)
+                        .await
+                        .map(|position| position.leverage)
+                        .unwrap_or(1),
+                };
                 let opportunity = self.find_opportunity(token, None, None).await?;
                 self.confirm_open(&opportunity, notional, leverage).await
             }
@@ -233,7 +240,14 @@ impl TelegramBot {
                 let target = parse_f64(parts.next(), "目标金额")?;
                 let order = parse_f64(parts.next(), "单笔金额")?;
                 let interval = parse_f64(parts.next(), "间隔秒数")?;
-                let leverage = parts.next().unwrap_or("1").parse::<u8>()?;
+                let leverage = match parts.next() {
+                    Some(value) => value.parse::<u8>()?,
+                    None => self
+                        .find_position_by_token(token)
+                        .await
+                        .map(|position| position.leverage)
+                        .unwrap_or(1),
+                };
                 let opportunity = self.find_opportunity(token, None, None).await?;
                 self.confirm_batch_open(&opportunity, target, order, interval, leverage)
                     .await
@@ -929,6 +943,9 @@ impl TelegramBot {
             task.order_notional_usdt,
             task.interval_seconds
         );
+        if let Some(leverage) = task.leverage {
+            text.push_str(&format!("\n杠杆：{}×", leverage));
+        }
         if let Some(error) = task.error.as_deref() {
             text.push_str(&format!("\n\n❌ {}", html(error)));
         }
@@ -1191,7 +1208,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/protection — 查询双腿保护状态\n/open TOKEN 金额 [杠杆] — 开仓或加仓\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 批量加仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/protection — 查询双腿保护状态\n/open TOKEN 金额 [杠杆] — 开仓或加仓；已有仓位默认沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 批量加仓；已有仓位默认沿用当前杠杆\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![

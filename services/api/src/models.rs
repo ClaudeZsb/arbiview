@@ -210,6 +210,7 @@ pub struct BatchIncreaseTask {
     pub target_notional_usdt: f64,
     pub order_notional_usdt: f64,
     pub interval_seconds: f64,
+    pub leverage: Option<u8>,
     pub completed_notional_usdt: f64,
     pub completed_batches: usize,
     pub total_batches: usize,
