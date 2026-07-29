@@ -142,9 +142,12 @@ impl TelegramBot {
                 Ok(updates) => {
                     for update in updates {
                         offset = update.update_id + 1;
-                        if let Err(error) = self.handle_update(update).await {
-                            tracing::warn!("Telegram update failed: {error:#}");
-                        }
+                        let bot = self.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = bot.handle_update(update).await {
+                                tracing::warn!("Telegram update failed: {error:#}");
+                            }
+                        });
                     }
                 }
                 Err(error) => {
