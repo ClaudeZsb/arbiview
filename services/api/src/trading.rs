@@ -113,6 +113,7 @@ pub struct TradingService {
     auto_close_rules: Arc<RwLock<HashMap<String, AutoCloseRule>>>,
     managed_symbols: Arc<RwLock<HashSet<String>>>,
     protected_routes: Arc<RwLock<HashMap<String, ProtectedRoute>>>,
+    position_funding_baselines: Arc<RwLock<HashMap<String, f64>>>,
     protection_events: Arc<RwLock<Vec<HedgeProtectionEvent>>>,
     execution_lock: Arc<Mutex<()>>,
 }
@@ -121,6 +122,7 @@ impl TradingService {
     pub fn new(config: Config, market: MarketService) -> Result<Self> {
         let auto_close_rules = load_auto_close_rules(&config)?;
         let mut managed_symbols = load_managed_symbols(&config)?;
+        let position_funding_baselines = load_position_funding_baselines(&config)?;
         managed_symbols.extend(
             auto_close_rules
                 .values()
@@ -139,6 +141,7 @@ impl TradingService {
             auto_close_rules: Arc::new(RwLock::new(auto_close_rules)),
             managed_symbols: Arc::new(RwLock::new(managed_symbols)),
             protected_routes: Arc::new(RwLock::new(HashMap::new())),
+            position_funding_baselines: Arc::new(RwLock::new(position_funding_baselines)),
             protection_events: Arc::new(RwLock::new(Vec::new())),
             execution_lock: Arc::new(Mutex::new(())),
         })
@@ -2794,20 +2797,19 @@ impl TradingService {
                 )
             })
             .collect::<HashMap<_, _>>();
+        self.apply_position_funding_baselines(
+            &mut binance,
+            &mut bybit,
+            &binance_income,
+            &bybit_income,
+        )
+        .await;
         for leg in &mut binance {
-            leg.funding_earned = *binance_income
-                .funding_by_symbol
-                .get(&leg.symbol)
-                .unwrap_or(&0.0);
             leg.funding_rate = *funding_rates
                 .get(&format!("Binance:{}", leg.symbol))
                 .unwrap_or(&0.0);
         }
         for leg in &mut bybit {
-            leg.funding_earned = *bybit_income
-                .funding_by_symbol
-                .get(&leg.symbol)
-                .unwrap_or(&0.0);
             leg.funding_rate = *funding_rates
                 .get(&format!("Bybit:{}", leg.symbol))
                 .unwrap_or(&0.0);
@@ -2844,6 +2846,66 @@ impl TradingService {
                 })
             })
             .collect())
+    }
+
+    async fn apply_position_funding_baselines(
+        &self,
+        binance: &mut [PositionLeg],
+        bybit: &mut [PositionLeg],
+        binance_income: &IncomeSummary,
+        bybit_income: &IncomeSummary,
+    ) {
+        let mut baselines = self.position_funding_baselines.write().await;
+        let mut active = HashSet::new();
+        let mut changed = false;
+        for (exchange, legs, income) in [
+            ("Binance", binance, binance_income),
+            ("Bybit", bybit, bybit_income),
+        ] {
+            for leg in legs {
+                let key = position_funding_key(exchange, &leg.symbol, &leg.side);
+                active.insert(key.clone());
+                let total = *income.funding_by_symbol.get(&leg.symbol).unwrap_or(&0.0);
+                let baseline = baselines.entry(key).or_insert_with(|| {
+                    changed = true;
+                    total
+                });
+                leg.funding_earned = total - *baseline;
+            }
+        }
+        let previous_len = baselines.len();
+        baselines.retain(|key, _| active.contains(key));
+        changed |= baselines.len() != previous_len;
+        drop(baselines);
+        if changed {
+            self.persist_position_funding_baselines().await;
+        }
+    }
+
+    async fn persist_position_funding_baselines(&self) {
+        let Some(path) = self.config.position_funding_state_path.as_ref() else {
+            return;
+        };
+        let baselines = self.position_funding_baselines.read().await.clone();
+        let data = match serde_json::to_vec_pretty(&baselines) {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::error!("failed to serialize position funding baselines: {error}");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::error!("failed to create position funding state directory: {error}");
+                return;
+            }
+        }
+        let temporary = path.with_extension("tmp");
+        if let Err(error) =
+            std::fs::write(&temporary, data).and_then(|_| std::fs::rename(&temporary, path))
+        {
+            tracing::error!("failed to persist position funding baselines: {error}");
+        }
     }
 
     async fn binance_margin_positions(&self) -> Result<Vec<PositionLeg>> {
@@ -3729,6 +3791,22 @@ fn load_managed_symbols(config: &Config) -> Result<HashSet<String>> {
         .map(|symbol| symbol.trim().to_ascii_uppercase())
         .filter(|symbol| !symbol.is_empty())
         .collect())
+}
+
+fn load_position_funding_baselines(config: &Config) -> Result<HashMap<String, f64>> {
+    let Some(path) = config.position_funding_state_path.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error).context("failed to read position funding state"),
+    };
+    serde_json::from_slice(&data).context("failed to parse position funding state")
+}
+
+fn position_funding_key(exchange: &str, symbol: &str, side: &str) -> String {
+    format!("{exchange}:{symbol}:{side}")
 }
 
 #[cfg(test)]
