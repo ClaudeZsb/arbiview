@@ -122,7 +122,7 @@ impl TelegramBot {
                     {"command": "advisor", "description": "查询最新策略建议"},
                     {"command": "open", "description": "开仓：TOKEN 金额 [杠杆]"},
                     {"command": "batch_open", "description": "批量开仓：TOKEN 目标 单笔 间隔 [杠杆]"},
-                    {"command": "guard_open", "description": "保价差限价开仓：TOKEN 目标 单笔 间隔 [杠杆] [门槛%]"},
+                    {"command": "guard_open", "description": "保价差限价开仓：TOKEN 目标 [杠杆] [门槛%]"},
                     {"command": "reduce", "description": "减仓：TOKEN 金额"},
                     {"command": "batch_reduce", "description": "批量减仓：TOKEN 目标 单笔 间隔"},
                     {"command": "leverage", "description": "调整杠杆：TOKEN 杠杆"},
@@ -263,11 +263,9 @@ impl TelegramBot {
             }
             "/guard_open" => {
                 let token = parts.next().ok_or_else(|| {
-                    anyhow!("用法：/guard_open TOKEN 目标金额 单笔金额 间隔秒数 [杠杆] [最低价差%]")
+                    anyhow!("用法：/guard_open TOKEN 目标金额 [杠杆] [最低价差%]")
                 })?;
                 let target = parse_f64(parts.next(), "目标金额")?;
-                let order = parse_f64(parts.next(), "单笔金额")?;
-                let interval = parse_f64(parts.next(), "间隔秒数")?;
                 let leverage = match parts.next() {
                     Some(value) => value.parse::<u8>()?,
                     None => self
@@ -282,7 +280,7 @@ impl TelegramBot {
                     .map(|value| value.parse::<f64>().map(|value| value / 100.0))
                     .transpose()?
                     .unwrap_or(opportunity.spread);
-                self.confirm_guard_open(&opportunity, target, order, interval, leverage, threshold)
+                self.confirm_guard_open(&opportunity, target, leverage, threshold)
                     .await
             }
             "/reduce" => {
@@ -494,7 +492,7 @@ impl TelegramBot {
                     .await?;
                 self.show_batch_task(&task).await
             }
-            ["gox", token, long, short, target, order, interval, leverage, threshold] => {
+            ["gox", token, long, short, target, leverage, threshold] => {
                 let opportunity = self
                     .find_opportunity(token, Some(long), Some(short))
                     .await?;
@@ -504,8 +502,8 @@ impl TelegramBot {
                     .start_batch_increase(BatchIncreaseRequest {
                         opportunity_id: opportunity.id,
                         target_notional_usdt: target.parse()?,
-                        order_notional_usdt: order.parse()?,
-                        interval_seconds: interval.parse()?,
+                        order_notional_usdt: 0.0,
+                        interval_seconds: 0.25,
                         leverage: leverage.parse()?,
                         spread_guard: true,
                         spread_threshold: Some(threshold.parse()?),
@@ -962,34 +960,30 @@ impl TelegramBot {
         &self,
         opportunity: &Opportunity,
         target: f64,
-        order: f64,
-        interval: f64,
         leverage: u8,
         threshold: f64,
     ) -> Result<()> {
-        validate_batch_settings(target, order, interval)?;
+        if !(10.0..=1_000_000.0).contains(&target) {
+            return Err(anyhow!("目标金额范围为 10–1,000,000 USDT"));
+        }
         if !(1..=20).contains(&leverage) {
             return Err(anyhow!("杠杆范围为 1–20×"));
         }
         let route = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             opportunity.token.symbol,
             short_exchange(&opportunity.long.exchange),
             short_exchange(&opportunity.short.exchange),
             target,
-            order,
-            interval,
             leverage,
             threshold
         );
         self.send(
             &format!(
-                "⚠️ 确认保价差限价开仓？\n<b>{}</b> · 每腿目标 ${:.2} · {}×\n每单最多 ${:.2} · 间隔 {:.1}s\n仅当实时可执行价差 ≥ {:+.4}% 时并发提交 IOC 限价单\n当前参考价差 {:+.4}%",
+                "⚠️ 确认保价差限价开仓？\n<b>{}</b> · 每腿目标 ${:.2} · {}×\n仅当实时可执行价差 ≥ {:+.4}% 时，按两腿最优盘口中较小的挂单量并发提交 IOC 限价单，并尽快完成目标\n当前参考价差 {:+.4}%",
                 html(&opportunity.token.symbol),
                 target,
                 leverage,
-                order,
-                interval,
                 threshold * 100.0,
                 opportunity.spread * 100.0
             ),
@@ -1049,18 +1043,29 @@ impl TelegramBot {
         } else {
             "批量加仓"
         };
+        let batch_description = if task.spread_guard {
+            format!("{} 次动态盘口下单", task.completed_batches)
+        } else {
+            format!("{} / {}", task.completed_batches, task.total_batches)
+        };
+        let execution_description = if task.spread_guard {
+            "按两腿实时最优盘口容量下单，无人为间隔".to_string()
+        } else {
+            format!(
+                "单笔 ${:.2} · 间隔 {:.1}s",
+                task.order_notional_usdt, task.interval_seconds
+            )
+        };
         let mut text = format!(
-            "<b>{} · {}</b>\n状态：{}\n进度：{:.1}% · ${:.2} / ${:.2}\n批次：{} / {}\n单笔 ${:.2} · 间隔 {:.1}s",
+            "<b>{} · {}</b>\n状态：{}\n进度：{:.1}% · ${:.2} / ${:.2}\n批次：{}\n{}",
             action,
             html(&task.token),
             html(batch_status(&task.status)),
             progress,
             task.completed_notional_usdt,
             task.target_notional_usdt,
-            task.completed_batches,
-            task.total_batches,
-            task.order_notional_usdt,
-            task.interval_seconds
+            batch_description,
+            execution_description
         );
         if let Some(leverage) = task.leverage {
             text.push_str(&format!("\n杠杆：{}×", leverage));
@@ -1398,7 +1403,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询双腿保护状态和事件\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 单笔 间隔 [杠杆] [门槛%] — 保价差 IOC 限价批量开仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 100 2 10 -1.5</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询双腿保护状态和事件\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 10 -1.5</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![

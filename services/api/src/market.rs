@@ -377,6 +377,16 @@ impl MarketService {
         let mut refreshed = leg.clone();
         refreshed.bid = bid.ok_or_else(|| anyhow!("executable bid quote is unavailable"))?;
         refreshed.ask = ask.ok_or_else(|| anyhow!("executable ask quote is unavailable"))?;
+        if leg.exchange == "Binance" {
+            refreshed.bid_quantity = parse(&value["bidQty"]).unwrap_or(0.0);
+            refreshed.ask_quantity = parse(&value["askQty"]).unwrap_or(0.0);
+        } else if let Some(ticker) = value["result"]["list"]
+            .as_array()
+            .and_then(|items| items.first())
+        {
+            refreshed.bid_quantity = parse(&ticker["bid1Size"]).unwrap_or(0.0);
+            refreshed.ask_quantity = parse(&ticker["ask1Size"]).unwrap_or(0.0);
+        }
         Ok(refreshed)
     }
 
@@ -820,6 +830,8 @@ impl MarketService {
                     symbol: symbol.into(),
                     bid: parse(&b["bidPrice"])?,
                     ask: parse(&b["askPrice"])?,
+                    bid_quantity: parse(&b["bidQty"]).unwrap_or(0.0),
+                    ask_quantity: parse(&b["askQty"]).unwrap_or(0.0),
                     mark: parse(&x["markPrice"])?,
                     rate: parse(&x["lastFundingRate"]).unwrap_or(0.0),
                     interval_hours: intervals.get(symbol).copied().unwrap_or(8.0),
@@ -877,6 +889,8 @@ impl MarketService {
                     symbol: symbol.into(),
                     bid: parse(&x["bid1Price"])?,
                     ask: parse(&x["ask1Price"])?,
+                    bid_quantity: parse(&x["bid1Size"]).unwrap_or(0.0),
+                    ask_quantity: parse(&x["ask1Size"]).unwrap_or(0.0),
                     mark: parse(&x["markPrice"])?,
                     rate: parse(&x["fundingRate"]).unwrap_or(0.0),
                     interval_hours: interval,
@@ -907,7 +921,12 @@ impl MarketService {
             .filter_map(|x| {
                 Some((
                     x["symbol"].as_str()?.to_string(),
-                    (parse(&x["bidPrice"])?, parse(&x["askPrice"])?),
+                    (
+                        parse(&x["bidPrice"])?,
+                        parse(&x["askPrice"])?,
+                        parse(&x["bidQty"]).unwrap_or(0.0),
+                        parse(&x["askQty"]).unwrap_or(0.0),
+                    ),
                 ))
             })
             .collect::<HashMap<_, _>>();
@@ -938,7 +957,7 @@ impl MarketService {
                 }
                 let symbol = x["symbol"].as_str()?;
                 let base = x["baseAsset"].as_str()?;
-                let (bid, ask) = *books.get(symbol)?;
+                let (bid, ask, bid_quantity, ask_quantity) = *books.get(symbol)?;
                 let (volume, last) = volumes.get(symbol).copied().unwrap_or_default();
                 let step = x["filters"]
                     .as_array()
@@ -957,6 +976,8 @@ impl MarketService {
                     symbol: symbol.into(),
                     bid,
                     ask,
+                    bid_quantity,
+                    ask_quantity,
                     mark: if last > 0.0 { last } else { (bid + ask) / 2.0 },
                     rate: 0.0,
                     interval_hours: 0.0,
@@ -998,6 +1019,8 @@ impl MarketService {
                 let ticker = *ticker_map.get(symbol)?;
                 let bid = parse(&ticker["bid1Price"])?;
                 let ask = parse(&ticker["ask1Price"])?;
+                let bid_quantity = parse(&ticker["bid1Size"]).unwrap_or(0.0);
+                let ask_quantity = parse(&ticker["ask1Size"]).unwrap_or(0.0);
                 let last = parse(&ticker["lastPrice"]).unwrap_or((bid + ask) / 2.0);
                 let step = x["lotSizeFilter"]["basePrecision"]
                     .as_str()
@@ -1010,6 +1033,8 @@ impl MarketService {
                     symbol: symbol.into(),
                     bid,
                     ask,
+                    bid_quantity,
+                    ask_quantity,
                     mark: last,
                     rate: 0.0,
                     interval_hours: 0.0,
@@ -1534,6 +1559,8 @@ mod tests {
             symbol: "TESTUSDT".into(),
             bid: 1.0,
             ask: 1.0,
+            bid_quantity: 100.0,
+            ask_quantity: 100.0,
             mark: 1.0,
             rate: 0.0,
             interval_hours: 8.0,

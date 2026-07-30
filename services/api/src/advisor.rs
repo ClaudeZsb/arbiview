@@ -276,6 +276,8 @@ mod tests {
             symbol: format!("{symbol}USDT"),
             bid: 10.0,
             ask: 10.0,
+            bid_quantity: 100.0,
+            ask_quantity: 100.0,
             mark: 10.0,
             rate: 0.001,
             interval_hours: 1.0,

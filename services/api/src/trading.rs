@@ -20,6 +20,7 @@ type HmacSha256 = Hmac<Sha256>;
 type FundingTotals = HashMap<String, f64>;
 type FundingCache = Option<(i64, IncomeSummary, IncomeSummary)>;
 type MarginPositionCache = Option<(Instant, Vec<PositionLeg>)>;
+const SPREAD_GUARD_POLL_SECONDS: f64 = 0.25;
 
 #[derive(Clone, Default)]
 struct IncomeSummary {
@@ -907,10 +908,12 @@ impl TradingService {
         if !(10.0..=1_000_000.0).contains(&request.target_notional_usdt) {
             bail!("targetNotionalUsdt must be between 10 and 1,000,000");
         }
-        if !(10.0..=request.target_notional_usdt).contains(&request.order_notional_usdt) {
+        if !request.spread_guard
+            && !(10.0..=request.target_notional_usdt).contains(&request.order_notional_usdt)
+        {
             bail!("orderNotionalUsdt must be between 10 and targetNotionalUsdt");
         }
-        if !(0.5..=3_600.0).contains(&request.interval_seconds) {
+        if !request.spread_guard && !(0.5..=3_600.0).contains(&request.interval_seconds) {
             bail!("intervalSeconds must be between 0.5 and 3,600");
         }
         if !(1..=20).contains(&request.leverage) {
@@ -936,8 +939,11 @@ impl TradingService {
             bail!("another batch position task is already active");
         }
         let now = chrono::Utc::now().timestamp_millis();
-        let total_batches =
-            (request.target_notional_usdt / request.order_notional_usdt).ceil() as usize;
+        let total_batches = if request.spread_guard {
+            0
+        } else {
+            (request.target_notional_usdt / request.order_notional_usdt).ceil() as usize
+        };
         let task = BatchIncreaseTask {
             id: Uuid::new_v4().to_string(),
             action: "increase".into(),
@@ -946,8 +952,16 @@ impl TradingService {
             long_exchange: opportunity.long.exchange.clone(),
             short_exchange: opportunity.short.exchange.clone(),
             target_notional_usdt: request.target_notional_usdt,
-            order_notional_usdt: request.order_notional_usdt,
-            interval_seconds: request.interval_seconds,
+            order_notional_usdt: if request.spread_guard {
+                0.0
+            } else {
+                request.order_notional_usdt
+            },
+            interval_seconds: if request.spread_guard {
+                SPREAD_GUARD_POLL_SECONDS
+            } else {
+                request.interval_seconds
+            },
             leverage: Some(request.leverage),
             spread_guard: request.spread_guard,
             spread_threshold: request
@@ -1114,6 +1128,9 @@ impl TradingService {
         let mut completed = 0.0;
         let mut batch = 0usize;
         while completed + 0.001 < request.target_notional_usdt {
+            if request.spread_guard && request.target_notional_usdt - completed <= 10.0 {
+                break;
+            }
             let cancelled = self
                 .batch_tasks
                 .read()
@@ -1141,7 +1158,7 @@ impl TradingService {
                                 task.spread_wait_count += 1;
                             })
                             .await;
-                            tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds))
+                            tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS))
                                 .await;
                             continue;
                         }
@@ -1149,7 +1166,8 @@ impl TradingService {
                     }
                     Err(error) => {
                         tracing::warn!("spread-guard quote refresh failed: {error:#}");
-                        tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds)).await;
+                        tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS))
+                            .await;
                         continue;
                     }
                 }
@@ -1157,9 +1175,20 @@ impl TradingService {
                 opportunity.clone()
             };
             batch += 1;
-            let batch_notional = request
-                .order_notional_usdt
-                .min(request.target_notional_usdt - completed);
+            let remaining = request.target_notional_usdt - completed;
+            let batch_notional = if request.spread_guard {
+                executable_top_notional(&batch_opportunity).min(remaining)
+            } else {
+                request.order_notional_usdt.min(remaining)
+            };
+            if batch_notional < 10.0 {
+                self.update_batch(&task_id, |task| {
+                    task.spread_wait_count += 1;
+                })
+                .await;
+                tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
+                continue;
+            }
             let open_request = OpenTradeRequest {
                 opportunity_id: request.opportunity_id.clone(),
                 notional_usdt: batch_notional,
@@ -1199,7 +1228,8 @@ impl TradingService {
                             task.error = None;
                         })
                         .await;
-                        tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds)).await;
+                        tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS))
+                            .await;
                         continue;
                     }
                     self.update_batch(&task_id, |task| {
@@ -1224,7 +1254,7 @@ impl TradingService {
                     return;
                 }
             }
-            if completed + 0.001 < request.target_notional_usdt {
+            if !request.spread_guard && completed + 0.001 < request.target_notional_usdt {
                 tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds)).await;
             }
         }
@@ -3771,6 +3801,12 @@ fn spread_guard_allows(current: f64, threshold: f64) -> bool {
     current + f64::EPSILON >= threshold
 }
 
+fn executable_top_notional(opportunity: &Opportunity) -> f64 {
+    (opportunity.long.ask * opportunity.long.ask_quantity)
+        .min(opportunity.short.bid * opportunity.short.bid_quantity)
+        .max(0.0)
+}
+
 fn number(value: &Value) -> Option<f64> {
     value
         .as_str()
@@ -4257,6 +4293,8 @@ mod tests {
             symbol: "DEXEUSDT".into(),
             bid: 10.0,
             ask: 10.0,
+            bid_quantity: 100.0,
+            ask_quantity: 100.0,
             mark: 10.0,
             rate: 0.0,
             interval_hours: 8.0,
@@ -4326,5 +4364,35 @@ mod tests {
         assert!(spread_guard_allows(-0.015, -0.02));
         assert!(!spread_guard_allows(-0.025, -0.02));
         assert!(spread_guard_allows(-0.02, -0.02));
+    }
+
+    #[test]
+    fn spread_guard_uses_the_smaller_top_of_book_capacity() {
+        let mut opportunity = Opportunity {
+            id: "DEXE".into(),
+            token: Token {
+                symbol: "DEXE".into(),
+                name: "DEXE".into(),
+                rank: None,
+                tags: vec![],
+            },
+            long: test_market_leg("Binance"),
+            short: test_market_leg("Bybit"),
+            funding_per_hour: 0.0,
+            borrow_interest_per_hour: 0.0,
+            apy: 0.0,
+            spread: 0.0,
+            average_spread_24h: 0.0,
+            spread_vs_average: 0.0,
+            fees: 0.0,
+            break_even_hours: 0.0,
+            route_type: "perpetual_perpetual".into(),
+            execution_supported: true,
+        };
+        opportunity.long.ask = 10.0;
+        opportunity.long.ask_quantity = 30.0;
+        opportunity.short.bid = 12.0;
+        opportunity.short.bid_quantity = 20.0;
+        assert!((executable_top_notional(&opportunity) - 240.0).abs() < 1e-9);
     }
 }

@@ -18,6 +18,8 @@ pub struct Leg {
     pub symbol: String,
     pub bid: f64,
     pub ask: f64,
+    pub bid_quantity: f64,
+    pub ask_quantity: f64,
     pub mark: f64,
     pub rate: f64,
     pub interval_hours: f64,
