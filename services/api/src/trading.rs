@@ -21,6 +21,7 @@ type FundingTotals = HashMap<String, f64>;
 type FundingCache = Option<(i64, IncomeSummary, IncomeSummary)>;
 type MarginPositionCache = Option<(Instant, Vec<PositionLeg>)>;
 const SPREAD_GUARD_POLL_SECONDS: f64 = 0.25;
+const POSITION_SETTLEMENT_CHECKS: usize = 3;
 
 #[derive(Clone, Default)]
 struct IncomeSummary {
@@ -1979,19 +1980,36 @@ impl TradingService {
         report.short_notional_usdt = short.as_ref().map(position_notional).unwrap_or(0.0);
         report.balanced = paired_positions_are_balanced(long.as_ref(), short.as_ref());
         if !report.balanced {
-            report.naked_exposure = true;
-            report.alert = true;
             let mismatch = (report.long_notional_usdt - report.short_notional_usdt).abs();
             let mismatch_percent = match (&long, &short) {
                 (Some(long), Some(short)) => hedge_notional_imbalance_ratio(long, short) * 100.0,
-                _ => 100.0,
+                _ if mismatch > f64::EPSILON => 100.0,
+                _ => 0.0,
             };
+            if notional_mismatch_exceeds_values(
+                report.long_notional_usdt,
+                report.short_notional_usdt,
+                POSITION_RECONCILIATION_TOLERANCE_RATIO,
+            ) {
+                report.naked_exposure = true;
+                report.alert = true;
+                bail!(
+                    "NAKED_EXPOSURE: phase two exhausted after {} attempts ({} anomalies); actual position mismatch {:.6} USDT ({:.2}%) exceeds both 10 USDT and 1%",
+                    report.phase_two_attempts,
+                    report.phase_two_anomalies,
+                    mismatch,
+                    mismatch_percent
+                );
+            }
+            if request.spread_guard {
+                bail!(
+                    "SPREAD_NO_FILL: exchange position synchronization produced only {:.6} USDT of residual mismatch",
+                    mismatch
+                );
+            }
             bail!(
-                "NAKED_EXPOSURE: phase two exhausted after {} attempts ({} anomalies); actual position mismatch {:.2} USDT ({:.2}%) exceeds both 10 USDT and 1%",
-                report.phase_two_attempts,
-                report.phase_two_anomalies,
-                mismatch,
-                mismatch_percent
+                "position reconciliation returned an incomplete leg with {:.6} USDT residual mismatch, within protection tolerance",
+                mismatch
             );
         }
         let added_notional = report.long_notional_usdt.min(report.short_notional_usdt)
@@ -2131,6 +2149,7 @@ impl TradingService {
             anomalies: 0,
             orders: vec![],
         };
+        let mut empty_checks = 0usize;
         while result.attempts < MAX_RECONCILIATION_ATTEMPTS {
             let (long_state, short_state) = tokio::join!(
                 self.actual_leg(long_leg, "long"),
@@ -2158,7 +2177,12 @@ impl TradingService {
                     break;
                 }
             } else if long_notional <= f64::EPSILON && short_notional <= f64::EPSILON {
-                break;
+                empty_checks += 1;
+                if empty_checks >= POSITION_SETTLEMENT_CHECKS {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
+                continue;
             }
             let difference = (long_notional - short_notional).abs();
             let (leg, side, reference) = if long_notional > short_notional {
@@ -3930,9 +3954,26 @@ fn hedge_notional_mismatch_exceeds(
     short: &PositionLeg,
     tolerance_ratio: f64,
 ) -> bool {
-    let difference = (position_notional(long) - position_notional(short)).abs();
-    difference > HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT
-        && hedge_notional_imbalance_ratio(long, short) > tolerance_ratio
+    notional_mismatch_exceeds_values(
+        position_notional(long),
+        position_notional(short),
+        tolerance_ratio,
+    )
+}
+
+fn notional_mismatch_exceeds_values(
+    long_notional: f64,
+    short_notional: f64,
+    tolerance_ratio: f64,
+) -> bool {
+    let difference = (long_notional - short_notional).abs();
+    let larger = long_notional.max(short_notional);
+    let ratio = if larger <= f64::EPSILON {
+        0.0
+    } else {
+        difference / larger
+    };
+    difference > HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT && ratio > tolerance_ratio
 }
 
 fn paired_positions_are_balanced(long: Option<&PositionLeg>, short: Option<&PositionLeg>) -> bool {
@@ -4394,5 +4435,14 @@ mod tests {
         opportunity.short.bid = 12.0;
         opportunity.short.bid_quantity = 20.0;
         assert!((executable_top_notional(&opportunity) - 240.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reconciliation_requires_both_absolute_and_relative_mismatch_thresholds() {
+        assert!(!notional_mismatch_exceeds_values(0.004, 0.0, 0.01));
+        assert!(!notional_mismatch_exceeds_values(1_000.0, 995.0, 0.01));
+        assert!(!notional_mismatch_exceeds_values(2_000.0, 1_985.0, 0.01));
+        assert!(notional_mismatch_exceeds_values(1_000.0, 980.0, 0.01));
+        assert!(notional_mismatch_exceeds_values(20.0, 0.0, 0.01));
     }
 }
