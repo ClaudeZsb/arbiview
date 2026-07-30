@@ -257,6 +257,8 @@ impl MarketService {
         self.enrich_opportunity_averages(&mut spot_opportunities)
             .await;
         spread_opportunities.sort_by(|a, b| b.spread.total_cmp(&a.spread));
+        self.enrich_opportunity_averages(&mut spread_opportunities)
+            .await;
         let result = OpportunitiesResponse {
             opportunities: cross_opportunities,
             spot_opportunities,

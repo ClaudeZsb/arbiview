@@ -11,7 +11,11 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 const API_TIMEOUT_SECONDS: u64 = 25;
 const DEFAULT_NOTIONAL: f64 = 100.0;
@@ -88,6 +92,7 @@ pub fn spawn(config: TelegramConfig, state: Arc<AppState>) {
         state,
     };
     let polling_bot = bot.clone();
+    let spread_bot = bot.clone();
     tokio::spawn(async move {
         tracing::info!("Telegram bot enabled with long polling");
         if let Err(error) = polling_bot.run().await {
@@ -96,6 +101,9 @@ pub fn spawn(config: TelegramConfig, state: Arc<AppState>) {
     });
     tokio::spawn(async move {
         bot.run_advisor_notifications().await;
+    });
+    tokio::spawn(async move {
+        spread_bot.run_spread_notifications().await;
     });
 }
 
@@ -1145,6 +1153,67 @@ impl TelegramBot {
                 Err(error) => tracing::warn!("advisor evaluation failed: {error:#}"),
             }
             tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    }
+
+    async fn run_spread_notifications(&self) {
+        const DEVIATION_THRESHOLD: f64 = 0.01;
+        const TOKEN_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+        let mut last_sent = HashMap::<String, Instant>::new();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        loop {
+            match self.state.market.opportunities().await {
+                Ok(snapshot) => {
+                    for opportunity in snapshot.spread_opportunities {
+                        if opportunity.spread_vs_average < DEVIATION_THRESHOLD {
+                            continue;
+                        }
+                        let token = opportunity.token.symbol.to_ascii_uppercase();
+                        if last_sent
+                            .get(&token)
+                            .is_some_and(|sent| sent.elapsed() < TOKEN_COOLDOWN)
+                        {
+                            continue;
+                        }
+                        let message = format!(
+                            "📐 <b>价差偏离提醒 · {}</b>\n\n🟢 LONG {} @ ${:.6}\n🔴 SHORT {} @ ${:.6}\n\n当前方向价差：{:+.3}%\n24h 整点平均：{:+.3}%\n高于均值：<b>{:+.3}%</b>\n\n当前价差显著高于历史均值，可关注 LONG 低价腿、SHORT 高价腿并等待价差回归。资金费与手续费仍需单独评估。",
+                            html(&opportunity.token.symbol),
+                            html(&opportunity.long.exchange),
+                            opportunity.long.ask,
+                            html(&opportunity.short.exchange),
+                            opportunity.short.bid,
+                            opportunity.spread * 100.0,
+                            opportunity.average_spread_24h * 100.0,
+                            opportunity.spread_vs_average * 100.0
+                        );
+                        match self
+                            .send(
+                                &message,
+                                vec![vec![
+                                    button("查看资费机会", "opps"),
+                                    button("查看持仓", "pos"),
+                                ]],
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                last_sent.insert(token, Instant::now());
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    symbol = opportunity.token.symbol,
+                                    "Telegram spread notification failed: {error:#}"
+                                );
+                            }
+                        }
+                    }
+                    last_sent.retain(|_, sent| sent.elapsed() < TOKEN_COOLDOWN);
+                }
+                Err(error) => {
+                    tracing::warn!("spread notification scan failed: {error:#}");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(20)).await;
         }
     }
 
