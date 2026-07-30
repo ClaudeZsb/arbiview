@@ -721,19 +721,31 @@ impl TelegramBot {
             short_exchange(&opportunity.short.exchange)
         );
         let text = format!(
-            "<b>{}/USDT</b>{}\n🟢 LONG {} @ ${:.6} · 24h {}\n🔴 SHORT {} @ ${:.6} · 24h {}\n\n资金 APY：{:+.2}%\n开仓价差：{:+.3}%\n预计回本：{}\n资金净收益：{:+.5}%/小时",
+            "<b>{}/USDT</b>{}\n🟢 LONG {} · {} @ ${:.6} · 24h {}\n   {}\n🔴 SHORT {} · {} @ ${:.6} · 24h {}\n   {}\n\n资金 APY：{:+.2}%\n开仓价差：{:+.3}%\n预计回本：{}\n资金净收益：{:+.5}%/小时{}",
             html(&opportunity.token.symbol),
             telegram_tags(&opportunity.token.tags),
             html(&opportunity.long.exchange),
+            market_label(&opportunity.long.market),
             opportunity.long.ask,
             compact_usdt(opportunity.long.volume_24h_usdt),
+            funding_schedule(&opportunity.long),
             html(&opportunity.short.exchange),
+            market_label(&opportunity.short.market),
             opportunity.short.bid,
             compact_usdt(opportunity.short.volume_24h_usdt),
+            funding_schedule(&opportunity.short),
             opportunity.apy * 100.0,
             opportunity.spread * 100.0,
             break_even(opportunity.break_even_hours),
-            opportunity.funding_per_hour * 100.0
+            opportunity.funding_per_hour * 100.0,
+            if opportunity.borrow_interest_per_hour > 0.0 {
+                format!(
+                    "\nSpot 借币成本：-{:.5}%/小时",
+                    opportunity.borrow_interest_per_hour * 100.0
+                )
+            } else {
+                String::new()
+            }
         );
         let keyboard = vec![
             vec![
@@ -1361,6 +1373,34 @@ fn position_keyboard(position: &Position) -> Keyboard {
 fn history_rate(rate: Option<f64>) -> String {
     rate.map(|value| format!("{:+.3}", value * 100.0))
         .unwrap_or_else(|| "—".into())
+}
+
+fn market_label(market: &str) -> &'static str {
+    if market == "spot" {
+        "SPOT"
+    } else {
+        "PERP"
+    }
+}
+
+fn funding_schedule(leg: &crate::models::Leg) -> String {
+    if leg.market == "spot" {
+        return "现货腿 · 无资金费结算".into();
+    }
+    let settlement = chrono::DateTime::from_timestamp_millis(leg.next_funding_time)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid timezone"))
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "—".into());
+    format!(
+        "资费 {:+.4}% / {}h · 下次 {}",
+        leg.rate * 100.0,
+        leg.interval_hours,
+        settlement
+    )
 }
 
 fn format_advisor(recommendation: &AdvisorResponse) -> String {
