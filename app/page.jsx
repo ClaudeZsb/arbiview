@@ -1078,8 +1078,21 @@ export default function Dashboard() {
   const refreshBatchTask = useCallback(async (taskId) => {
     try {
       const response = await fetch(`/backend/trades/batch-increase/${taskId}`, { cache: "no-store" });
-      const task = await response.json();
-      if (!response.ok) throw new Error(task.error);
+      const task = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = task.error || `HTTP ${response.status}`;
+        if (response.status === 404 || message.includes("batch task not found")) {
+          setBatchTask((current) => current?.id === taskId ? {
+            ...current,
+            status: "expired",
+            error: "后端已重启或任务记录已过期；请核对当前仓位后重新创建任务"
+          } : current);
+          setNotice("批量任务记录已失效，已停止轮询；请核对当前仓位后重新创建任务");
+          await loadAccount();
+          return;
+        }
+        throw new Error(message);
+      }
       setBatchTask(task);
       if (task.currentPosition) {
         setPositions((current) => {
@@ -1117,8 +1130,20 @@ export default function Dashboard() {
     if (!batchTask?.id) return;
     try {
       const response = await fetch(`/backend/trades/batch-increase/${batchTask.id}/cancel`, { method: "POST" });
-      const task = await response.json();
-      if (!response.ok) throw new Error(task.error);
+      const task = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = task.error || `HTTP ${response.status}`;
+        if (response.status === 404 || message.includes("batch task not found")) {
+          setBatchTask((current) => current ? {
+            ...current,
+            status: "expired",
+            error: "任务记录已过期，无需再发送停止请求"
+          } : current);
+          setNotice("任务记录已过期，已解除窗口锁定");
+          return;
+        }
+        throw new Error(message);
+      }
       setBatchTask(task);
     } catch (error) {
       setNotice(`停止批量加仓失败：${error.message}`);
@@ -1393,7 +1418,10 @@ export default function Dashboard() {
         busy={tradeBusy}
         onStart={startBatchIncrease}
         onCancel={cancelBatchIncrease}
-        onClose={() => setBatchPanel(null)}
+        onClose={() => {
+          setBatchPanel(null);
+          setBatchTask(null);
+        }}
       />}
     </main>
   );
