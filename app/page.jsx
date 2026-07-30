@@ -212,7 +212,7 @@ function TradeModal({ item, mode, onClose, onSubmit, busy }) {
         <div className={`trade-warning ${isLive ? "live" : "paper"}`}><ShieldCheck size={16} />
           {isLive
             ? spreadGuard
-              ? `保价差模式：仅当实时可执行价差 ≥ ${spreadThreshold}% 时，按两腿买一/卖一中较小的挂单量并发提交 IOC 限价单，并尽快循环完成目标。`
+              ? `保价差模式：仅当实时可执行价差 ≥ ${spreadThreshold}% 时按盘口提交 IOC 限价单，单腿每次最多 $50；部分成交差额留到下一轮保价差补齐，不主动减仓。`
               : "真实交易模式：两腿将并发提交市价单；不足目标时优先补仓，差额超过 10 USDT 时自动减仓对齐。"
             : mode === "paper"
               ? "模拟交易模式：只在后端记录模拟仓位，不会向交易所发送订单。"
@@ -299,7 +299,7 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
         {(!spreadGuard || isReduce) && <label>批次间隔（秒）<input type="number" min="0.5" max="3600" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /></label>}
         <div className="batch-estimate">
           {spreadGuard && !isReduce
-            ? "每轮按两腿实时最优盘口中较小的可成交量下单；价差满足时不设人为间隔"
+            ? "按实时盘口动态下单，单腿每次最多 $50；成交差额在下一轮保价差补齐，不主动减仓"
             : <>预计 {Math.ceil(target / Math.max(orderNotional, 1))} 批，约 {duration(Math.max(0, Math.ceil(target / Math.max(orderNotional, 1)) - 1) * intervalSeconds / 3600)}</>}
         </div>
         <button
@@ -320,7 +320,7 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
           保价差限价 · 门槛 {pct(task.spreadThreshold, 4)} · 当前 {task.currentSpread == null ? "读取中" : pct(task.currentSpread, 4)} · 已等待 {task.spreadWaitCount} 次
         </div>}
         <div className="batch-progress"><i style={{ width: `${progress}%` }} /></div>
-        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>{task.spreadGuard ? "按实时盘口动态下单 · 无人为间隔" : `单笔 ${money(task.orderNotionalUsdt)} · 间隔 ${task.intervalSeconds}s`}</span></div>
+        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>{task.spreadGuard ? "实时盘口动态下单 · 单腿硬顶 $50 · 差额跨批次补偿" : `单笔 ${money(task.orderNotionalUsdt)} · 间隔 ${task.intervalSeconds}s`}</span></div>
         {task.error && <div className="batch-error">{task.error}</div>}
         <div className="batch-log" ref={logRef}>
           {task.logs.length === 0 && <div className="batch-log-empty">等待第一批成交…</div>}

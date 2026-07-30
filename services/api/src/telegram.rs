@@ -980,7 +980,7 @@ impl TelegramBot {
         );
         self.send(
             &format!(
-                "⚠️ 确认保价差限价开仓？\n<b>{}</b> · 每腿目标 ${:.2} · {}×\n仅当实时可执行价差 ≥ {:+.4}% 时，按两腿最优盘口中较小的挂单量并发提交 IOC 限价单，并尽快完成目标\n当前参考价差 {:+.4}%",
+                "⚠️ 确认保价差限价开仓？\n<b>{}</b> · 每腿目标 ${:.2} · {}×\n仅当实时可执行价差 ≥ {:+.4}% 时提交 IOC 限价单；单腿每次最多 $50，成交差额跨批次保价补偿，不主动减仓\n当前参考价差 {:+.4}%",
                 html(&opportunity.token.symbol),
                 target,
                 leverage,
@@ -1049,7 +1049,7 @@ impl TelegramBot {
             format!("{} / {}", task.completed_batches, task.total_batches)
         };
         let execution_description = if task.spread_guard {
-            "按两腿实时最优盘口容量下单，无人为间隔".to_string()
+            "按实时盘口下单，单腿硬顶 $50；差额跨批次保价补偿，无人为间隔".to_string()
         } else {
             format!(
                 "单笔 ${:.2} · 间隔 {:.1}s",

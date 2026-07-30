@@ -9,7 +9,7 @@ use reqwest::{Client, Method};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -22,6 +22,7 @@ type FundingCache = Option<(i64, IncomeSummary, IncomeSummary)>;
 type MarginPositionCache = Option<(Instant, Vec<PositionLeg>)>;
 const SPREAD_GUARD_POLL_SECONDS: f64 = 0.25;
 const POSITION_SETTLEMENT_CHECKS: usize = 3;
+const SPREAD_GUARD_ORDER_CAP_USDT: f64 = 50.0;
 
 #[derive(Clone, Default)]
 struct IncomeSummary {
@@ -89,6 +90,18 @@ struct PhaseTwoResult {
     attempts: u8,
     anomalies: u8,
     orders: Vec<OrderExecution>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardFillSide {
+    Long,
+    Short,
+}
+
+struct GuardUnmatchedFill {
+    side: GuardFillSide,
+    notional_usdt: f64,
+    price: f64,
 }
 
 #[derive(Clone)]
@@ -1113,6 +1126,11 @@ impl TradingService {
         opportunity: Opportunity,
         request: BatchIncreaseRequest,
     ) {
+        if request.spread_guard && matches!(self.config.trading_mode, TradingMode::Live) {
+            self.run_spread_guard_increase(task_id, opportunity, request)
+                .await;
+            return;
+        }
         self.update_batch(&task_id, |task| task.status = "running".into())
             .await;
         let base_notional = self
@@ -1261,6 +1279,262 @@ impl TradingService {
         }
         self.update_batch(&task_id, |task| task.status = "completed".into())
             .await;
+    }
+
+    async fn run_spread_guard_increase(
+        &self,
+        task_id: String,
+        opportunity: Opportunity,
+        request: BatchIncreaseRequest,
+    ) {
+        self.update_batch(&task_id, |task| task.status = "running".into())
+            .await;
+        let preflight = OpenTradeRequest {
+            opportunity_id: request.opportunity_id.clone(),
+            notional_usdt: request.target_notional_usdt,
+            leverage: request.leverage,
+            spread_guard: true,
+            spread_threshold: request.spread_threshold,
+        };
+        if let Err(error) = self.preflight_balance(&opportunity, &preflight).await {
+            self.fail_batch_task(&task_id, 0, format!("{error:#}"))
+                .await;
+            return;
+        }
+        if let Err(error) = tokio::try_join!(
+            self.set_leverage(
+                &opportunity.long.exchange,
+                &opportunity.long.market,
+                &opportunity.long.symbol,
+                request.leverage
+            ),
+            self.set_leverage(
+                &opportunity.short.exchange,
+                &opportunity.short.market,
+                &opportunity.short.symbol,
+                request.leverage
+            )
+        ) {
+            self.fail_batch_task(
+                &task_id,
+                0,
+                format!("failed to configure leverage; no orders were sent: {error:#}"),
+            )
+            .await;
+            return;
+        }
+
+        let threshold = request.spread_threshold.unwrap_or(opportunity.spread);
+        let mut unmatched_long = VecDeque::new();
+        let mut unmatched_short = VecDeque::new();
+        let mut completed = 0.0;
+        let mut batch = 0usize;
+        while request.target_notional_usdt - completed > 10.0
+            || unmatched_total(&unmatched_long) > 10.0
+            || unmatched_total(&unmatched_short) > 10.0
+        {
+            if self.batch_cancelled(&task_id).await {
+                self.update_batch(&task_id, |task| task.status = "cancelled".into())
+                    .await;
+                return;
+            }
+            let quote = match self.market.refresh_opportunity_quotes(&opportunity).await {
+                Ok(quote) => quote,
+                Err(error) => {
+                    tracing::warn!("spread-guard quote refresh failed: {error:#}");
+                    self.record_spread_wait(&task_id, None).await;
+                    tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
+                    continue;
+                }
+            };
+            self.update_batch(&task_id, |task| task.current_spread = Some(quote.spread))
+                .await;
+            if !spread_guard_allows(quote.spread, threshold)
+                || !compensation_prices_are_protected(
+                    &unmatched_long,
+                    &unmatched_short,
+                    quote.long.ask,
+                    quote.short.bid,
+                    threshold,
+                )
+            {
+                self.record_spread_wait(&task_id, Some(quote.spread)).await;
+                tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
+                continue;
+            }
+
+            let long_excess = unmatched_total(&unmatched_long);
+            let short_excess = unmatched_total(&unmatched_short);
+            let remaining = (request.target_notional_usdt - completed).max(0.0);
+            let desired = if remaining > 10.0 {
+                SPREAD_GUARD_ORDER_CAP_USDT.min(remaining)
+            } else {
+                SPREAD_GUARD_ORDER_CAP_USDT.min(long_excess.max(short_excess))
+            };
+            let (long_notional, short_notional) =
+                guard_order_notionals(desired, long_excess, short_excess);
+            let long_qty = floor_step(long_notional / quote.long.ask, opportunity.long.qty_step);
+            let short_qty =
+                floor_step(short_notional / quote.short.bid, opportunity.short.qty_step);
+            if long_qty <= 0.0 && short_qty <= 0.0 {
+                self.record_spread_wait(&task_id, Some(quote.spread)).await;
+                tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
+                continue;
+            }
+
+            batch += 1;
+            let _execution_guard = self.execution_lock.lock().await;
+            let (long_result, short_result) = match (long_qty > 0.0, short_qty > 0.0) {
+                (true, true) => {
+                    let (long, short) = tokio::join!(
+                        self.place_limit_ioc(
+                            &quote.long.exchange,
+                            &quote.long.market,
+                            &quote.long.symbol,
+                            "Buy",
+                            long_qty,
+                            quote.long.ask,
+                        ),
+                        self.place_limit_ioc(
+                            &quote.short.exchange,
+                            &quote.short.market,
+                            &quote.short.symbol,
+                            "Sell",
+                            short_qty,
+                            quote.short.bid,
+                        )
+                    );
+                    (long.ok(), short.ok())
+                }
+                (true, false) => (
+                    self.place_limit_ioc(
+                        &quote.long.exchange,
+                        &quote.long.market,
+                        &quote.long.symbol,
+                        "Buy",
+                        long_qty,
+                        quote.long.ask,
+                    )
+                    .await
+                    .ok(),
+                    None,
+                ),
+                (false, true) => (
+                    None,
+                    self.place_limit_ioc(
+                        &quote.short.exchange,
+                        &quote.short.market,
+                        &quote.short.symbol,
+                        "Sell",
+                        short_qty,
+                        quote.short.bid,
+                    )
+                    .await
+                    .ok(),
+                ),
+                (false, false) => unreachable!(),
+            };
+            drop(_execution_guard);
+
+            let mut logs = Vec::new();
+            if let Some(order) = long_result {
+                let notional = order.executed_quantity * order.average_price;
+                if notional > 0.0 {
+                    unmatched_long.push_back(GuardUnmatchedFill {
+                        side: GuardFillSide::Long,
+                        notional_usdt: notional,
+                        price: order.average_price,
+                    });
+                    logs.push(guard_batch_log(
+                        &opportunity,
+                        batch,
+                        "long",
+                        &order,
+                        short_excess > f64::EPSILON,
+                    ));
+                }
+            }
+            if let Some(order) = short_result {
+                let notional = order.executed_quantity * order.average_price;
+                if notional > 0.0 {
+                    unmatched_short.push_back(GuardUnmatchedFill {
+                        side: GuardFillSide::Short,
+                        notional_usdt: notional,
+                        price: order.average_price,
+                    });
+                    logs.push(guard_batch_log(
+                        &opportunity,
+                        batch,
+                        "short",
+                        &order,
+                        long_excess > f64::EPSILON,
+                    ));
+                }
+            }
+            let matched = match_guard_fills(&mut unmatched_long, &mut unmatched_short);
+            completed = (completed + matched).min(request.target_notional_usdt);
+            let current_position = self.positions().await.ok().and_then(|positions| {
+                positions
+                    .into_iter()
+                    .find(|position| position.token == opportunity.token.symbol)
+            });
+            self.update_batch(&task_id, |task| {
+                task.completed_notional_usdt = completed;
+                task.completed_batches = batch;
+                task.current_position = current_position;
+                for mut log in logs {
+                    log.sequence = task.logs.len() + 1;
+                    task.logs.push(log);
+                }
+            })
+            .await;
+            if matched <= f64::EPSILON {
+                tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
+            }
+        }
+        self.update_batch(&task_id, |task| task.status = "completed".into())
+            .await;
+    }
+
+    async fn batch_cancelled(&self, task_id: &str) -> bool {
+        self.batch_tasks
+            .read()
+            .await
+            .get(task_id)
+            .map(|task| task.cancel_requested)
+            .unwrap_or(true)
+    }
+
+    async fn record_spread_wait(&self, task_id: &str, spread: Option<f64>) {
+        self.update_batch(task_id, |task| {
+            task.spread_wait_count += 1;
+            if let Some(spread) = spread {
+                task.current_spread = Some(spread);
+            }
+        })
+        .await;
+    }
+
+    async fn fail_batch_task(&self, task_id: &str, batch: usize, message: String) {
+        self.update_batch(task_id, |task| {
+            task.status = "failed".into();
+            task.error = Some(message.clone());
+            task.logs.push(BatchExecutionLog {
+                sequence: task.logs.len() + 1,
+                batch,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                exchange: "System".into(),
+                side: "error".into(),
+                token: task.token.clone(),
+                notional_usdt: 0.0,
+                executed_quantity: 0.0,
+                average_price: 0.0,
+                status: "failed".into(),
+                order_id: String::new(),
+                message,
+            });
+        })
+        .await;
     }
 
     async fn run_batch_reduce(
@@ -3684,6 +3958,88 @@ fn batch_logs(
     .collect()
 }
 
+fn guard_batch_log(
+    opportunity: &Opportunity,
+    batch: usize,
+    side: &str,
+    order: &OrderExecution,
+    is_compensation: bool,
+) -> BatchExecutionLog {
+    BatchExecutionLog {
+        sequence: 0,
+        batch,
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        exchange: order.exchange.clone(),
+        side: side.into(),
+        token: opportunity.token.symbol.clone(),
+        notional_usdt: order.executed_quantity * order.average_price,
+        executed_quantity: order.executed_quantity,
+        average_price: order.average_price,
+        status: order.status.clone(),
+        order_id: order.order_id.clone(),
+        message: if is_compensation {
+            "保价差补偿限价单成交".into()
+        } else {
+            "保价差 IOC 限价单成交".into()
+        },
+    }
+}
+
+fn unmatched_total(fills: &VecDeque<GuardUnmatchedFill>) -> f64 {
+    fills.iter().map(|fill| fill.notional_usdt).sum()
+}
+
+fn guard_order_notionals(desired: f64, unmatched_long: f64, unmatched_short: f64) -> (f64, f64) {
+    if unmatched_long > f64::EPSILON {
+        ((desired - unmatched_long).max(0.0), desired)
+    } else if unmatched_short > f64::EPSILON {
+        (desired, (desired - unmatched_short).max(0.0))
+    } else {
+        (desired, desired)
+    }
+}
+
+fn match_guard_fills(
+    long: &mut VecDeque<GuardUnmatchedFill>,
+    short: &mut VecDeque<GuardUnmatchedFill>,
+) -> f64 {
+    let mut matched = 0.0;
+    while let (Some(long_fill), Some(short_fill)) = (long.front_mut(), short.front_mut()) {
+        let amount = long_fill.notional_usdt.min(short_fill.notional_usdt);
+        matched += amount;
+        long_fill.notional_usdt -= amount;
+        short_fill.notional_usdt -= amount;
+        if long_fill.notional_usdt <= f64::EPSILON {
+            long.pop_front();
+        }
+        if short_fill.notional_usdt <= f64::EPSILON {
+            short.pop_front();
+        }
+    }
+    matched
+}
+
+fn compensation_prices_are_protected(
+    unmatched_long: &VecDeque<GuardUnmatchedFill>,
+    unmatched_short: &VecDeque<GuardUnmatchedFill>,
+    long_ask: f64,
+    short_bid: f64,
+    threshold: f64,
+) -> bool {
+    if 1.0 + threshold <= 0.0 {
+        return false;
+    }
+    let short_covers_long = unmatched_long.iter().all(|fill| {
+        fill.side == GuardFillSide::Long
+            && short_bid + f64::EPSILON >= fill.price * (1.0 + threshold)
+    });
+    let long_covers_short = unmatched_short.iter().all(|fill| {
+        fill.side == GuardFillSide::Short
+            && long_ask <= fill.price / (1.0 + threshold) + f64::EPSILON
+    });
+    short_covers_long && long_covers_short
+}
+
 fn batch_reduce_logs(
     position: &Position,
     batch: usize,
@@ -4444,5 +4800,36 @@ mod tests {
         assert!(!notional_mismatch_exceeds_values(2_000.0, 1_985.0, 0.01));
         assert!(notional_mismatch_exceeds_values(1_000.0, 980.0, 0.01));
         assert!(notional_mismatch_exceeds_values(20.0, 0.0, 0.01));
+    }
+
+    #[test]
+    fn guarded_batches_compensate_the_smaller_leg_without_reducing_the_larger_leg() {
+        assert_eq!(guard_order_notionals(50.0, 20.0, 0.0), (30.0, 50.0));
+        assert_eq!(guard_order_notionals(50.0, 0.0, 20.0), (50.0, 30.0));
+        assert_eq!(guard_order_notionals(50.0, 60.0, 0.0), (0.0, 50.0));
+    }
+
+    #[test]
+    fn compensation_price_must_preserve_the_original_guarded_spread() {
+        let mut long = VecDeque::from([GuardUnmatchedFill {
+            side: GuardFillSide::Long,
+            notional_usdt: 20.0,
+            price: 100.0,
+        }]);
+        let mut short = VecDeque::new();
+        assert!(compensation_prices_are_protected(
+            &long, &short, 100.0, 101.0, 0.01
+        ));
+        assert!(!compensation_prices_are_protected(
+            &long, &short, 99.0, 100.5, 0.01
+        ));
+        short.push_back(GuardUnmatchedFill {
+            side: GuardFillSide::Short,
+            notional_usdt: 20.0,
+            price: 102.0,
+        });
+        assert!((match_guard_fills(&mut long, &mut short) - 20.0).abs() < 1e-9);
+        assert!(long.is_empty());
+        assert!(short.is_empty());
     }
 }
