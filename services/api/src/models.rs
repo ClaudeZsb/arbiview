@@ -292,7 +292,7 @@ pub struct AdjustLeverageRequest {
 }
 
 fn default_leverage() -> u8 {
-    1
+    10
 }
 
 #[derive(Debug, Serialize)]

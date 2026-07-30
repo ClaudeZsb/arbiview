@@ -177,7 +177,7 @@ function SpreadOpportunityCard({ item, index, onTrade }) {
 
 function TradeModal({ item, mode, onClose, onSubmit, busy }) {
   const [notional, setNotional] = useState(1000);
-  const [leverage, setLeverage] = useState(1);
+  const [leverage, setLeverage] = useState(10);
   const isLive = mode === "live";
   const modeKnown = mode === "live" || mode === "paper";
   return (
