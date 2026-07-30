@@ -333,7 +333,7 @@ impl MarketService {
         Ok(refreshed)
     }
 
-    async fn refresh_leg_quote(&self, leg: &Leg) -> Result<Leg> {
+    pub async fn refresh_leg_quote(&self, leg: &Leg) -> Result<Leg> {
         let value: Value = match (leg.exchange.as_str(), leg.market.as_str()) {
             ("Binance", "perpetual") => {
                 self.get_json(format!(

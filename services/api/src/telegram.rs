@@ -125,6 +125,7 @@ impl TelegramBot {
                     {"command": "guard_open", "description": "保价差限价开仓：TOKEN 目标 [杠杆] [门槛%]"},
                     {"command": "reduce", "description": "减仓：TOKEN 金额"},
                     {"command": "batch_reduce", "description": "批量减仓：TOKEN 目标 单笔 间隔"},
+                    {"command": "no_loss_close", "description": "保不亏限价平仓：TOKEN 目标"},
                     {"command": "leverage", "description": "调整杠杆：TOKEN 杠杆"},
                     {"command": "close", "description": "完全平仓：TOKEN"},
                     {"command": "autoclose", "description": "设置 APY 自动平仓"},
@@ -312,6 +313,14 @@ impl TelegramBot {
                 let position = self.find_position_by_token(token).await?;
                 self.confirm_batch_reduce(&position, target, order, interval)
                     .await
+            }
+            "/no_loss_close" => {
+                let token = parts
+                    .next()
+                    .ok_or_else(|| anyhow!("用法：/no_loss_close TOKEN 目标金额"))?;
+                let target = parse_f64(parts.next(), "目标金额")?;
+                let position = self.find_position_by_token(token).await?;
+                self.confirm_no_loss_close(&position, target).await
             }
             "/leverage" => {
                 let token = parts
@@ -585,6 +594,21 @@ impl TelegramBot {
                         target_notional_usdt: target.parse()?,
                         order_notional_usdt: order.parse()?,
                         interval_seconds: interval.parse()?,
+                        no_loss_guard: false,
+                    })
+                    .await?;
+                self.show_batch_task(&task).await
+            }
+            ["nlx", id, target] => {
+                let task = self
+                    .state
+                    .trading
+                    .start_batch_reduce(BatchReduceRequest {
+                        position_id: (*id).into(),
+                        target_notional_usdt: target.parse()?,
+                        order_notional_usdt: 0.0,
+                        interval_seconds: 0.25,
+                        no_loss_guard: true,
                     })
                     .await?;
                 self.show_batch_task(&task).await
@@ -1032,24 +1056,50 @@ impl TelegramBot {
         .await
     }
 
+    async fn confirm_no_loss_close(&self, position: &Position, target: f64) -> Result<()> {
+        let maximum = (position.notional_usdt - 10.0).max(0.0);
+        if !(10.0..=maximum).contains(&target) {
+            return Err(anyhow!(
+                "目标金额必须在 10 与 {:.2} USDT 之间；需保留至少 10 USDT，全部退出请使用普通平仓",
+                maximum
+            ));
+        }
+        self.send(
+            &format!(
+                "⚠️ 确认启动保不亏限价平仓？\n<b>{}</b> · 每腿目标减少 ${:.2}\n仅当两腿按可平仓价计算的仓位盈亏合计不为负时下单；不包含资金费和手续费\n单腿每次最多 $50，部分成交将跨批次保不亏补齐",
+                html(&position.token),
+                target
+            ),
+            vec![vec![
+                button("确认启动", &format!("nlx|{}|{}", position.id, target)),
+                button("取消", &format!("p|{}", position.id)),
+            ]],
+        )
+        .await
+    }
+
     async fn show_batch_task(&self, task: &BatchIncreaseTask) -> Result<()> {
         let progress = if task.target_notional_usdt > 0.0 {
             (task.completed_notional_usdt / task.target_notional_usdt * 100.0).clamp(0.0, 100.0)
         } else {
             0.0
         };
-        let action = if task.action == "reduce" {
+        let action = if task.no_loss_guard {
+            "保不亏平仓"
+        } else if task.action == "reduce" {
             "批量减仓"
         } else {
             "批量加仓"
         };
-        let batch_description = if task.spread_guard {
+        let batch_description = if task.spread_guard || task.no_loss_guard {
             format!("{} 次动态盘口下单", task.completed_batches)
         } else {
             format!("{} / {}", task.completed_batches, task.total_batches)
         };
         let execution_description = if task.spread_guard {
             "按实时盘口下单，单腿硬顶 $50；差额跨批次保价补偿，无人为间隔".to_string()
+        } else if task.no_loss_guard {
+            "只看双腿仓位盈亏，单腿硬顶 $50；差额跨批次保不亏补偿".to_string()
         } else {
             format!(
                 "单笔 ${:.2} · 间隔 {:.1}s",
@@ -1076,6 +1126,15 @@ impl TelegramBot {
                 task.spread_threshold.unwrap_or_default() * 100.0,
                 task.current_spread
                     .map(|value| format!("{:+.4}%", value * 100.0))
+                    .unwrap_or_else(|| "读取中".into()),
+                task.spread_wait_count
+            ));
+        }
+        if task.no_loss_guard {
+            text.push_str(&format!(
+                "\n保不亏平仓：当前可配对仓位盈亏 {} · 已等待 {} 次",
+                task.current_close_pnl_usdt
+                    .map(|value| format!("{value:+.4} USDT"))
                     .unwrap_or_else(|| "读取中".into()),
                 task.spread_wait_count
             ));
@@ -1403,7 +1462,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询双腿保护状态和事件\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 10 -1.5</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询双腿保护状态和事件\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/no_loss_close TOKEN 目标 — 不计资金费和手续费的保不亏限价平仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 10 -1.5</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n<code>/no_loss_close DEXE 500</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![

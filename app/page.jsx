@@ -265,6 +265,7 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
   const [orderNotional, setOrderNotional] = useState(Math.min(100, isReduce ? maximumReduction : 100));
   const [intervalSeconds, setIntervalSeconds] = useState(2);
   const [spreadGuard, setSpreadGuard] = useState(false);
+  const [noLossGuard, setNoLossGuard] = useState(false);
   const [spreadThreshold, setSpreadThreshold] = useState(Number(((position.currentSpread || 0) * 100).toFixed(4)));
   const logRef = useRef(null);
   const progress = task
@@ -295,17 +296,23 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
           <option value="guard">保价差限价模式</option>
         </select></label>}
         {!isReduce && spreadGuard && <label>最低可执行价差（%）<input type="number" step="0.01" value={spreadThreshold} onChange={(event) => setSpreadThreshold(Number(event.target.value))} /></label>}
-        {(!spreadGuard || isReduce) && <label>单次每腿下单金额（USDT）<input type="number" min="10" step="10" value={orderNotional} onChange={(event) => setOrderNotional(Number(event.target.value))} /></label>}
-        {(!spreadGuard || isReduce) && <label>批次间隔（秒）<input type="number" min="0.5" max="3600" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /></label>}
+        {isReduce && <label>平仓模式<select value={noLossGuard ? "no-loss" : "market"} onChange={(event) => setNoLossGuard(event.target.value === "no-loss")}>
+          <option value="market">市价批量减仓</option>
+          <option value="no-loss">保不亏限价平仓</option>
+        </select></label>}
+        {(!spreadGuard && !noLossGuard) && <label>单次每腿下单金额（USDT）<input type="number" min="10" step="10" value={orderNotional} onChange={(event) => setOrderNotional(Number(event.target.value))} /></label>}
+        {(!spreadGuard && !noLossGuard) && <label>批次间隔（秒）<input type="number" min="0.5" max="3600" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /></label>}
         <div className="batch-estimate">
           {spreadGuard && !isReduce
             ? "按实时盘口动态下单，单腿每次最多 $50；成交差额在下一轮保价差补齐，不主动减仓"
+            : noLossGuard
+              ? "仅当两腿按可平仓价计算的仓位盈亏合计不为负时下单；不计资金费和手续费。单腿每次最多 $50，部分成交跨批次补齐"
             : <>预计 {Math.ceil(target / Math.max(orderNotional, 1))} 批，约 {duration(Math.max(0, Math.ceil(target / Math.max(orderNotional, 1)) - 1) * intervalSeconds / 3600)}</>}
         </div>
         <button
           className="batch-start"
-          disabled={busy || target < 10 || ((!spreadGuard || isReduce) && (orderNotional < 10 || orderNotional > target || intervalSeconds < 0.5)) || (isReduce && target > maximumReduction)}
-          onClick={() => onStart({ targetNotionalUsdt: target, orderNotionalUsdt: spreadGuard && !isReduce ? 0 : orderNotional, intervalSeconds: spreadGuard && !isReduce ? 0.25 : intervalSeconds, spreadGuard, spreadThreshold: spreadThreshold / 100 })}
+          disabled={busy || target < 10 || ((!spreadGuard && !noLossGuard) && (orderNotional < 10 || orderNotional > target || intervalSeconds < 0.5)) || (isReduce && target > maximumReduction)}
+          onClick={() => onStart({ targetNotionalUsdt: target, orderNotionalUsdt: spreadGuard || noLossGuard ? 0 : orderNotional, intervalSeconds: spreadGuard || noLossGuard ? 0.25 : intervalSeconds, spreadGuard, spreadThreshold: spreadThreshold / 100, noLossGuard })}
         >
           {busy ? "正在创建任务…" : `启动批量${isReduce ? "减仓" : "加仓"}`}
         </button>
@@ -314,13 +321,16 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
         <div className="batch-summary">
           <div><span>状态</span><b className={`batch-status ${task.status}`}>{task.status}</b></div>
           <div><span>完成金额</span><b>{money(task.completedNotionalUsdt)} / {money(task.targetNotionalUsdt)}</b></div>
-          <div><span>批次</span><b>{task.spreadGuard ? `${task.completedBatches} 次动态下单` : `${task.completedBatches} / ${task.totalBatches}`}</b></div>
+          <div><span>批次</span><b>{task.spreadGuard || task.noLossGuard ? `${task.completedBatches} 次动态下单` : `${task.completedBatches} / ${task.totalBatches}`}</b></div>
         </div>
         {task.spreadGuard && <div className="batch-estimate">
           保价差限价 · 门槛 {pct(task.spreadThreshold, 4)} · 当前 {task.currentSpread == null ? "读取中" : pct(task.currentSpread, 4)} · 已等待 {task.spreadWaitCount} 次
         </div>}
+        {task.noLossGuard && <div className="batch-estimate">
+          保不亏限价平仓 · 当前可配对仓位盈亏 {task.currentClosePnlUsdt == null ? "读取中" : money(task.currentClosePnlUsdt)} · 已等待 {task.spreadWaitCount} 次
+        </div>}
         <div className="batch-progress"><i style={{ width: `${progress}%` }} /></div>
-        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>{task.spreadGuard ? "实时盘口动态下单 · 单腿硬顶 $50 · 差额跨批次补偿" : `单笔 ${money(task.orderNotionalUsdt)} · 间隔 ${task.intervalSeconds}s`}</span></div>
+        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>{task.spreadGuard ? "实时盘口动态下单 · 单腿硬顶 $50 · 差额跨批次补偿" : task.noLossGuard ? "只看仓位盈亏 · 单腿硬顶 $50 · 差额跨批次补偿" : `单笔 ${money(task.orderNotionalUsdt)} · 间隔 ${task.intervalSeconds}s`}</span></div>
         {task.error && <div className="batch-error">{task.error}</div>}
         <div className="batch-log" ref={logRef}>
           {task.logs.length === 0 && <div className="batch-log-empty">等待第一批成交…</div>}
