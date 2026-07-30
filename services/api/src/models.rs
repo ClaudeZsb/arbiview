@@ -159,6 +159,9 @@ pub struct OpenTradeRequest {
     pub notional_usdt: f64,
     #[serde(default = "default_leverage")]
     pub leverage: u8,
+    #[serde(default)]
+    pub spread_guard: bool,
+    pub spread_threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,6 +173,9 @@ pub struct BatchIncreaseRequest {
     pub interval_seconds: f64,
     #[serde(default = "default_leverage")]
     pub leverage: u8,
+    #[serde(default)]
+    pub spread_guard: bool,
+    pub spread_threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -211,6 +217,10 @@ pub struct BatchIncreaseTask {
     pub order_notional_usdt: f64,
     pub interval_seconds: f64,
     pub leverage: Option<u8>,
+    pub spread_guard: bool,
+    pub spread_threshold: Option<f64>,
+    pub current_spread: Option<f64>,
+    pub spread_wait_count: usize,
     pub completed_notional_usdt: f64,
     pub completed_batches: usize,
     pub total_batches: usize,

@@ -122,6 +122,7 @@ impl TelegramBot {
                     {"command": "advisor", "description": "查询最新策略建议"},
                     {"command": "open", "description": "开仓：TOKEN 金额 [杠杆]"},
                     {"command": "batch_open", "description": "批量开仓：TOKEN 目标 单笔 间隔 [杠杆]"},
+                    {"command": "guard_open", "description": "保价差限价开仓：TOKEN 目标 单笔 间隔 [杠杆] [门槛%]"},
                     {"command": "reduce", "description": "减仓：TOKEN 金额"},
                     {"command": "batch_reduce", "description": "批量减仓：TOKEN 目标 单笔 间隔"},
                     {"command": "leverage", "description": "调整杠杆：TOKEN 杠杆"},
@@ -258,6 +259,30 @@ impl TelegramBot {
                 };
                 let opportunity = self.find_opportunity(token, None, None).await?;
                 self.confirm_batch_open(&opportunity, target, order, interval, leverage)
+                    .await
+            }
+            "/guard_open" => {
+                let token = parts.next().ok_or_else(|| {
+                    anyhow!("用法：/guard_open TOKEN 目标金额 单笔金额 间隔秒数 [杠杆] [最低价差%]")
+                })?;
+                let target = parse_f64(parts.next(), "目标金额")?;
+                let order = parse_f64(parts.next(), "单笔金额")?;
+                let interval = parse_f64(parts.next(), "间隔秒数")?;
+                let leverage = match parts.next() {
+                    Some(value) => value.parse::<u8>()?,
+                    None => self
+                        .find_position_by_token(token)
+                        .await
+                        .map(|position| position.leverage)
+                        .unwrap_or(10),
+                };
+                let opportunity = self.find_opportunity(token, None, None).await?;
+                let threshold = parts
+                    .next()
+                    .map(|value| value.parse::<f64>().map(|value| value / 100.0))
+                    .transpose()?
+                    .unwrap_or(opportunity.spread);
+                self.confirm_guard_open(&opportunity, target, order, interval, leverage, threshold)
                     .await
             }
             "/reduce" => {
@@ -420,6 +445,8 @@ impl TelegramBot {
                         opportunity_id: opportunity.id,
                         notional_usdt: amount.parse()?,
                         leverage: leverage.parse()?,
+                        spread_guard: false,
+                        spread_threshold: None,
                     })
                     .await?;
                 self.send(
@@ -461,6 +488,27 @@ impl TelegramBot {
                         order_notional_usdt: order.parse()?,
                         interval_seconds: interval.parse()?,
                         leverage: leverage.parse()?,
+                        spread_guard: false,
+                        spread_threshold: None,
+                    })
+                    .await?;
+                self.show_batch_task(&task).await
+            }
+            ["gox", token, long, short, target, order, interval, leverage, threshold] => {
+                let opportunity = self
+                    .find_opportunity(token, Some(long), Some(short))
+                    .await?;
+                let task = self
+                    .state
+                    .trading
+                    .start_batch_increase(BatchIncreaseRequest {
+                        opportunity_id: opportunity.id,
+                        target_notional_usdt: target.parse()?,
+                        order_notional_usdt: order.parse()?,
+                        interval_seconds: interval.parse()?,
+                        leverage: leverage.parse()?,
+                        spread_guard: true,
+                        spread_threshold: Some(threshold.parse()?),
                     })
                     .await?;
                 self.show_batch_task(&task).await
@@ -910,6 +958,57 @@ impl TelegramBot {
         .await
     }
 
+    async fn confirm_guard_open(
+        &self,
+        opportunity: &Opportunity,
+        target: f64,
+        order: f64,
+        interval: f64,
+        leverage: u8,
+        threshold: f64,
+    ) -> Result<()> {
+        validate_batch_settings(target, order, interval)?;
+        if !(1..=20).contains(&leverage) {
+            return Err(anyhow!("杠杆范围为 1–20×"));
+        }
+        let route = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            opportunity.token.symbol,
+            short_exchange(&opportunity.long.exchange),
+            short_exchange(&opportunity.short.exchange),
+            target,
+            order,
+            interval,
+            leverage,
+            threshold
+        );
+        self.send(
+            &format!(
+                "⚠️ 确认保价差限价开仓？\n<b>{}</b> · 每腿目标 ${:.2} · {}×\n每单最多 ${:.2} · 间隔 {:.1}s\n仅当实时可执行价差 ≥ {:+.4}% 时并发提交 IOC 限价单\n当前参考价差 {:+.4}%",
+                html(&opportunity.token.symbol),
+                target,
+                leverage,
+                order,
+                interval,
+                threshold * 100.0,
+                opportunity.spread * 100.0
+            ),
+            vec![vec![
+                button("确认启动", &format!("gox|{route}")),
+                button(
+                    "取消",
+                    &format!(
+                        "o|{}|{}|{}",
+                        opportunity.token.symbol,
+                        short_exchange(&opportunity.long.exchange),
+                        short_exchange(&opportunity.short.exchange)
+                    ),
+                ),
+            ]],
+        )
+        .await
+    }
+
     async fn confirm_batch_reduce(
         &self,
         position: &Position,
@@ -965,6 +1064,16 @@ impl TelegramBot {
         );
         if let Some(leverage) = task.leverage {
             text.push_str(&format!("\n杠杆：{}×", leverage));
+        }
+        if task.spread_guard {
+            text.push_str(&format!(
+                "\n保价差限价：门槛 {:+.4}% · 当前 {} · 已等待 {} 次",
+                task.spread_threshold.unwrap_or_default() * 100.0,
+                task.current_spread
+                    .map(|value| format!("{:+.4}%", value * 100.0))
+                    .unwrap_or_else(|| "读取中".into()),
+                task.spread_wait_count
+            ));
         }
         if let Some(error) = task.error.as_deref() {
             text.push_str(&format!("\n\n❌ {}", html(error)));
@@ -1289,7 +1398,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额与盈亏\n/protection — 查询双腿保护状态\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 批量加仓；新仓默认 10×，加仓沿用当前杠杆\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询双腿保护状态和事件\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 单笔 间隔 [杠杆] [门槛%] — 保价差 IOC 限价批量开仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 100 2 10 -1.5</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![

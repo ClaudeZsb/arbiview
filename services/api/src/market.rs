@@ -315,6 +315,71 @@ impl MarketService {
         Ok((funding_per_hour, spread, funding_per_hour * YEAR_HOURS))
     }
 
+    pub async fn refresh_opportunity_quotes(
+        &self,
+        opportunity: &Opportunity,
+    ) -> Result<Opportunity> {
+        let (long, short) = tokio::try_join!(
+            self.refresh_leg_quote(&opportunity.long),
+            self.refresh_leg_quote(&opportunity.short)
+        )?;
+        if long.ask <= 0.0 || short.bid <= 0.0 {
+            bail!("executable bid/ask quote is unavailable");
+        }
+        let mut refreshed = opportunity.clone();
+        refreshed.long = long;
+        refreshed.short = short;
+        refreshed.spread = (refreshed.short.bid - refreshed.long.ask) / refreshed.long.ask;
+        Ok(refreshed)
+    }
+
+    async fn refresh_leg_quote(&self, leg: &Leg) -> Result<Leg> {
+        let value: Value = match (leg.exchange.as_str(), leg.market.as_str()) {
+            ("Binance", "perpetual") => {
+                self.get_json(format!(
+                    "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={}",
+                    leg.symbol
+                ))
+                .await?
+            }
+            ("Binance", "spot") => {
+                self.get_json(format!(
+                    "https://api.binance.com/api/v3/ticker/bookTicker?symbol={}",
+                    leg.symbol
+                ))
+                .await?
+            }
+            ("Bybit", "perpetual") => {
+                self.get_json(format!(
+                    "https://api.bybit.com/v5/market/tickers?category=linear&symbol={}",
+                    leg.symbol
+                ))
+                .await?
+            }
+            ("Bybit", "spot") => {
+                self.get_json(format!(
+                    "https://api.bybit.com/v5/market/tickers?category=spot&symbol={}",
+                    leg.symbol
+                ))
+                .await?
+            }
+            _ => bail!("unsupported executable quote route"),
+        };
+        let (bid, ask) = if leg.exchange == "Binance" {
+            (parse(&value["bidPrice"]), parse(&value["askPrice"]))
+        } else {
+            let ticker = value["result"]["list"]
+                .as_array()
+                .and_then(|items| items.first())
+                .ok_or_else(|| anyhow!("Bybit executable quote is unavailable"))?;
+            (parse(&ticker["bid1Price"]), parse(&ticker["ask1Price"]))
+        };
+        let mut refreshed = leg.clone();
+        refreshed.bid = bid.ok_or_else(|| anyhow!("executable bid quote is unavailable"))?;
+        refreshed.ask = ask.ok_or_else(|| anyhow!("executable ask quote is unavailable"))?;
+        Ok(refreshed)
+    }
+
     async fn enrich_opportunity_averages(&self, opportunities: &mut [Opportunity]) {
         let mut average_tasks = tokio::task::JoinSet::new();
         for (index, opportunity) in opportunities.iter().enumerate() {

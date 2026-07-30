@@ -863,6 +863,20 @@ impl TradingService {
         opportunity: Opportunity,
         request: OpenTradeRequest,
     ) -> Result<TradeResponse> {
+        let opportunity = if request.spread_guard {
+            let refreshed = self.market.refresh_opportunity_quotes(&opportunity).await?;
+            let threshold = request.spread_threshold.unwrap_or(opportunity.spread);
+            if !spread_guard_allows(refreshed.spread, threshold) {
+                bail!(
+                    "SPREAD_WAIT: current executable spread {:.4}% is below threshold {:.4}%",
+                    refreshed.spread * 100.0,
+                    threshold * 100.0
+                );
+            }
+            refreshed
+        } else {
+            opportunity
+        };
         if !opportunity.execution_supported {
             bail!("this opportunity is observation-only or currently has no borrowable liquidity");
         }
@@ -935,6 +949,12 @@ impl TradingService {
             order_notional_usdt: request.order_notional_usdt,
             interval_seconds: request.interval_seconds,
             leverage: Some(request.leverage),
+            spread_guard: request.spread_guard,
+            spread_threshold: request
+                .spread_guard
+                .then(|| request.spread_threshold.unwrap_or(opportunity.spread)),
+            current_spread: Some(opportunity.spread),
+            spread_wait_count: 0,
             completed_notional_usdt: 0.0,
             completed_batches: 0,
             total_batches,
@@ -1013,6 +1033,10 @@ impl TradingService {
             order_notional_usdt: request.order_notional_usdt,
             interval_seconds: request.interval_seconds,
             leverage: None,
+            spread_guard: false,
+            spread_threshold: None,
+            current_spread: None,
+            spread_wait_count: 0,
             completed_notional_usdt: 0.0,
             completed_batches: 0,
             total_batches,
@@ -1076,6 +1100,17 @@ impl TradingService {
     ) {
         self.update_batch(&task_id, |task| task.status = "running".into())
             .await;
+        let base_notional = self
+            .positions()
+            .await
+            .ok()
+            .and_then(|positions| {
+                positions
+                    .into_iter()
+                    .find(|position| position.token == opportunity.token.symbol)
+            })
+            .map(|position| position.notional_usdt)
+            .unwrap_or(0.0);
         let mut completed = 0.0;
         let mut batch = 0usize;
         while completed + 0.001 < request.target_notional_usdt {
@@ -1093,6 +1128,34 @@ impl TradingService {
                 .await;
                 return;
             }
+            let batch_opportunity = if request.spread_guard {
+                match self.market.refresh_opportunity_quotes(&opportunity).await {
+                    Ok(refreshed) => {
+                        let threshold = request.spread_threshold.unwrap_or(opportunity.spread);
+                        self.update_batch(&task_id, |task| {
+                            task.current_spread = Some(refreshed.spread);
+                        })
+                        .await;
+                        if !spread_guard_allows(refreshed.spread, threshold) {
+                            self.update_batch(&task_id, |task| {
+                                task.spread_wait_count += 1;
+                            })
+                            .await;
+                            tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds))
+                                .await;
+                            continue;
+                        }
+                        refreshed
+                    }
+                    Err(error) => {
+                        tracing::warn!("spread-guard quote refresh failed: {error:#}");
+                        tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds)).await;
+                        continue;
+                    }
+                }
+            } else {
+                opportunity.clone()
+            };
             batch += 1;
             let batch_notional = request
                 .order_notional_usdt
@@ -1101,14 +1164,18 @@ impl TradingService {
                 opportunity_id: request.opportunity_id.clone(),
                 notional_usdt: batch_notional,
                 leverage: request.leverage,
+                spread_guard: request.spread_guard,
+                spread_threshold: request.spread_threshold.or(Some(opportunity.spread)),
             };
             match self
-                .open_opportunity(opportunity.clone(), open_request)
+                .open_opportunity(batch_opportunity.clone(), open_request)
                 .await
             {
                 Ok(response) => {
-                    completed += batch_notional;
-                    let logs = batch_logs(&opportunity, batch, &response, batch_notional);
+                    completed = (response.position.notional_usdt - base_notional)
+                        .max(0.0)
+                        .min(request.target_notional_usdt);
+                    let logs = batch_logs(&batch_opportunity, batch, &response, batch_notional);
                     let current_position = response.position.clone();
                     self.update_batch(&task_id, |task| {
                         task.completed_notional_usdt = completed.min(task.target_notional_usdt);
@@ -1123,6 +1190,18 @@ impl TradingService {
                 }
                 Err(error) => {
                     let message = format!("{error:#}");
+                    if request.spread_guard
+                        && (message.contains("SPREAD_WAIT") || message.contains("SPREAD_NO_FILL"))
+                    {
+                        batch = batch.saturating_sub(1);
+                        self.update_batch(&task_id, |task| {
+                            task.spread_wait_count += 1;
+                            task.error = None;
+                        })
+                        .await;
+                        tokio::time::sleep(Duration::from_secs_f64(request.interval_seconds)).await;
+                        continue;
+                    }
                     self.update_batch(&task_id, |task| {
                         task.status = "failed".into();
                         task.error = Some(message.clone());
@@ -1759,24 +1838,45 @@ impl TradingService {
             compensation_orders: vec![],
         };
 
-        let (long_result, short_result) = tokio::join!(
-            self.place(
-                &opportunity.long.exchange,
-                &opportunity.long.market,
-                &opportunity.long.symbol,
-                "Buy",
-                long_qty,
-                false,
-            ),
-            self.place(
-                &opportunity.short.exchange,
-                &opportunity.short.market,
-                &opportunity.short.symbol,
-                "Sell",
-                short_qty,
-                false,
+        let (long_result, short_result) = if request.spread_guard {
+            tokio::join!(
+                self.place_limit_ioc(
+                    &opportunity.long.exchange,
+                    &opportunity.long.market,
+                    &opportunity.long.symbol,
+                    "Buy",
+                    long_qty,
+                    opportunity.long.ask,
+                ),
+                self.place_limit_ioc(
+                    &opportunity.short.exchange,
+                    &opportunity.short.market,
+                    &opportunity.short.symbol,
+                    "Sell",
+                    short_qty,
+                    opportunity.short.bid,
+                )
             )
-        );
+        } else {
+            tokio::join!(
+                self.place(
+                    &opportunity.long.exchange,
+                    &opportunity.long.market,
+                    &opportunity.long.symbol,
+                    "Buy",
+                    long_qty,
+                    false,
+                ),
+                self.place(
+                    &opportunity.short.exchange,
+                    &opportunity.short.market,
+                    &opportunity.short.symbol,
+                    "Sell",
+                    short_qty,
+                    false,
+                )
+            )
+        };
         match long_result {
             Ok(order) => {
                 if let Err(error) = self.ensure_slippage(&order, opportunity.long.ask, true) {
@@ -1800,10 +1900,31 @@ impl TradingService {
             }
         }
 
-        let (long_phase, short_phase) = tokio::join!(
-            self.align_leg_to_target(&opportunity.long, "long", "Buy", long_target),
-            self.align_leg_to_target(&opportunity.short, "short", "Sell", short_target)
-        );
+        let (long_phase, short_phase) = if request.spread_guard {
+            let (long, short) = tokio::join!(
+                self.actual_leg(&opportunity.long, "long"),
+                self.actual_leg(&opportunity.short, "short")
+            );
+            (
+                PhaseOneResult {
+                    state: long.unwrap_or(None),
+                    attempts: 0,
+                    anomalies: 0,
+                    orders: vec![],
+                },
+                PhaseOneResult {
+                    state: short.unwrap_or(None),
+                    attempts: 0,
+                    anomalies: 0,
+                    orders: vec![],
+                },
+            )
+        } else {
+            tokio::join!(
+                self.align_leg_to_target(&opportunity.long, "long", "Buy", long_target),
+                self.align_leg_to_target(&opportunity.short, "short", "Sell", short_target)
+            )
+        };
         report.phase_one_long_attempts = long_phase.attempts;
         report.phase_one_short_attempts = short_phase.attempts;
         report.phase_one_long_anomalies = long_phase.anomalies;
@@ -1842,6 +1963,11 @@ impl TradingService {
                 mismatch,
                 mismatch_percent
             );
+        }
+        let added_notional = report.long_notional_usdt.min(report.short_notional_usdt)
+            - current_long.min(current_short);
+        if request.spread_guard && added_notional < 1.0 {
+            bail!("SPREAD_NO_FILL: IOC limit orders produced no balanced fill");
         }
         let long =
             long.ok_or_else(|| anyhow!("NAKED_EXPOSURE: actual long position is missing"))?;
@@ -2358,6 +2484,7 @@ impl TradingService {
                     quantity,
                     reduce_only,
                     &client_order_id,
+                    None,
                 )
                 .await
             }
@@ -2368,11 +2495,53 @@ impl TradingService {
                     quantity,
                     reduce_only,
                     &client_order_id,
+                    None,
                 )
                 .await
             }
             ("Bybit", "perpetual") => {
-                self.bybit_order(symbol, side, quantity, reduce_only, &client_order_id)
+                self.bybit_order(symbol, side, quantity, reduce_only, &client_order_id, None)
+                    .await
+            }
+            _ => bail!("unsupported {exchange} {market} market"),
+        }
+    }
+
+    async fn place_limit_ioc(
+        &self,
+        exchange: &str,
+        market: &str,
+        symbol: &str,
+        side: &str,
+        quantity: f64,
+        price: f64,
+    ) -> Result<OrderExecution> {
+        let client_order_id = format!("av{}", Uuid::new_v4().simple());
+        match (exchange, market) {
+            ("Binance", "perpetual") => {
+                self.binance_order(
+                    symbol,
+                    if side == "Buy" { "BUY" } else { "SELL" },
+                    quantity,
+                    false,
+                    &client_order_id,
+                    Some(price),
+                )
+                .await
+            }
+            ("Binance", "spot") => {
+                self.binance_margin_order(
+                    symbol,
+                    if side == "Buy" { "BUY" } else { "SELL" },
+                    quantity,
+                    false,
+                    &client_order_id,
+                    Some(price),
+                )
+                .await
+            }
+            ("Bybit", "perpetual") => {
+                self.bybit_order(symbol, side, quantity, false, &client_order_id, Some(price))
                     .await
             }
             _ => bail!("unsupported {exchange} {market} market"),
@@ -2432,6 +2601,7 @@ impl TradingService {
         qty: f64,
         reduce_only: bool,
         client_order_id: &str,
+        limit_price: Option<f64>,
     ) -> Result<OrderExecution> {
         let creds = self
             .config
@@ -2458,8 +2628,12 @@ impl TradingService {
         } else {
             format!("&reduceOnly={reduce_only}")
         };
+        let order_params = limit_price.map_or_else(
+            || "type=MARKET".to_string(),
+            |price| format!("type=LIMIT&timeInForce=IOC&price={}", format_price(price)),
+        );
         let query = format!(
-            "symbol={symbol}&side={side}&type=MARKET&quantity={}&newClientOrderId={client_order_id}&newOrderRespType=RESULT{mode_params}&timestamp={}",
+            "symbol={symbol}&side={side}&{order_params}&quantity={}&newClientOrderId={client_order_id}&newOrderRespType=RESULT{mode_params}&timestamp={}",
             format_qty(qty),
             chrono::Utc::now().timestamp_millis()
         );
@@ -2525,6 +2699,7 @@ impl TradingService {
         qty: f64,
         reduce_only: bool,
         client_order_id: &str,
+        limit_price: Option<f64>,
     ) -> Result<OrderExecution> {
         let creds = self
             .config
@@ -2539,8 +2714,12 @@ impl TradingService {
         } else {
             "AUTO_BORROW_REPAY"
         };
+        let order_params = limit_price.map_or_else(
+            || "type=MARKET".to_string(),
+            |price| format!("type=LIMIT&timeInForce=IOC&price={}", format_price(price)),
+        );
         let query = format!(
-            "symbol={symbol}&isIsolated=FALSE&side={side}&type=MARKET&quantity={}&sideEffectType={side_effect}&newClientOrderId={client_order_id}&newOrderRespType=FULL&timestamp={}",
+            "symbol={symbol}&isIsolated=FALSE&side={side}&{order_params}&quantity={}&sideEffectType={side_effect}&newClientOrderId={client_order_id}&newOrderRespType=FULL&timestamp={}",
             format_qty(qty),
             chrono::Utc::now().timestamp_millis()
         );
@@ -2617,15 +2796,21 @@ impl TradingService {
         qty: f64,
         reduce_only: bool,
         client_order_id: &str,
+        limit_price: Option<f64>,
     ) -> Result<OrderExecution> {
         let position_idx = self.bybit_position_idx(symbol, side, reduce_only).await?;
-        let body = json!({
+        let mut body = json!({
             "category": "linear", "symbol": symbol, "side": side,
-            "orderType": "Market", "qty": format_qty(qty),
+            "orderType": if limit_price.is_some() { "Limit" } else { "Market" },
+            "qty": format_qty(qty),
             "reduceOnly": reduce_only,
             "orderLinkId": client_order_id,
             "positionIdx": position_idx,
         });
+        if let Some(price) = limit_price {
+            body["price"] = Value::String(format_price(price));
+            body["timeInForce"] = Value::String("IOC".into());
+        }
         let submit = self
             .bybit_signed(Method::POST, "/v5/order/create", Some(body))
             .await;
@@ -2669,6 +2854,16 @@ impl TradingService {
                     });
                 }
                 if matches!(status, "Rejected" | "Cancelled" | "Deactivated") {
+                    if partial_quantity > 0.0 && partial_average_price > 0.0 {
+                        return Ok(OrderExecution {
+                            exchange: "Bybit".into(),
+                            client_order_id: client_order_id.into(),
+                            order_id,
+                            status: "PartiallyFilled".into(),
+                            executed_quantity: partial_quantity,
+                            average_price: partial_average_price,
+                        });
+                    }
                     bail!(
                         "Bybit order ended with status={status}, clientOrderId={client_order_id}"
                     );
@@ -3567,6 +3762,15 @@ fn format_qty(value: f64) -> String {
         .to_string()
 }
 
+fn format_price(value: f64) -> String {
+    let raw = format!("{value:.12}");
+    raw.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn spread_guard_allows(current: f64, threshold: f64) -> bool {
+    current + f64::EPSILON >= threshold
+}
+
 fn number(value: &Value) -> Option<f64> {
     value
         .as_str()
@@ -4113,5 +4317,14 @@ mod tests {
             ..Default::default()
         };
         assert!((summary.realized_pnl() - 5.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spread_guard_always_prefers_the_numerically_higher_spread() {
+        assert!(spread_guard_allows(0.015, 0.01));
+        assert!(!spread_guard_allows(0.005, 0.01));
+        assert!(spread_guard_allows(-0.015, -0.02));
+        assert!(!spread_guard_allows(-0.025, -0.02));
+        assert!(spread_guard_allows(-0.02, -0.02));
     }
 }
