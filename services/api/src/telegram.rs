@@ -1066,7 +1066,7 @@ impl TelegramBot {
         }
         self.send(
             &format!(
-                "⚠️ 确认启动保不亏限价平仓？\n<b>{}</b> · 每腿目标减少 ${:.2}\n仅当两腿按可平仓价计算的仓位盈亏合计不为负时下单；不包含资金费和手续费\n单腿每次最多 $50，部分成交将跨批次保不亏补齐",
+                "⚠️ 确认启动保不亏限价平仓？\n<b>{}</b> · 每腿目标减少 ${:.2}\n仅当累计仓位平仓盈亏不为负时下单；不包含资金费和手续费\n单腿每次最多 $50，部分成交立即市价补腿，亏损欠账由下一批追回",
                 html(&position.token),
                 target
             ),
@@ -1099,7 +1099,7 @@ impl TelegramBot {
         let execution_description = if task.spread_guard {
             "单腿硬顶 $50；差额立即市价补齐，下一批追回价差欠账，无人为间隔".to_string()
         } else if task.no_loss_guard {
-            "只看双腿仓位盈亏，单腿硬顶 $50；差额跨批次保不亏补偿".to_string()
+            "只看双腿仓位盈亏；差额立即市价补齐，下一批追回盈亏欠账".to_string()
         } else {
             format!(
                 "单笔 ${:.2} · 间隔 {:.1}s",

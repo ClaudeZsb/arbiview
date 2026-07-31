@@ -306,7 +306,7 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
           {spreadGuard && !isReduce
             ? "按实时盘口动态下单，单腿每次最多 $50；成交差额立即市价补腿，不利价差由下一批提高门槛追回"
             : noLossGuard
-              ? "仅当两腿按可平仓价计算的仓位盈亏合计不为负时下单；不计资金费和手续费。单腿每次最多 $50，部分成交跨批次补齐"
+              ? "仅当累计仓位平仓盈亏不为负时下单；不计资金费和手续费。单腿每次最多 $50，部分成交立即市价补腿，亏损欠账由下一批追回"
             : <>预计 {Math.ceil(target / Math.max(orderNotional, 1))} 批，约 {duration(Math.max(0, Math.ceil(target / Math.max(orderNotional, 1)) - 1) * intervalSeconds / 3600)}</>}
         </div>
         <button
@@ -330,7 +330,7 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
           保不亏限价平仓 · 当前可配对仓位盈亏 {task.currentClosePnlUsdt == null ? "读取中" : money(task.currentClosePnlUsdt)} · 已等待 {task.spreadWaitCount} 次
         </div>}
         <div className="batch-progress"><i style={{ width: `${progress}%` }} /></div>
-        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>{task.spreadGuard ? "单腿硬顶 $50 · 差额立即市价补齐 · 下一批追回价差欠账" : task.noLossGuard ? "只看仓位盈亏 · 单腿硬顶 $50 · 差额跨批次补偿" : `单笔 ${money(task.orderNotionalUsdt)} · 间隔 ${task.intervalSeconds}s`}</span></div>
+        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>{task.spreadGuard ? "单腿硬顶 $50 · 差额立即市价补齐 · 下一批追回价差欠账" : task.noLossGuard ? "只看仓位盈亏 · 差额立即市价补齐 · 下一批追回盈亏欠账" : `单笔 ${money(task.orderNotionalUsdt)} · 间隔 ${task.intervalSeconds}s`}</span></div>
         {task.error && <div className="batch-error">{task.error}</div>}
         <div className="batch-log" ref={logRef}>
           {task.logs.length === 0 && <div className="batch-log-empty">等待第一批成交…</div>}

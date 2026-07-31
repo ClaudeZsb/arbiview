@@ -1778,10 +1778,7 @@ impl TradingService {
         let mut completed = 0.0;
         let mut realized_position_pnl = 0.0;
         let mut batch = 0usize;
-        while request.target_notional_usdt - completed > 10.0
-            || close_unmatched_total(&unmatched_long) > 10.0
-            || close_unmatched_total(&unmatched_short) > 10.0
-        {
+        while request.target_notional_usdt - completed > 10.0 {
             if self.batch_cancelled(&task_id).await {
                 self.update_batch(&task_id, |task| task.status = "cancelled".into())
                     .await;
@@ -1803,16 +1800,10 @@ impl TradingService {
                 (long_quote.bid - position.long.entry_price) / long_quote.bid.max(f64::EPSILON);
             let short_pnl_ratio =
                 (position.short.entry_price - short_quote.ask) / short_quote.ask.max(f64::EPSILON);
-            let long_excess = close_unmatched_total(&unmatched_long);
-            let short_excess = close_unmatched_total(&unmatched_short);
             let remaining = (request.target_notional_usdt - completed).max(0.0);
-            let desired = if remaining > 10.0 {
-                SPREAD_GUARD_ORDER_CAP_USDT.min(remaining)
-            } else {
-                SPREAD_GUARD_ORDER_CAP_USDT.min(long_excess.max(short_excess))
-            };
-            let (long_notional, short_notional) =
-                guard_order_notionals(desired, long_excess, short_excess);
+            let desired = SPREAD_GUARD_ORDER_CAP_USDT.min(remaining);
+            let long_notional = desired;
+            let short_notional = desired;
             let mut projected_long = unmatched_long.clone();
             let mut projected_short = unmatched_short.clone();
             if long_notional > 0.0 {
@@ -1829,10 +1820,10 @@ impl TradingService {
             }
             let (_, projected_pnl) = match_close_fills(&mut projected_long, &mut projected_short);
             self.update_batch(&task_id, |task| {
-                task.current_close_pnl_usdt = Some(projected_pnl)
+                task.current_close_pnl_usdt = Some(realized_position_pnl + projected_pnl)
             })
             .await;
-            if projected_pnl < -1e-8 {
+            if !no_loss_next_batch_allowed(realized_position_pnl, projected_pnl) {
                 self.record_spread_wait(&task_id, None).await;
                 tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
                 continue;
@@ -1882,13 +1873,7 @@ impl TradingService {
                         pnl_ratio: (order.average_price - position.long.entry_price)
                             / order.average_price,
                     });
-                    logs.push(no_loss_batch_log(
-                        &position,
-                        batch,
-                        "long",
-                        &order,
-                        short_excess > f64::EPSILON,
-                    ));
+                    logs.push(no_loss_batch_log(&position, batch, "long", &order, false));
                 }
             }
             if let Some(order) = short_result {
@@ -1899,17 +1884,100 @@ impl TradingService {
                         pnl_ratio: (position.short.entry_price - order.average_price)
                             / order.average_price,
                     });
-                    logs.push(no_loss_batch_log(
-                        &position,
-                        batch,
-                        "short",
-                        &order,
-                        long_excess > f64::EPSILON,
-                    ));
+                    logs.push(no_loss_batch_log(&position, batch, "short", &order, false));
                 }
             }
-            let (matched, matched_pnl) =
+            let (mut matched, mut matched_pnl) =
                 match_close_fills(&mut unmatched_long, &mut unmatched_short);
+            for attempt in 1..=MAX_RECONCILIATION_ATTEMPTS {
+                let long_excess = close_unmatched_total(&unmatched_long);
+                let short_excess = close_unmatched_total(&unmatched_short);
+                let difference = (long_excess - short_excess).abs();
+                if difference <= HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT {
+                    break;
+                }
+                let _supplement_guard = self.execution_lock.lock().await;
+                let supplement = if long_excess > short_excess {
+                    let quantity = floor_step(difference / short_quote.ask, short_leg.qty_step);
+                    if quantity <= 0.0 {
+                        None
+                    } else {
+                        self.place(
+                            &short_leg.exchange,
+                            &short_leg.market,
+                            &short_leg.symbol,
+                            "Buy",
+                            quantity,
+                            true,
+                        )
+                        .await
+                        .ok()
+                        .map(|order| ("short", order))
+                    }
+                } else {
+                    let quantity = floor_step(difference / long_quote.bid, long_leg.qty_step);
+                    if quantity <= 0.0 {
+                        None
+                    } else {
+                        self.place(
+                            &long_leg.exchange,
+                            &long_leg.market,
+                            &long_leg.symbol,
+                            "Sell",
+                            quantity,
+                            true,
+                        )
+                        .await
+                        .ok()
+                        .map(|order| ("long", order))
+                    }
+                };
+                drop(_supplement_guard);
+                let Some((side, order)) = supplement else {
+                    tracing::warn!(
+                        token = %position.token,
+                        attempt,
+                        "immediate market close-leg supplement failed"
+                    );
+                    continue;
+                };
+                let notional = order.executed_quantity * order.average_price;
+                if side == "long" {
+                    unmatched_long.push_back(CloseUnmatchedFill {
+                        notional_usdt: notional,
+                        pnl_ratio: (order.average_price - position.long.entry_price)
+                            / order.average_price,
+                    });
+                } else {
+                    unmatched_short.push_back(CloseUnmatchedFill {
+                        notional_usdt: notional,
+                        pnl_ratio: (position.short.entry_price - order.average_price)
+                            / order.average_price,
+                    });
+                }
+                logs.push(no_loss_market_supplement_log(
+                    &position, batch, side, &order,
+                ));
+                let (newly_matched, new_pnl) =
+                    match_close_fills(&mut unmatched_long, &mut unmatched_short);
+                matched += newly_matched;
+                matched_pnl += new_pnl;
+            }
+            let residual = (close_unmatched_total(&unmatched_long)
+                - close_unmatched_total(&unmatched_short))
+            .abs();
+            if residual > HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT {
+                self.fail_batch_task(
+                    &task_id,
+                    batch,
+                    format!(
+                        "NAKED_EXPOSURE: immediate market close supplement failed after {} attempts; residual mismatch {:.2} USDT",
+                        MAX_RECONCILIATION_ATTEMPTS, residual
+                    ),
+                )
+                .await;
+                return;
+            }
             completed = (completed + matched).min(request.target_notional_usdt);
             realized_position_pnl += matched_pnl;
             let current_position =
@@ -4372,16 +4440,6 @@ fn unmatched_total(fills: &VecDeque<GuardUnmatchedFill>) -> f64 {
     fills.iter().map(|fill| fill.notional_usdt).sum()
 }
 
-fn guard_order_notionals(desired: f64, unmatched_long: f64, unmatched_short: f64) -> (f64, f64) {
-    if unmatched_long > f64::EPSILON {
-        ((desired - unmatched_long).max(0.0), desired)
-    } else if unmatched_short > f64::EPSILON {
-        (desired, (desired - unmatched_short).max(0.0))
-    } else {
-        (desired, desired)
-    }
-}
-
 fn match_guard_fills_with_edge(
     long: &mut VecDeque<GuardUnmatchedFill>,
     short: &mut VecDeque<GuardUnmatchedFill>,
@@ -4443,6 +4501,10 @@ fn match_close_fills(
     (matched, pnl)
 }
 
+fn no_loss_next_batch_allowed(realized_position_pnl: f64, projected_batch_pnl: f64) -> bool {
+    realized_position_pnl + projected_batch_pnl >= -1e-8
+}
+
 fn no_loss_batch_log(
     position: &Position,
     batch: usize,
@@ -4467,6 +4529,28 @@ fn no_loss_batch_log(
         } else {
             "保不亏 IOC 限价平仓成交".into()
         },
+    }
+}
+
+fn no_loss_market_supplement_log(
+    position: &Position,
+    batch: usize,
+    side: &str,
+    order: &OrderExecution,
+) -> BatchExecutionLog {
+    BatchExecutionLog {
+        sequence: 0,
+        batch,
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        exchange: order.exchange.clone(),
+        side: side.into(),
+        token: position.token.clone(),
+        notional_usdt: order.executed_quantity * order.average_price,
+        executed_quantity: order.executed_quantity,
+        average_price: order.average_price,
+        status: order.status.clone(),
+        order_id: order.order_id.clone(),
+        message: "单腿平仓差额立即市价补齐".into(),
     }
 }
 
@@ -5233,13 +5317,6 @@ mod tests {
     }
 
     #[test]
-    fn guarded_batches_compensate_the_smaller_leg_without_reducing_the_larger_leg() {
-        assert_eq!(guard_order_notionals(50.0, 20.0, 0.0), (30.0, 50.0));
-        assert_eq!(guard_order_notionals(50.0, 0.0, 20.0), (50.0, 30.0));
-        assert_eq!(guard_order_notionals(50.0, 60.0, 0.0), (0.0, 50.0));
-    }
-
-    #[test]
     fn market_supplement_shortfall_raises_the_next_required_spread() {
         let mut long = VecDeque::from([GuardUnmatchedFill {
             notional_usdt: 20.0,
@@ -5281,5 +5358,8 @@ mod tests {
         }]);
         let (_, pnl) = match_close_fills(&mut long, &mut short);
         assert!(pnl < 0.0);
+        assert!(!no_loss_next_batch_allowed(-0.40, 0.30));
+        assert!(no_loss_next_batch_allowed(-0.40, 0.40));
+        assert!(no_loss_next_batch_allowed(0.20, -0.10));
     }
 }
