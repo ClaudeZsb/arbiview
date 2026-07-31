@@ -487,7 +487,7 @@ impl TradingService {
             token: route.token.clone(),
             event_type: "detecting".into(),
             status: "running".into(),
-            message: "检测到双腿名义价值偏差超过 1%".into(),
+            message: "检测到双腿名义价值偏差超过 3% 且超过 10 USDT".into(),
             started_at: now,
             updated_at: now,
             initial_long_notional_usdt: None,
@@ -506,21 +506,8 @@ impl TradingService {
             }
         };
         loop {
-            let actual = match tokio::try_join!(
-                self.binance_positions(),
-                self.bybit_positions(),
-                self.binance_margin_positions(),
-                self.market.position_quotes()
-            ) {
-                Ok((binance, bybit, margin, quotes)) => {
-                    let mut legs = binance
-                        .into_iter()
-                        .chain(bybit)
-                        .chain(margin)
-                        .collect::<Vec<_>>();
-                    apply_position_quotes(&mut legs, &quotes);
-                    legs
-                }
+            let actual = match self.authoritative_protection_positions().await {
+                Ok(legs) => legs,
                 Err(error) => {
                     self.fail_protection_event(&event_id, format!("仓位读取失败：{error:#}"))
                         .await;
@@ -565,7 +552,7 @@ impl TradingService {
                     if !hedge_notional_needs_protection(&long, &short) {
                         self.complete_protection_event(
                             &event_id,
-                            "当前差额未同时超过 1% 与 10 USDT，保护停止",
+                            "当前差额未同时超过 3% 与 10 USDT，保护停止",
                         )
                         .await;
                         return;
@@ -647,6 +634,28 @@ impl TradingService {
             }
             tokio::time::sleep(Duration::from_secs_f64(HEDGE_PROTECTION_INTERVAL_SECONDS)).await;
         }
+    }
+
+    async fn authoritative_protection_positions(&self) -> Result<Vec<PositionLeg>> {
+        let (binance, bybit, margin, quotes) = tokio::try_join!(
+            self.fetch_binance_positions(),
+            self.fetch_bybit_positions(),
+            self.binance_margin_positions(),
+            self.market.position_quotes()
+        )?;
+        self.account_store
+            .seed_binance(self.fetch_binance_balance().await?, binance.clone())
+            .await;
+        self.account_store
+            .seed_bybit(self.fetch_bybit_balance().await?, bybit.clone())
+            .await;
+        let mut legs = binance
+            .into_iter()
+            .chain(bybit)
+            .chain(margin)
+            .collect::<Vec<_>>();
+        apply_position_quotes(&mut legs, &quotes);
+        Ok(legs)
     }
 
     async fn push_protection_event(&self, event: HedgeProtectionEvent) {
