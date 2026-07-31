@@ -1313,6 +1313,7 @@ export default function Dashboard() {
           <div>
             <div className="section-kicker"><TrendingUp size={15} /> CROSS-EXCHANGE PERPETUAL</div>
             <h2>跨所永续套利 <span>{rows.length}</span></h2>
+            <div className="configured">仅排名下一整点实际发生结算的机会 · APY 只计该整点结算腿</div>
           </div>
           <div className="updated">
             <Clock3 size={15} />
@@ -1404,7 +1405,7 @@ export default function Dashboard() {
       <section className="methodology" id="methodology">
         <div className="method-title"><Info size={18} /><div><b>计算口径</b><span>帮助你正确理解展示数据</span></div></div>
         <div><span>01</span><p><b>可执行价格</b>Long 使用卖一价，Short 使用买一价；Long 低于 Short 时价差为正。</p></div>
-        <div><span>02</span><p><b>资金 APY</b>按各合约实际结算周期换算小时净收益，再按 365 天单利年化。</p></div>
+        <div><span>02</span><p><b>资金 APY</b>跨所永续只计下一整点实际结算腿的完整费率；若两所周期不同，未在该整点结算的腿不计入。现货–永续仍按合约周期折算。</p></div>
         <div><span>03</span><p><b>预计回本</b>以资金费率覆盖“当前方向价差 − 24h 平均方向价差”及双腿开平仓 taker 手续费；Binance 0.05%，Bybit 0.055%。</p></div>
       </section>
 

@@ -1337,11 +1337,36 @@ fn strategy_reference_price(mark_price: f64, last_price: f64) -> (f64, bool) {
 }
 
 fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunity> {
-    let funding_per_hour = short.rate / short.interval_hours - long.rate / long.interval_hours;
-    if funding_per_hour <= 0.0 {
+    make_cross_opportunity_at(token, long, short, chrono::Utc::now().timestamp_millis())
+}
+
+fn make_cross_opportunity_at(
+    token: &Token,
+    long: &Leg,
+    short: &Leg,
+    now_millis: i64,
+) -> Option<Opportunity> {
+    let long_settles = settles_at_next_hour(long, now_millis);
+    let short_settles = settles_at_next_hour(short, now_millis);
+    if !long_settles && !short_settles {
         return None;
     }
-    Some(build_opportunity(token, long, short, funding_per_hour))
+    let next_hour_return =
+        if short_settles { short.rate } else { 0.0 } - if long_settles { long.rate } else { 0.0 };
+    if next_hour_return <= 0.0 {
+        return None;
+    }
+    Some(build_opportunity(token, long, short, next_hour_return))
+}
+
+fn settles_at_next_hour(leg: &Leg, now_millis: i64) -> bool {
+    const HOUR_MILLIS: i64 = 60 * 60 * 1_000;
+    const SETTLEMENT_TOLERANCE_MILLIS: i64 = 60 * 1_000;
+    if leg.market != "perpetual" || leg.next_funding_time <= now_millis {
+        return false;
+    }
+    let next_hour = now_millis.div_euclid(HOUR_MILLIS) * HOUR_MILLIS + HOUR_MILLIS;
+    (leg.next_funding_time - next_hour).abs() <= SETTLEMENT_TOLERANCE_MILLIS
 }
 
 fn make_spot_short_perpetual_long(
@@ -1569,5 +1594,58 @@ mod tests {
             tags,
             volume_24h_usdt: 1_000_000.0,
         }
+    }
+
+    #[test]
+    fn cross_opportunity_only_counts_legs_settling_at_the_next_hour() {
+        let now = 30 * 60 * 1_000;
+        let next_hour = 60 * 60 * 1_000;
+        let four_hours = 4 * 60 * 60 * 1_000;
+        let token = Token {
+            symbol: "TEST".into(),
+            name: "TEST".into(),
+            rank: None,
+            tags: vec![],
+        };
+        let mut long = test_leg("Binance", vec![]);
+        long.rate = 0.01;
+        long.interval_hours = 4.0;
+        long.next_funding_time = four_hours;
+        let mut short = test_leg("Bybit", vec![]);
+        short.rate = 0.002;
+        short.interval_hours = 1.0;
+        short.next_funding_time = next_hour;
+
+        let opportunity =
+            make_cross_opportunity_at(&token, &long, &short, now).expect("next-hour settlement");
+        assert!((opportunity.funding_per_hour - 0.002).abs() < 1e-12);
+        assert!((opportunity.apy - 0.002 * YEAR_HOURS).abs() < 1e-9);
+
+        short.next_funding_time = four_hours;
+        assert!(make_cross_opportunity_at(&token, &long, &short, now).is_none());
+    }
+
+    #[test]
+    fn cross_opportunity_combines_both_rates_when_both_legs_settle_next_hour() {
+        let now = 3 * 60 * 60 * 1_000 + 30 * 60 * 1_000;
+        let settlement = 4 * 60 * 60 * 1_000;
+        let token = Token {
+            symbol: "TEST".into(),
+            name: "TEST".into(),
+            rank: None,
+            tags: vec![],
+        };
+        let mut long = test_leg("Binance", vec![]);
+        long.rate = 0.001;
+        long.interval_hours = 4.0;
+        long.next_funding_time = settlement;
+        let mut short = test_leg("Bybit", vec![]);
+        short.rate = 0.003;
+        short.interval_hours = 1.0;
+        short.next_funding_time = settlement;
+
+        let opportunity =
+            make_cross_opportunity_at(&token, &long, &short, now).expect("both settle");
+        assert!((opportunity.funding_per_hour - 0.002).abs() < 1e-12);
     }
 }
