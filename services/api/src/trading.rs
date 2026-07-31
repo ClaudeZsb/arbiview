@@ -42,12 +42,22 @@ impl SpreadRecovery {
         threshold - self.installment_ratio(next_notional, available_batches)
     }
 
-    fn record_open_batch(&mut self, threshold: f64, notional: f64, edge_value: f64) {
-        self.record_debt((self.debt_usdt + threshold * notional - edge_value).max(0.0));
+    fn record_open_cumulative(
+        &mut self,
+        threshold: f64,
+        completed_notional: f64,
+        cumulative_edge_value: f64,
+    ) {
+        self.record_debt((threshold * completed_notional - cumulative_edge_value).max(0.0));
     }
 
-    fn record_close_batch(&mut self, threshold: f64, notional: f64, spread_value: f64) {
-        self.record_debt((self.debt_usdt + spread_value - threshold * notional).max(0.0));
+    fn record_close_cumulative(
+        &mut self,
+        threshold: f64,
+        completed_notional: f64,
+        cumulative_spread_value: f64,
+    ) {
+        self.record_debt((cumulative_spread_value - threshold * completed_notional).max(0.0));
     }
 
     fn installment_ratio(&self, next_notional: f64, available_batches: usize) -> f64 {
@@ -1830,7 +1840,7 @@ impl TradingService {
             }
             completed = (completed + matched).min(request.target_notional_usdt);
             cumulative_edge_value += edge_value;
-            spread_recovery.record_open_batch(threshold, matched, edge_value);
+            spread_recovery.record_open_cumulative(threshold, completed, cumulative_edge_value);
             let cumulative_spread =
                 (completed > f64::EPSILON).then_some(cumulative_edge_value / completed);
             let current_position = self.positions().await.ok().and_then(|positions| {
@@ -2266,7 +2276,11 @@ impl TradingService {
             completed = (completed + matched).min(request.target_notional_usdt);
             realized_position_pnl += matched_pnl;
             cumulative_close_spread_value += matched_spread_value;
-            spread_recovery.record_close_batch(original_threshold, matched, matched_spread_value);
+            spread_recovery.record_close_cumulative(
+                original_threshold,
+                completed,
+                cumulative_close_spread_value,
+            );
             let cumulative_close_spread =
                 (completed > f64::EPSILON).then_some(cumulative_close_spread_value / completed);
             let current_position =
@@ -5682,7 +5696,7 @@ mod tests {
         assert!((matched - 20.0).abs() < 1e-9);
         assert!((edge_value - 0.1).abs() < 1e-9);
         let mut recovery = SpreadRecovery::default();
-        recovery.record_open_batch(0.01, matched, edge_value);
+        recovery.record_open_cumulative(0.01, matched, edge_value);
         assert_eq!(recovery.batches_remaining, 10);
         assert!((recovery.debt_usdt - 0.1).abs() < 1e-9);
         assert!((recovery.open_threshold(0.01, 20.0, 10) - 0.0105).abs() < 1e-9);
@@ -5692,13 +5706,12 @@ mod tests {
 
     #[test]
     fn successful_open_batches_pay_down_the_scheduled_debt() {
-        let mut recovery = SpreadRecovery {
-            debt_usdt: 1.0,
-            batches_remaining: 10,
-        };
+        let mut recovery = SpreadRecovery::default();
+        recovery.record_open_cumulative(0.01, 500.0, 4.0);
+        assert!((recovery.debt_usdt - 1.0).abs() < 1e-9);
         let threshold = recovery.open_threshold(0.01, 50.0, 10);
         assert!((threshold - 0.012).abs() < 1e-9);
-        recovery.record_open_batch(0.01, 50.0, 50.0 * threshold);
+        recovery.record_open_cumulative(0.01, 550.0, 4.0 + 50.0 * threshold);
         assert!((recovery.debt_usdt - 0.9).abs() < 1e-9);
         assert_eq!(recovery.batches_remaining, 9);
         assert!((recovery.open_threshold(0.01, 50.0, 9) - 0.012).abs() < 1e-9);
@@ -5707,7 +5720,7 @@ mod tests {
     #[test]
     fn close_spread_debt_is_amortized_toward_a_lower_maximum() {
         let mut recovery = SpreadRecovery::default();
-        recovery.record_close_batch(0.01, 50.0, 0.75);
+        recovery.record_close_cumulative(0.01, 50.0, 0.75);
         assert_eq!(recovery.batches_remaining, 10);
         assert!((recovery.debt_usdt - 0.25).abs() < 1e-9);
         assert!((recovery.close_threshold(0.01, 50.0, 10) - 0.0095).abs() < 1e-9);
@@ -5720,6 +5733,17 @@ mod tests {
             batches_remaining: 10,
         };
         assert!((recovery.open_threshold(0.01, 50.0, 2) - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cumulative_open_surplus_offsets_a_later_market_supplement_loss() {
+        let mut recovery = SpreadRecovery::default();
+        recovery.record_open_cumulative(0.013, 950.0, 950.0 * 0.0134);
+        assert_eq!(recovery.debt_usdt, 0.0);
+
+        recovery.record_open_cumulative(0.013, 1_000.0, 1_000.0 * 0.01338);
+        assert_eq!(recovery.debt_usdt, 0.0);
+        assert!((recovery.open_threshold(0.013, 50.0, 1) - 0.013).abs() < 1e-9);
     }
 
     #[test]
