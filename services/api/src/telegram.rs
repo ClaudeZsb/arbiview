@@ -1419,7 +1419,7 @@ impl TelegramBot {
             match self.state.market.opportunities().await {
                 Ok(snapshot) => {
                     for opportunity in snapshot.spread_opportunities {
-                        if opportunity.spread_vs_average < DEVIATION_THRESHOLD {
+                        if opportunity.spread_vs_average <= DEVIATION_THRESHOLD {
                             continue;
                         }
                         let token = opportunity.token.symbol.to_ascii_uppercase();

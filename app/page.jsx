@@ -1407,11 +1407,11 @@ export default function Dashboard() {
             <div className="section-kicker"><ArrowDownUp size={15} /> PRICE SPREAD ARBITRAGE</div>
             <h2>价差套利 <span>{spreadRows.length}</span></h2>
           </div>
-          <div className="configured">机会入选仍基于当前可执行价差 · UI 按相对 24h 时间加权基准的偏离排序</div>
+          <div className="configured">仅展示相对 24h 时间加权基准偏离 &gt; 0.5% · Funding 成本按当前费率估算</div>
         </div>
         <div className="spread-column-head"><span>资产</span><span>执行路径</span><span>加权偏离</span><span>Funding 成本</span><span>成本承受时间</span></div>
         <div className="spread-list">
-          {!loading && !error && spreadRows.length === 0 && <div className="state compact">当前没有价差超过 0.5% 的共同合约</div>}
+          {!loading && !error && spreadRows.length === 0 && <div className="state compact">当前没有时间加权价差偏离超过 0.5% 的共同合约</div>}
           {spreadRows.map((item, index) => <SpreadOpportunityCard key={`spread-${item.id}`} item={item} index={index} onTrade={setTradeItem} />)}
         </div>
         <p className="spread-note">加权偏离 = 当前可执行方向价差 − 24h 时间加权方向价差（半衰期 6 小时）；成本承受时间按偏离扣除往返手续费后计算。Funding 成本按当前费率线性估算。</p>

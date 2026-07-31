@@ -17,6 +17,7 @@ const BINANCE_FEE: f64 = 0.0005;
 const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
 const SPREAD_AVERAGE_HALF_LIFE_HOURS: f64 = 6.0;
+const SPREAD_OPPORTUNITY_DEVIATION_THRESHOLD: f64 = 0.005;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 type SpreadAverageCache = HashMap<String, (Instant, f64)>;
@@ -273,9 +274,12 @@ impl MarketService {
             .await;
         self.enrich_opportunity_averages(&mut spot_opportunities)
             .await;
-        spread_opportunities.sort_by(|a, b| b.spread.total_cmp(&a.spread));
         self.enrich_opportunity_averages(&mut spread_opportunities)
             .await;
+        spread_opportunities.retain(|opportunity| {
+            opportunity.spread_vs_average > SPREAD_OPPORTUNITY_DEVIATION_THRESHOLD
+        });
+        spread_opportunities.sort_by(|a, b| b.spread_vs_average.total_cmp(&a.spread_vs_average));
         let result = OpportunitiesResponse {
             opportunities: cross_opportunities,
             spot_opportunities,
@@ -1688,10 +1692,6 @@ fn is_tradefi(leg: &Leg) -> bool {
 }
 
 fn make_spread_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunity> {
-    let spread = (short.bid - long.ask) / long.ask;
-    if spread <= 0.005 {
-        return None;
-    }
     let funding_per_hour = short.rate / short.interval_hours - long.rate / long.interval_hours;
     Some(build_opportunity(token, long, short, funding_per_hour))
 }
