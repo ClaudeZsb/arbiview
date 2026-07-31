@@ -1780,7 +1780,7 @@ mod tests {
                 let _ = run_live_quote_stream(&leg, &key, &cache).await;
             });
         }
-        tokio::time::timeout(Duration::from_secs(15), async {
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if cache.read().await.len() == routes.len() {
                     break;
@@ -1788,8 +1788,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
-        .await
-        .expect("all four websocket quote routes should publish");
+        .await;
+        if result.is_err() {
+            let connected = cache.read().await.keys().cloned().collect::<Vec<_>>();
+            panic!("all four websocket quote routes should publish; received {connected:?}");
+        }
         for quote in cache.read().await.values() {
             assert!(quote.bid > 0.0);
             assert!(quote.ask >= quote.bid);
