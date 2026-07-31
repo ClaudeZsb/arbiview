@@ -1759,6 +1759,43 @@ mod tests {
         assert_eq!(quote.ask_quantity, 4.4);
     }
 
+    #[tokio::test]
+    #[ignore = "requires direct access to exchange websocket endpoints"]
+    async fn exchange_websocket_quotes_are_live() {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        let routes = [
+            ("Binance", "perpetual"),
+            ("Binance", "spot"),
+            ("Bybit", "perpetual"),
+            ("Bybit", "spot"),
+        ];
+        for (exchange, market) in routes {
+            let mut leg = test_leg(exchange, vec![]);
+            leg.market = market.into();
+            leg.base = "BTC".into();
+            leg.symbol = "BTCUSDT".into();
+            let key = route_leg_key(exchange, market, &leg.symbol);
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                let _ = run_live_quote_stream(&leg, &key, &cache).await;
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cache.read().await.len() == routes.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("all four websocket quote routes should publish");
+        for quote in cache.read().await.values() {
+            assert!(quote.bid > 0.0);
+            assert!(quote.ask >= quote.bid);
+        }
+    }
+
     #[test]
     fn classifies_cmc_and_tradefi_independently() {
         let cmc = Token {
