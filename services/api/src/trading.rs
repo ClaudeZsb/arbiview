@@ -215,6 +215,7 @@ impl TradingService {
             let mut binance_connected = false;
             let mut bybit_connected = false;
             let mut margin_refresh_seconds = 30u64;
+            let mut account_reconcile_seconds = 0u64;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let current_binance = service.account_store.connected("Binance").await;
@@ -246,6 +247,7 @@ impl TradingService {
                 binance_connected = current_binance;
                 bybit_connected = current_bybit;
                 margin_refresh_seconds = margin_refresh_seconds.saturating_add(1);
+                account_reconcile_seconds = account_reconcile_seconds.saturating_add(1);
                 if margin_refresh_seconds >= 30 {
                     match service.fetch_binance_margin_positions().await {
                         Ok(positions) => {
@@ -257,6 +259,39 @@ impl TradingService {
                             margin_refresh_seconds = 25;
                         }
                     }
+                }
+                if account_reconcile_seconds >= 30 {
+                    let (binance, bybit) = tokio::join!(
+                        async {
+                            tokio::try_join!(
+                                service.fetch_binance_balance(),
+                                service.fetch_binance_positions()
+                            )
+                        },
+                        async {
+                            tokio::try_join!(
+                                service.fetch_bybit_balance(),
+                                service.fetch_bybit_positions()
+                            )
+                        }
+                    );
+                    match binance {
+                        Ok((balance, positions)) => {
+                            service.account_store.seed_binance(balance, positions).await
+                        }
+                        Err(error) => {
+                            tracing::warn!("Binance account reconciliation failed: {error:#}")
+                        }
+                    }
+                    match bybit {
+                        Ok((balance, positions)) => {
+                            service.account_store.seed_bybit(balance, positions).await
+                        }
+                        Err(error) => {
+                            tracing::warn!("Bybit account reconciliation failed: {error:#}")
+                        }
+                    }
+                    account_reconcile_seconds = 0;
                 }
             }
         });
@@ -3632,12 +3667,10 @@ impl TradingService {
             {
                 return confirmed_order_or_error(order);
             }
-            if limit_price.is_none() {
-                response = self
-                    .binance_signed(Method::GET, "/fapi/v1/order", &status_query(), creds)
-                    .await?;
-                fill = binance_fill(&response);
-            }
+            response = self
+                .binance_signed(Method::GET, "/fapi/v1/order", &status_query(), creds)
+                .await?;
+            fill = binance_fill(&response);
         }
         if fill.1 <= 0.0 || fill.2 <= 0.0 {
             bail!(
