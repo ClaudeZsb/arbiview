@@ -1402,7 +1402,7 @@ impl TelegramBot {
                             continue;
                         }
                         let message = format!(
-                            "📐 <b>价差偏离提醒 · {}</b>\n\n🟢 LONG {} @ ${:.6}\n🔴 SHORT {} @ ${:.6}\n\n当前方向价差：{:+.3}%\n24h 整点平均：{:+.3}%\n高于均值：<b>{:+.3}%</b>\n\n当前价差显著高于历史均值，可关注 LONG 低价腿、SHORT 高价腿并等待价差回归。资金费与手续费仍需单独评估。",
+                            "📐 <b>价差偏离提醒 · {}</b>\n\n🟢 LONG {} @ ${:.6}\n🔴 SHORT {} @ ${:.6}\n\n当前方向价差：{:+.3}%\n24h 时间加权基准：{:+.3}%\n高于基准：<b>{:+.3}%</b>\n\n当前价差显著高于近期加权基准，可关注 LONG 低价腿、SHORT 高价腿并等待价差回归。加权半衰期 6 小时；资金费与手续费仍需单独评估。",
                             html(&opportunity.token.symbol),
                             html(&opportunity.long.exchange),
                             opportunity.long.ask,
@@ -1710,7 +1710,7 @@ fn format_advisor(recommendation: &AdvisorResponse) -> String {
         "enter" => {
             let entry = recommendation.entry.as_ref().expect("entry recommendation");
             format!(
-                "🟢 <b>策略建议：允许入场</b>\n<b>{}</b> · LONG {} / SHORT {}\nAPY：{:.2}%（结算候选第 {} 名）\n回本时间：{:.2} 小时\n价差：当前 {:+.3}% / 24h 均值 {:+.3}% / 偏离 {:+.3}%\n下一结算：{}\n\n{}",
+                "🟢 <b>策略建议：允许入场</b>\n<b>{}</b> · LONG {} / SHORT {}\nAPY：{:.2}%（结算候选第 {} 名）\n回本时间：{:.2} 小时\n价差：当前 {:+.3}% / 24h 加权基准 {:+.3}% / 偏离 {:+.3}%\n下一结算：{}\n\n{}",
                 html(&entry.token),
                 html(&entry.long_exchange),
                 html(&entry.short_exchange),

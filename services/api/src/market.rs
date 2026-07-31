@@ -16,6 +16,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const BINANCE_FEE: f64 = 0.0005;
 const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
+const SPREAD_AVERAGE_HALF_LIFE_HOURS: f64 = 6.0;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 type SpreadAverageCache = HashMap<String, (Instant, f64)>;
@@ -1125,7 +1126,7 @@ impl MarketService {
             long.exchange, long.market, long.symbol, short.exchange, short.market, short.symbol
         );
         if let Some((at, average)) = self.spread_average_cache.read().await.get(&key) {
-            if at.elapsed() < Duration::from_secs(60 * 60) {
+            if at.elapsed() < Duration::from_secs(5 * 60) {
                 return Ok(*average);
             }
         }
@@ -1147,7 +1148,8 @@ impl MarketService {
         if aligned.is_empty() {
             bail!("no aligned Binance/Bybit hourly candles");
         }
-        let average = aligned.iter().map(|point| point.1).sum::<f64>() / aligned.len() as f64;
+        let average = time_weighted_spread_average(&aligned, SPREAD_AVERAGE_HALF_LIFE_HOURS)
+            .ok_or_else(|| anyhow!("weighted spread average is unavailable"))?;
         self.spread_average_cache
             .write()
             .await
@@ -1562,6 +1564,22 @@ fn live_quote_from_bybit(value: &Value) -> Option<LiveQuote> {
     })
 }
 
+fn time_weighted_spread_average(points: &[(i64, f64)], half_life_hours: f64) -> Option<f64> {
+    if points.is_empty() || !half_life_hours.is_finite() || half_life_hours <= 0.0 {
+        return None;
+    }
+    let latest_timestamp = points.iter().map(|point| point.0).max()?;
+    let (weighted_sum, weight_sum) = points.iter().fold(
+        (0.0, 0.0),
+        |(weighted_sum, weight_sum), (timestamp, spread)| {
+            let age_hours = (latest_timestamp - *timestamp).max(0) as f64 / (60.0 * 60.0 * 1_000.0);
+            let weight = 2.0_f64.powf(-age_hours / half_life_hours);
+            (weighted_sum + spread * weight, weight_sum + weight)
+        },
+    );
+    (weight_sum > f64::EPSILON).then_some(weighted_sum / weight_sum)
+}
+
 fn strategy_reference_price(mark_price: f64, last_price: f64) -> (f64, bool) {
     let uses_last_price = last_price > 0.0 && (mark_price - last_price).abs() / last_price > 0.001;
     if uses_last_price {
@@ -1792,6 +1810,34 @@ mod tests {
         assert_eq!(quote.ask, 2.665);
         assert_eq!(quote.bid_quantity, 45.2);
         assert_eq!(quote.ask_quantity, 4.4);
+    }
+
+    #[test]
+    fn weighted_spread_average_prioritizes_recent_hours() {
+        let hour = 60 * 60 * 1_000;
+        let points = vec![
+            (0, 0.10),
+            (18 * hour, 0.0),
+            (23 * hour, 0.0),
+            (24 * hour, 0.0),
+        ];
+        let simple_average = points.iter().map(|point| point.1).sum::<f64>() / points.len() as f64;
+        let weighted = time_weighted_spread_average(&points, 6.0).expect("weighted spread average");
+        assert!(weighted < simple_average / 2.0);
+    }
+
+    #[test]
+    fn weighted_spread_average_tracks_recent_spike_more_than_old_values() {
+        let hour = 60 * 60 * 1_000;
+        let points = vec![
+            (0, 0.0),
+            (18 * hour, 0.0),
+            (23 * hour, 0.0),
+            (24 * hour, 0.04),
+        ];
+        let simple_average = points.iter().map(|point| point.1).sum::<f64>() / points.len() as f64;
+        let weighted = time_weighted_spread_average(&points, 6.0).expect("weighted spread average");
+        assert!(weighted > simple_average);
     }
 
     #[tokio::test]

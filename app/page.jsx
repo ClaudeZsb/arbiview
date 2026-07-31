@@ -126,9 +126,9 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
             <small className="borrow-cost">借币成本 −{pct(item.borrowInterestPerHour, 4).replace("+", "")} / 小时</small>}
         </div>
       <div className="metric spread">
-        <span className="metric-label">当前 / 24h 平均价差</span>
+        <span className="metric-label">当前 / 24h 加权价差</span>
         <strong className={item.spread >= 0 ? "positive" : "negative"}>{pct(item.spread)}</strong>
-        <small>均值 {pct(item.averageSpread24h)} · 偏离 <b className={item.spreadVsAverage >= 0 ? "positive" : "negative"}>{pct(item.spreadVsAverage)}</b></small>
+        <small>加权基准 {pct(item.averageSpread24h)} · 偏离 <b className={item.spreadVsAverage >= 0 ? "positive" : "negative"}>{pct(item.spreadVsAverage)}</b></small>
         </div>
       <div className="metric breakeven">
         <span className="metric-label">预计回本</span>
@@ -1412,7 +1412,7 @@ export default function Dashboard() {
         <div className="method-title"><Info size={18} /><div><b>计算口径</b><span>帮助你正确理解展示数据</span></div></div>
         <div><span>01</span><p><b>可执行价格</b>Long 使用卖一价，Short 使用买一价；Long 低于 Short 时价差为正。</p></div>
         <div><span>02</span><p><b>资金 APY</b>跨所永续只计下一整点实际结算腿的完整费率；若两所周期不同，未在该整点结算的腿不计入。现货–永续仍按合约周期折算。</p></div>
-        <div><span>03</span><p><b>预计回本</b>以资金费率覆盖“当前方向价差 − 24h 平均方向价差”及双腿开平仓 taker 手续费；Binance 0.05%，Bybit 0.055%。</p></div>
+        <div><span>03</span><p><b>预计回本</b>以资金费率覆盖“当前方向价差 − 24h 时间加权方向价差”及双腿开平仓 taker 手续费；加权半衰期 6 小时，越近权重越高。Binance 0.05%，Bybit 0.055%。</p></div>
       </section>
 
       <footer><span><ShieldCheck size={15} />数据仅供研究，不构成投资建议</span><span>ARBIVIEW / 2026</span></footer>
