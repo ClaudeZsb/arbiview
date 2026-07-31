@@ -25,6 +25,56 @@ type FundingCache = Option<(i64, IncomeSummary, IncomeSummary)>;
 const SPREAD_GUARD_POLL_SECONDS: f64 = 0.25;
 const POSITION_SETTLEMENT_CHECKS: usize = 3;
 const SPREAD_GUARD_ORDER_CAP_USDT: f64 = 50.0;
+const SPREAD_RECOVERY_BATCHES: usize = 10;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SpreadRecovery {
+    debt_usdt: f64,
+    batches_remaining: usize,
+}
+
+impl SpreadRecovery {
+    fn open_threshold(&self, threshold: f64, next_notional: f64, available_batches: usize) -> f64 {
+        threshold + self.installment_ratio(next_notional, available_batches)
+    }
+
+    fn close_threshold(&self, threshold: f64, next_notional: f64, available_batches: usize) -> f64 {
+        threshold - self.installment_ratio(next_notional, available_batches)
+    }
+
+    fn record_open_batch(&mut self, threshold: f64, notional: f64, edge_value: f64) {
+        self.record_debt((self.debt_usdt + threshold * notional - edge_value).max(0.0));
+    }
+
+    fn record_close_batch(&mut self, threshold: f64, notional: f64, spread_value: f64) {
+        self.record_debt((self.debt_usdt + spread_value - threshold * notional).max(0.0));
+    }
+
+    fn installment_ratio(&self, next_notional: f64, available_batches: usize) -> f64 {
+        let installments = self.batches_remaining.min(available_batches);
+        if self.debt_usdt <= f64::EPSILON || installments == 0 || next_notional <= f64::EPSILON {
+            0.0
+        } else {
+            self.debt_usdt / (next_notional * installments as f64)
+        }
+    }
+
+    fn record_debt(&mut self, updated_debt: f64) {
+        if updated_debt <= f64::EPSILON {
+            self.debt_usdt = 0.0;
+            self.batches_remaining = 0;
+            return;
+        }
+        let new_adverse_fill =
+            self.debt_usdt <= f64::EPSILON || updated_debt > self.debt_usdt + f64::EPSILON;
+        self.debt_usdt = updated_debt;
+        self.batches_remaining = if new_adverse_fill {
+            SPREAD_RECOVERY_BATCHES
+        } else {
+            self.batches_remaining.saturating_sub(1).max(1)
+        };
+    }
+}
 
 #[derive(Clone, Default)]
 struct IncomeSummary {
@@ -1510,6 +1560,7 @@ impl TradingService {
         let mut unmatched_short = VecDeque::new();
         let mut completed = 0.0;
         let mut cumulative_edge_value = 0.0;
+        let mut spread_recovery = SpreadRecovery::default();
         let mut batch = 0usize;
         let mut consecutive_empty_attempts = 0u32;
         while request.target_notional_usdt - completed > 10.0 {
@@ -1531,8 +1582,10 @@ impl TradingService {
                 .await;
             let remaining = (request.target_notional_usdt - completed).max(0.0);
             let desired = SPREAD_GUARD_ORDER_CAP_USDT.min(remaining);
+            let available_batches =
+                (remaining / SPREAD_GUARD_ORDER_CAP_USDT).ceil().max(1.0) as usize;
             let effective_threshold =
-                required_next_spread(threshold, completed, cumulative_edge_value, desired);
+                spread_recovery.open_threshold(threshold, desired, available_batches);
             self.update_batch(&task_id, |task| {
                 task.effective_spread_threshold = Some(effective_threshold)
             })
@@ -1777,6 +1830,7 @@ impl TradingService {
             }
             completed = (completed + matched).min(request.target_notional_usdt);
             cumulative_edge_value += edge_value;
+            spread_recovery.record_open_batch(threshold, matched, edge_value);
             let cumulative_spread =
                 (completed > f64::EPSILON).then_some(cumulative_edge_value / completed);
             let current_position = self.positions().await.ok().and_then(|positions| {
@@ -1980,6 +2034,7 @@ impl TradingService {
         let mut realized_position_pnl = 0.0;
         let mut close_spread_threshold = request.close_spread_threshold;
         let mut cumulative_close_spread_value = 0.0;
+        let mut spread_recovery = SpreadRecovery::default();
         let mut batch = 0usize;
         while request.target_notional_usdt - completed > 10.0 {
             if self.batch_cancelled(&task_id).await {
@@ -2008,12 +2063,10 @@ impl TradingService {
             let original_threshold = *close_spread_threshold.get_or_insert(current_close_spread);
             let remaining = (request.target_notional_usdt - completed).max(0.0);
             let desired = SPREAD_GUARD_ORDER_CAP_USDT.min(remaining);
-            let effective_threshold = required_next_spread(
-                original_threshold,
-                completed,
-                cumulative_close_spread_value,
-                desired,
-            );
+            let available_batches =
+                (remaining / SPREAD_GUARD_ORDER_CAP_USDT).ceil().max(1.0) as usize;
+            let effective_threshold =
+                spread_recovery.close_threshold(original_threshold, desired, available_batches);
             self.update_batch(&task_id, |task| {
                 task.spread_threshold = Some(original_threshold);
                 task.current_spread = Some(current_close_spread);
@@ -2213,6 +2266,7 @@ impl TradingService {
             completed = (completed + matched).min(request.target_notional_usdt);
             realized_position_pnl += matched_pnl;
             cumulative_close_spread_value += matched_spread_value;
+            spread_recovery.record_close_batch(original_threshold, matched, matched_spread_value);
             let cumulative_close_spread =
                 (completed > f64::EPSILON).then_some(cumulative_close_spread_value / completed);
             let current_position =
@@ -4732,19 +4786,6 @@ fn match_guard_fills_with_edge(
     (matched, edge_value)
 }
 
-fn required_next_spread(
-    threshold: f64,
-    completed_notional: f64,
-    cumulative_edge_value: f64,
-    next_notional: f64,
-) -> f64 {
-    if next_notional <= f64::EPSILON {
-        threshold
-    } else {
-        (threshold * (completed_notional + next_notional) - cumulative_edge_value) / next_notional
-    }
-}
-
 fn close_unmatched_total(fills: &VecDeque<CloseUnmatchedFill>) -> f64 {
     fills.iter().map(|fill| fill.notional_usdt).sum()
 }
@@ -5628,7 +5669,7 @@ mod tests {
     }
 
     #[test]
-    fn market_supplement_shortfall_raises_the_next_required_spread() {
+    fn market_supplement_shortfall_is_amortized_over_ten_open_batches() {
         let mut long = VecDeque::from([GuardUnmatchedFill {
             notional_usdt: 20.0,
             price: 100.0,
@@ -5640,9 +5681,45 @@ mod tests {
         let (matched, edge_value) = match_guard_fills_with_edge(&mut long, &mut short);
         assert!((matched - 20.0).abs() < 1e-9);
         assert!((edge_value - 0.1).abs() < 1e-9);
-        assert!((required_next_spread(0.01, matched, edge_value, 20.0) - 0.015).abs() < 1e-9);
+        let mut recovery = SpreadRecovery::default();
+        recovery.record_open_batch(0.01, matched, edge_value);
+        assert_eq!(recovery.batches_remaining, 10);
+        assert!((recovery.debt_usdt - 0.1).abs() < 1e-9);
+        assert!((recovery.open_threshold(0.01, 20.0, 10) - 0.0105).abs() < 1e-9);
         assert!(long.is_empty());
         assert!(short.is_empty());
+    }
+
+    #[test]
+    fn successful_open_batches_pay_down_the_scheduled_debt() {
+        let mut recovery = SpreadRecovery {
+            debt_usdt: 1.0,
+            batches_remaining: 10,
+        };
+        let threshold = recovery.open_threshold(0.01, 50.0, 10);
+        assert!((threshold - 0.012).abs() < 1e-9);
+        recovery.record_open_batch(0.01, 50.0, 50.0 * threshold);
+        assert!((recovery.debt_usdt - 0.9).abs() < 1e-9);
+        assert_eq!(recovery.batches_remaining, 9);
+        assert!((recovery.open_threshold(0.01, 50.0, 9) - 0.012).abs() < 1e-9);
+    }
+
+    #[test]
+    fn close_spread_debt_is_amortized_toward_a_lower_maximum() {
+        let mut recovery = SpreadRecovery::default();
+        recovery.record_close_batch(0.01, 50.0, 0.75);
+        assert_eq!(recovery.batches_remaining, 10);
+        assert!((recovery.debt_usdt - 0.25).abs() < 1e-9);
+        assert!((recovery.close_threshold(0.01, 50.0, 10) - 0.0095).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spread_recovery_uses_the_actual_remaining_batches_near_task_end() {
+        let recovery = SpreadRecovery {
+            debt_usdt: 1.0,
+            batches_remaining: 10,
+        };
+        assert!((recovery.open_threshold(0.01, 50.0, 2) - 0.02).abs() < 1e-9);
     }
 
     #[test]
