@@ -1,4 +1,7 @@
 use crate::{
+    account_stream::{
+        spawn_binance_account_stream, spawn_bybit_account_stream, AccountBalance, AccountStore,
+    },
     config::{Config, ExchangeCredentials, TradingMode},
     market::MarketService,
     models::*,
@@ -136,6 +139,7 @@ pub struct TradingService {
     position_funding_baselines: Arc<RwLock<HashMap<String, f64>>>,
     protection_events: Arc<RwLock<Vec<HedgeProtectionEvent>>>,
     execution_lock: Arc<Mutex<()>>,
+    account_store: AccountStore,
 }
 
 impl TradingService {
@@ -164,7 +168,86 @@ impl TradingService {
             position_funding_baselines: Arc::new(RwLock::new(position_funding_baselines)),
             protection_events: Arc::new(RwLock::new(Vec::new())),
             execution_lock: Arc::new(Mutex::new(())),
+            account_store: AccountStore::default(),
         })
+    }
+
+    pub fn spawn_account_streams(&self) {
+        if self.config.trading_mode != TradingMode::Live {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let (binance_balance, binance_positions, bybit_balance, bybit_positions) = tokio::join!(
+                service.fetch_binance_balance(),
+                service.fetch_binance_positions(),
+                service.fetch_bybit_balance(),
+                service.fetch_bybit_positions()
+            );
+            match (binance_balance, binance_positions) {
+                (Ok(balance), Ok(positions)) => {
+                    service.account_store.seed_binance(balance, positions).await;
+                }
+                (balance, positions) => tracing::warn!(
+                    "Binance account stream bootstrap failed: balance={:?}, positions={:?}",
+                    balance.err(),
+                    positions.err()
+                ),
+            }
+            match (bybit_balance, bybit_positions) {
+                (Ok(balance), Ok(positions)) => {
+                    service.account_store.seed_bybit(balance, positions).await;
+                }
+                (balance, positions) => tracing::warn!(
+                    "Bybit account stream bootstrap failed: balance={:?}, positions={:?}",
+                    balance.err(),
+                    positions.err()
+                ),
+            }
+            if let Some(credentials) = service.config.binance.clone() {
+                spawn_binance_account_stream(
+                    service.client.clone(),
+                    credentials,
+                    service.account_store.clone(),
+                );
+            }
+            if let Some(credentials) = service.config.bybit.clone() {
+                spawn_bybit_account_stream(credentials, service.account_store.clone());
+            }
+            let mut binance_connected = false;
+            let mut bybit_connected = false;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let current_binance = service.account_store.connected("Binance").await;
+                let current_bybit = service.account_store.connected("Bybit").await;
+                if current_binance && !binance_connected {
+                    match tokio::try_join!(
+                        service.fetch_binance_balance(),
+                        service.fetch_binance_positions()
+                    ) {
+                        Ok((balance, positions)) => {
+                            service.account_store.seed_binance(balance, positions).await
+                        }
+                        Err(error) => {
+                            tracing::warn!("Binance reconnect snapshot failed: {error:#}")
+                        }
+                    }
+                }
+                if current_bybit && !bybit_connected {
+                    match tokio::try_join!(
+                        service.fetch_bybit_balance(),
+                        service.fetch_bybit_positions()
+                    ) {
+                        Ok((balance, positions)) => {
+                            service.account_store.seed_bybit(balance, positions).await
+                        }
+                        Err(error) => tracing::warn!("Bybit reconnect snapshot failed: {error:#}"),
+                    }
+                }
+                binance_connected = current_binance;
+                bybit_connected = current_bybit;
+            }
+        });
     }
 
     pub fn spawn_auto_close_monitor(&self) {
@@ -216,6 +299,17 @@ impl TradingService {
             protected_tokens,
             events: self.protection_events.read().await.clone(),
         }
+    }
+
+    pub async fn account_stream_status(&self) -> Value {
+        json!({
+            "binance": {
+                "connected": self.account_store.connected("Binance").await
+            },
+            "bybit": {
+                "connected": self.account_store.connected("Bybit").await
+            }
+        })
     }
 
     async fn inspect_hedge_protection(&self) -> Result<()> {
@@ -3448,7 +3542,13 @@ impl TradingService {
         {
             Ok(response) => response,
             Err(submit_error) => {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                if let Some(order) = self
+                    .account_store
+                    .wait_for_order(client_order_id, Duration::from_secs(2))
+                    .await
+                {
+                    return confirmed_order_or_error(order);
+                }
                 let status_query = format!(
                     "symbol={symbol}&origClientOrderId={client_order_id}&timestamp={}",
                     chrono::Utc::now().timestamp_millis()
@@ -3469,16 +3569,19 @@ impl TradingService {
             )
         };
         let mut fill = binance_fill(&response);
-        if limit_price.is_none() && (fill.1 <= 0.0 || fill.2 <= 0.0) {
-            for _ in 0..8 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+        if fill.1 <= 0.0 || fill.2 <= 0.0 {
+            if let Some(order) = self
+                .account_store
+                .wait_for_order(client_order_id, Duration::from_secs(2))
+                .await
+            {
+                return confirmed_order_or_error(order);
+            }
+            if limit_price.is_none() {
                 response = self
                     .binance_signed(Method::GET, "/fapi/v1/order", &status_query(), creds)
                     .await?;
                 fill = binance_fill(&response);
-                if fill.0 == "FILLED" && fill.1 > 0.0 && fill.2 > 0.0 {
-                    break;
-                }
             }
         }
         if fill.1 <= 0.0 || fill.2 <= 0.0 {
@@ -3630,65 +3733,40 @@ impl TradingService {
             .and_then(|response| response["result"]["orderId"].as_str())
             .unwrap_or("")
             .to_string();
-        let mut partial_quantity = 0.0;
-        let mut partial_average_price = 0.0;
-        for _ in 0..8 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            let path = format!(
-                "/v5/order/realtime?category=linear&symbol={symbol}&orderLinkId={client_order_id}"
-            );
-            let status_response = self.bybit_signed(Method::GET, &path, None).await?;
-            if status_response["retCode"].as_i64().unwrap_or(-1) != 0 {
-                bail!("Bybit order status failed: {}", status_response["retMsg"]);
-            }
-            if let Some(order) = status_response["result"]["list"]
-                .as_array()
-                .and_then(|orders| orders.first())
-            {
-                let status = order["orderStatus"].as_str().unwrap_or("Unknown");
-                partial_quantity = number(&order["cumExecQty"]).unwrap_or(0.0);
-                partial_average_price = number(&order["avgPrice"]).unwrap_or(0.0);
-                if status == "Filled" {
-                    return Ok(OrderExecution {
-                        exchange: "Bybit".into(),
-                        client_order_id: client_order_id.into(),
-                        order_id,
-                        status: status.into(),
-                        executed_quantity: number(&order["cumExecQty"]).unwrap_or(0.0),
-                        average_price: number(&order["avgPrice"]).unwrap_or(0.0),
-                    });
-                }
-                if matches!(status, "Rejected" | "Cancelled" | "Deactivated") {
-                    if partial_quantity > 0.0 && partial_average_price > 0.0 {
-                        return Ok(OrderExecution {
-                            exchange: "Bybit".into(),
-                            client_order_id: client_order_id.into(),
-                            order_id,
-                            status: "PartiallyFilled".into(),
-                            executed_quantity: partial_quantity,
-                            average_price: partial_average_price,
-                        });
-                    }
-                    bail!(
-                        "Bybit order ended with status={status}, clientOrderId={client_order_id}"
-                    );
-                }
-            }
+        if let Some(order) = self
+            .account_store
+            .wait_for_order(client_order_id, Duration::from_secs(3))
+            .await
+        {
+            return confirmed_order_or_error(order);
         }
         if let Err(submit_error) = submit {
             bail!(
                 "Bybit submit result unknown ({submit_error:#}); confirmation timed out; query orderLinkId={client_order_id} before any retry"
             );
         }
-        if partial_quantity > 0.0 {
-            return Ok(OrderExecution {
+        // Private order websocket is the primary confirmation path. A single
+        // REST lookup remains as a disconnect/recovery fallback.
+        let path = format!(
+            "/v5/order/realtime?category=linear&symbol={symbol}&orderLinkId={client_order_id}"
+        );
+        let status_response = self.bybit_signed(Method::GET, &path, None).await?;
+        if status_response["retCode"].as_i64().unwrap_or(-1) != 0 {
+            bail!("Bybit order status failed: {}", status_response["retMsg"]);
+        }
+        if let Some(value) = status_response["result"]["list"]
+            .as_array()
+            .and_then(|orders| orders.first())
+        {
+            let order = OrderExecution {
                 exchange: "Bybit".into(),
                 client_order_id: client_order_id.into(),
                 order_id,
-                status: "PartiallyFilled".into(),
-                executed_quantity: partial_quantity,
-                average_price: partial_average_price,
-            });
+                status: value["orderStatus"].as_str().unwrap_or("Unknown").into(),
+                executed_quantity: number(&value["cumExecQty"]).unwrap_or(0.0),
+                average_price: number(&value["avgPrice"]).unwrap_or(0.0),
+            };
+            return confirmed_order_or_error(order);
         }
         bail!("Bybit order confirmation timed out; query orderLinkId={client_order_id} before any retry")
     }
@@ -4004,6 +4082,18 @@ impl TradingService {
     }
 
     async fn binance_positions(&self) -> Result<Vec<PositionLeg>> {
+        if let Some((_, positions)) = self.account_store.snapshot("Binance").await {
+            return Ok(positions);
+        }
+        let (balance, positions) =
+            tokio::try_join!(self.fetch_binance_balance(), self.fetch_binance_positions())?;
+        self.account_store
+            .seed_binance(balance, positions.clone())
+            .await;
+        Ok(positions)
+    }
+
+    async fn fetch_binance_positions(&self) -> Result<Vec<PositionLeg>> {
         let creds = self
             .config
             .binance
@@ -4040,6 +4130,18 @@ impl TradingService {
     }
 
     async fn bybit_positions(&self) -> Result<Vec<PositionLeg>> {
+        if let Some((_, positions)) = self.account_store.snapshot("Bybit").await {
+            return Ok(positions);
+        }
+        let (balance, positions) =
+            tokio::try_join!(self.fetch_bybit_balance(), self.fetch_bybit_positions())?;
+        self.account_store
+            .seed_bybit(balance, positions.clone())
+            .await;
+        Ok(positions)
+    }
+
+    async fn fetch_bybit_positions(&self) -> Result<Vec<PositionLeg>> {
         let json = self
             .bybit_signed(
                 Method::GET,
@@ -4205,6 +4307,16 @@ impl TradingService {
     }
 
     async fn binance_balance(&self) -> Result<(f64, f64, f64)> {
+        if let Some((balance, _)) = self.account_store.snapshot("Binance").await {
+            return Ok((balance.equity, balance.available, balance.unrealized_pnl));
+        }
+        let (balance, positions) =
+            tokio::try_join!(self.fetch_binance_balance(), self.fetch_binance_positions())?;
+        self.account_store.seed_binance(balance, positions).await;
+        Ok((balance.equity, balance.available, balance.unrealized_pnl))
+    }
+
+    async fn fetch_binance_balance(&self) -> Result<AccountBalance> {
         let creds = self
             .config
             .binance
@@ -4214,14 +4326,24 @@ impl TradingService {
         let json = self
             .binance_signed(Method::GET, "/fapi/v2/account", &query, creds)
             .await?;
-        Ok((
-            number(&json["totalWalletBalance"]).unwrap_or(0.0),
-            number(&json["availableBalance"]).unwrap_or(0.0),
-            number(&json["totalUnrealizedProfit"]).unwrap_or(0.0),
-        ))
+        Ok(AccountBalance {
+            equity: number(&json["totalWalletBalance"]).unwrap_or(0.0),
+            available: number(&json["availableBalance"]).unwrap_or(0.0),
+            unrealized_pnl: number(&json["totalUnrealizedProfit"]).unwrap_or(0.0),
+        })
     }
 
     async fn bybit_balance(&self) -> Result<(f64, f64, f64)> {
+        if let Some((balance, _)) = self.account_store.snapshot("Bybit").await {
+            return Ok((balance.equity, balance.available, balance.unrealized_pnl));
+        }
+        let (balance, positions) =
+            tokio::try_join!(self.fetch_bybit_balance(), self.fetch_bybit_positions())?;
+        self.account_store.seed_bybit(balance, positions).await;
+        Ok((balance.equity, balance.available, balance.unrealized_pnl))
+    }
+
+    async fn fetch_bybit_balance(&self) -> Result<AccountBalance> {
         let json = self
             .bybit_signed(
                 Method::GET,
@@ -4233,11 +4355,11 @@ impl TradingService {
             .as_array()
             .and_then(|x| x.first())
             .ok_or_else(|| anyhow!("Bybit wallet missing"))?;
-        Ok((
-            number(&account["totalEquity"]).unwrap_or(0.0),
-            number(&account["totalAvailableBalance"]).unwrap_or(0.0),
-            number(&account["totalPerpUPL"]).unwrap_or(0.0),
-        ))
+        Ok(AccountBalance {
+            equity: number(&account["totalEquity"]).unwrap_or(0.0),
+            available: number(&account["totalAvailableBalance"]).unwrap_or(0.0),
+            unrealized_pnl: number(&account["totalPerpUPL"]).unwrap_or(0.0),
+        })
     }
 
     async fn binance_signed(
@@ -4750,6 +4872,24 @@ fn is_ioc_no_fill(error: &str) -> bool {
         || normalized.contains("status=canceled")
         || normalized.contains("order ended with status=cancelled")
         || normalized.contains("order ended with status=canceled")
+}
+
+fn confirmed_order_or_error(mut order: OrderExecution) -> Result<OrderExecution> {
+    if order.executed_quantity > 0.0 && order.average_price > 0.0 {
+        if matches!(
+            order.status.as_str(),
+            "CANCELED" | "EXPIRED" | "Cancelled" | "Canceled"
+        ) {
+            order.status = "PartiallyFilled".into();
+        }
+        return Ok(order);
+    }
+    bail!(
+        "{} order ended with status={}, clientOrderId={}",
+        order.exchange,
+        order.status,
+        order.client_order_id
+    )
 }
 
 fn executable_top_notional(opportunity: &Opportunity) -> f64 {

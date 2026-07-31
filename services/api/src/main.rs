@@ -1,3 +1,4 @@
+mod account_stream;
 mod advisor;
 mod config;
 mod market;
@@ -56,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     });
     state.trading.spawn_auto_close_monitor();
     state.trading.spawn_hedge_protection_monitor();
+    state.trading.spawn_account_streams();
     if let Some(telegram) = config.telegram.clone() {
         telegram::spawn(telegram, state.clone());
     }
@@ -75,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
             get(opportunity_history),
         )
         .route("/api/account/summary", get(account_summary))
+        .route("/api/account/stream-status", get(account_stream_status))
         .route("/api/account/hedge-protection", get(hedge_protection))
         .route("/api/auto-close", get(auto_close_rules))
         .route("/api/auto-close/:id/cancel", post(cancel_auto_close))
@@ -124,6 +127,12 @@ async fn position_quotes(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.market.position_quotes().await?))
+}
+
+async fn account_stream_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.trading.account_stream_status().await))
 }
 
 async fn spread_history(
