@@ -151,7 +151,8 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
 function SpreadOpportunityCard({ item, index, onTrade }) {
   const fundingCostPerHour = Math.max(0, -item.fundingPerHour);
   const fundingImpact8h = item.fundingPerHour * 8;
-  const edgeAfterFees = item.spread - item.fees;
+  const weightedDeviation = item.spreadVsAverage ?? (item.spread - item.averageSpread24h);
+  const edgeAfterFees = weightedDeviation - item.fees;
   const costLimitHours = fundingCostPerHour > 0
     ? Math.max(0, edgeAfterFees) / fundingCostPerHour
     : null;
@@ -167,7 +168,7 @@ function SpreadOpportunityCard({ item, index, onTrade }) {
         <ArrowRight size={15} />
         <div><i className="side-dot short" /><span>SHORT · {item.short.exchange}</span><b>{price(item.short.bid)}</b></div>
       </div>
-      <div className="spread-stat"><span>可执行价差</span><strong>{pct(item.spread)}</strong><small>扣往返费后 {pct(edgeAfterFees)}</small></div>
+      <div className="spread-stat"><span>相对加权价差偏离</span><strong className={weightedDeviation >= 0 ? "positive" : "negative"}>{pct(weightedDeviation)}</strong><small>当前 {pct(item.spread)} · 加权基准 {pct(item.averageSpread24h)} · 扣费后 {pct(edgeAfterFees)}</small></div>
       <div className="spread-stat"><span>Funding 影响</span><strong className={fundingImpact8h >= 0 ? "positive" : "negative"}>{fundingImpact8h >= 0 ? "预计收入 " : "预计成本 "}{pct(Math.abs(fundingImpact8h))} / 8h</strong><small>净值 {pct(item.fundingPerHour, 4)} / 小时</small></div>
       <div className="spread-stat"><span>成本承受时间</span><strong>{costLimitHours === null ? "无 Funding 成本" : duration(costLimitHours)}</strong><small>{costLimitHours === null ? "当前 Funding 反而增厚收益" : "Funding 消耗净价差的估算时间"}</small></div>
       <button className="trade-button" onClick={() => onTrade(item)}><Zap size={13} />开仓</button>
@@ -1266,7 +1267,9 @@ export default function Dashboard() {
     () => (data?.spreadOpportunities || [])
       .filter((item) => [item.token.symbol, item.token.name, ...(item.token.tags || [])]
         .some((value) => value.toLowerCase().includes(query.toLowerCase())))
-      .sort((a, b) => b.spread - a.spread),
+      .sort((a, b) =>
+        (b.spreadVsAverage ?? b.spread - b.averageSpread24h)
+        - (a.spreadVsAverage ?? a.spread - a.averageSpread24h)),
     [data, query]
   );
   useEffect(() => {
@@ -1404,14 +1407,14 @@ export default function Dashboard() {
             <div className="section-kicker"><ArrowDownUp size={15} /> PRICE SPREAD ARBITRAGE</div>
             <h2>价差套利 <span>{spreadRows.length}</span></h2>
           </div>
-          <div className="configured">仅展示可执行价差 &gt; 0.5% · Funding 成本按当前费率估算</div>
+          <div className="configured">机会入选仍基于当前可执行价差 · UI 按相对 24h 时间加权基准的偏离排序</div>
         </div>
-        <div className="spread-column-head"><span>资产</span><span>执行路径</span><span>价差</span><span>Funding 成本</span><span>成本承受时间</span></div>
+        <div className="spread-column-head"><span>资产</span><span>执行路径</span><span>加权偏离</span><span>Funding 成本</span><span>成本承受时间</span></div>
         <div className="spread-list">
           {!loading && !error && spreadRows.length === 0 && <div className="state compact">当前没有价差超过 0.5% 的共同合约</div>}
           {spreadRows.map((item, index) => <SpreadOpportunityCard key={`spread-${item.id}`} item={item} index={index} onTrade={setTradeItem} />)}
         </div>
-        <p className="spread-note">价差收益依赖两所价格最终收敛；Funding 成本按当前费率和结算周期线性估算，实际费率可能在持仓期间变化。</p>
+        <p className="spread-note">加权偏离 = 当前可执行方向价差 − 24h 时间加权方向价差（半衰期 6 小时）；成本承受时间按偏离扣除往返手续费后计算。Funding 成本按当前费率线性估算。</p>
       </section>
 
       <section className="methodology" id="methodology">
