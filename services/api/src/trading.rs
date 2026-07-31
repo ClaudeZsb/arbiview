@@ -109,6 +109,7 @@ struct GuardUnmatchedFill {
 struct CloseUnmatchedFill {
     notional_usdt: f64,
     pnl_ratio: f64,
+    price: f64,
 }
 
 #[derive(Clone)]
@@ -1191,7 +1192,10 @@ impl TradingService {
             },
             leverage: None,
             spread_guard: false,
-            spread_threshold: None,
+            spread_threshold: request
+                .no_loss_guard
+                .then_some(request.close_spread_threshold)
+                .flatten(),
             current_spread: None,
             effective_spread_threshold: None,
             cumulative_filled_spread: None,
@@ -1930,6 +1934,8 @@ impl TradingService {
         let mut unmatched_short = VecDeque::<CloseUnmatchedFill>::new();
         let mut completed = 0.0;
         let mut realized_position_pnl = 0.0;
+        let mut close_spread_threshold = request.close_spread_threshold;
+        let mut cumulative_close_spread_value = 0.0;
         let mut batch = 0usize;
         while request.target_notional_usdt - completed > 10.0 {
             if self.batch_cancelled(&task_id).await {
@@ -1953,8 +1959,29 @@ impl TradingService {
                 (long_quote.bid - position.long.entry_price) / long_quote.bid.max(f64::EPSILON);
             let short_pnl_ratio =
                 (position.short.entry_price - short_quote.ask) / short_quote.ask.max(f64::EPSILON);
+            let current_close_spread =
+                (short_quote.ask - long_quote.bid) / long_quote.bid.max(f64::EPSILON);
+            let original_threshold = *close_spread_threshold.get_or_insert(current_close_spread);
             let remaining = (request.target_notional_usdt - completed).max(0.0);
             let desired = SPREAD_GUARD_ORDER_CAP_USDT.min(remaining);
+            let effective_threshold = required_next_spread(
+                original_threshold,
+                completed,
+                cumulative_close_spread_value,
+                desired,
+            );
+            self.update_batch(&task_id, |task| {
+                task.spread_threshold = Some(original_threshold);
+                task.current_spread = Some(current_close_spread);
+                task.effective_spread_threshold = Some(effective_threshold);
+            })
+            .await;
+            if !close_spread_guard_allows(current_close_spread, effective_threshold) {
+                self.record_spread_wait(&task_id, Some(current_close_spread))
+                    .await;
+                tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
+                continue;
+            }
             let long_notional = desired;
             let short_notional = desired;
             let mut projected_long = unmatched_long.clone();
@@ -1963,15 +1990,18 @@ impl TradingService {
                 projected_long.push_back(CloseUnmatchedFill {
                     notional_usdt: long_notional,
                     pnl_ratio: long_pnl_ratio,
+                    price: long_quote.bid,
                 });
             }
             if short_notional > 0.0 {
                 projected_short.push_back(CloseUnmatchedFill {
                     notional_usdt: short_notional,
                     pnl_ratio: short_pnl_ratio,
+                    price: short_quote.ask,
                 });
             }
-            let (_, projected_pnl) = match_close_fills(&mut projected_long, &mut projected_short);
+            let (_, projected_pnl, _) =
+                match_close_fills(&mut projected_long, &mut projected_short);
             self.update_batch(&task_id, |task| {
                 task.current_close_pnl_usdt = Some(realized_position_pnl + projected_pnl)
             })
@@ -2025,6 +2055,7 @@ impl TradingService {
                         notional_usdt: notional,
                         pnl_ratio: (order.average_price - position.long.entry_price)
                             / order.average_price,
+                        price: order.average_price,
                     });
                     logs.push(no_loss_batch_log(&position, batch, "long", &order, false));
                 }
@@ -2036,11 +2067,12 @@ impl TradingService {
                         notional_usdt: notional,
                         pnl_ratio: (position.short.entry_price - order.average_price)
                             / order.average_price,
+                        price: order.average_price,
                     });
                     logs.push(no_loss_batch_log(&position, batch, "short", &order, false));
                 }
             }
-            let (mut matched, mut matched_pnl) =
+            let (mut matched, mut matched_pnl, mut matched_spread_value) =
                 match_close_fills(&mut unmatched_long, &mut unmatched_short);
             for attempt in 1..=MAX_RECONCILIATION_ATTEMPTS {
                 let long_excess = close_unmatched_total(&unmatched_long);
@@ -2100,21 +2132,24 @@ impl TradingService {
                         notional_usdt: notional,
                         pnl_ratio: (order.average_price - position.long.entry_price)
                             / order.average_price,
+                        price: order.average_price,
                     });
                 } else {
                     unmatched_short.push_back(CloseUnmatchedFill {
                         notional_usdt: notional,
                         pnl_ratio: (position.short.entry_price - order.average_price)
                             / order.average_price,
+                        price: order.average_price,
                     });
                 }
                 logs.push(no_loss_market_supplement_log(
                     &position, batch, side, &order,
                 ));
-                let (newly_matched, new_pnl) =
+                let (newly_matched, new_pnl, new_spread_value) =
                     match_close_fills(&mut unmatched_long, &mut unmatched_short);
                 matched += newly_matched;
                 matched_pnl += new_pnl;
+                matched_spread_value += new_spread_value;
             }
             let residual = (close_unmatched_total(&unmatched_long)
                 - close_unmatched_total(&unmatched_short))
@@ -2133,6 +2168,9 @@ impl TradingService {
             }
             completed = (completed + matched).min(request.target_notional_usdt);
             realized_position_pnl += matched_pnl;
+            cumulative_close_spread_value += matched_spread_value;
+            let cumulative_close_spread =
+                (completed > f64::EPSILON).then_some(cumulative_close_spread_value / completed);
             let current_position =
                 self.positions().await.ok().and_then(|positions| {
                     positions.into_iter().find(|item| item.id == position.id)
@@ -2142,6 +2180,7 @@ impl TradingService {
                 task.completed_batches = batch;
                 task.current_position = current_position;
                 task.current_close_pnl_usdt = Some(realized_position_pnl);
+                task.cumulative_filled_spread = cumulative_close_spread;
                 for mut log in logs {
                     log.sequence = task.logs.len() + 1;
                     task.logs.push(log);
@@ -4671,13 +4710,16 @@ fn close_unmatched_total(fills: &VecDeque<CloseUnmatchedFill>) -> f64 {
 fn match_close_fills(
     long: &mut VecDeque<CloseUnmatchedFill>,
     short: &mut VecDeque<CloseUnmatchedFill>,
-) -> (f64, f64) {
+) -> (f64, f64, f64) {
     let mut matched = 0.0;
     let mut pnl = 0.0;
+    let mut spread_value = 0.0;
     while let (Some(long_fill), Some(short_fill)) = (long.front_mut(), short.front_mut()) {
         let amount = long_fill.notional_usdt.min(short_fill.notional_usdt);
         matched += amount;
         pnl += amount * (long_fill.pnl_ratio + short_fill.pnl_ratio);
+        spread_value +=
+            amount * (short_fill.price - long_fill.price) / long_fill.price.max(f64::EPSILON);
         long_fill.notional_usdt -= amount;
         short_fill.notional_usdt -= amount;
         if long_fill.notional_usdt <= f64::EPSILON {
@@ -4687,7 +4729,7 @@ fn match_close_fills(
             short.pop_front();
         }
     }
-    (matched, pnl)
+    (matched, pnl, spread_value)
 }
 
 fn no_loss_next_batch_allowed(realized_position_pnl: f64, projected_batch_pnl: f64) -> bool {
@@ -4882,6 +4924,10 @@ fn format_price(value: f64) -> String {
 
 fn spread_guard_allows(current: f64, threshold: f64) -> bool {
     current + f64::EPSILON >= threshold
+}
+
+fn close_spread_guard_allows(current: f64, maximum: f64) -> bool {
+    current <= maximum + 1e-12
 }
 
 fn is_ioc_no_fill(error: &str) -> bool {
@@ -5494,6 +5540,13 @@ mod tests {
     }
 
     #[test]
+    fn close_spread_guard_prefers_the_numerically_lower_spread() {
+        assert!(close_spread_guard_allows(-0.02, -0.015));
+        assert!(close_spread_guard_allows(-0.015, -0.015));
+        assert!(!close_spread_guard_allows(-0.01, -0.015));
+    }
+
+    #[test]
     fn spread_guard_uses_the_smaller_top_of_book_capacity() {
         let mut opportunity = Opportunity {
             id: "DEXE".into(),
@@ -5555,24 +5608,29 @@ mod tests {
         let mut long = VecDeque::from([CloseUnmatchedFill {
             notional_usdt: 50.0,
             pnl_ratio: 0.02,
+            price: 100.0,
         }]);
         let mut short = VecDeque::from([CloseUnmatchedFill {
             notional_usdt: 50.0,
             pnl_ratio: -0.015,
+            price: 101.0,
         }]);
-        let (matched, pnl) = match_close_fills(&mut long, &mut short);
+        let (matched, pnl, spread_value) = match_close_fills(&mut long, &mut short);
         assert!((matched - 50.0).abs() < 1e-9);
         assert!((pnl - 0.25).abs() < 1e-9);
+        assert!((spread_value - 0.5).abs() < 1e-9);
 
         let mut long = VecDeque::from([CloseUnmatchedFill {
             notional_usdt: 50.0,
             pnl_ratio: 0.01,
+            price: 100.0,
         }]);
         let mut short = VecDeque::from([CloseUnmatchedFill {
             notional_usdt: 50.0,
             pnl_ratio: -0.02,
+            price: 102.0,
         }]);
-        let (_, pnl) = match_close_fills(&mut long, &mut short);
+        let (_, pnl, _) = match_close_fills(&mut long, &mut short);
         assert!(pnl < 0.0);
         assert!(!no_loss_next_batch_allowed(-0.40, 0.30));
         assert!(no_loss_next_batch_allowed(-0.40, 0.40));

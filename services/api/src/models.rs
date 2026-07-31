@@ -189,6 +189,7 @@ pub struct BatchReduceRequest {
     pub interval_seconds: f64,
     #[serde(default)]
     pub no_loss_guard: bool,
+    pub close_spread_threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
