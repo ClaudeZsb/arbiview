@@ -1,5 +1,6 @@
 use crate::{config::Config, models::*};
 use anyhow::{anyhow, bail, Context, Result};
+use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde_json::Value;
@@ -10,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, RwLock};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const BINANCE_FEE: f64 = 0.0005;
 const BYBIT_FEE: f64 = 0.00055;
@@ -20,6 +22,16 @@ type SpreadAverageCache = HashMap<String, (Instant, f64)>;
 type BorrowRateCache = HashMap<String, (Instant, f64)>;
 type BorrowAvailabilityCache = HashMap<String, (Instant, bool)>;
 type RouteLegCache = HashMap<String, Leg>;
+type LiveQuoteCache = HashMap<String, LiveQuote>;
+
+#[derive(Clone, Copy)]
+struct LiveQuote {
+    at: Instant,
+    bid: f64,
+    ask: f64,
+    bid_quantity: f64,
+    ask_quantity: f64,
+}
 
 fn latest_rate_at(rates: &[(i64, f64)], timestamp: i64) -> Option<f64> {
     rates
@@ -48,6 +60,8 @@ pub struct MarketService {
     borrow_rate_cache: Arc<RwLock<BorrowRateCache>>,
     borrow_availability_cache: Arc<RwLock<BorrowAvailabilityCache>>,
     route_leg_cache: Arc<RwLock<RouteLegCache>>,
+    live_quote_cache: Arc<RwLock<LiveQuoteCache>>,
+    live_quote_streams: Arc<Mutex<HashSet<String>>>,
 }
 
 impl MarketService {
@@ -69,6 +83,8 @@ impl MarketService {
             borrow_rate_cache: Arc::new(RwLock::new(HashMap::new())),
             borrow_availability_cache: Arc::new(RwLock::new(HashMap::new())),
             route_leg_cache: Arc::new(RwLock::new(HashMap::new())),
+            live_quote_cache: Arc::new(RwLock::new(HashMap::new())),
+            live_quote_streams: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -334,6 +350,62 @@ impl MarketService {
     }
 
     pub async fn refresh_leg_quote(&self, leg: &Leg) -> Result<Leg> {
+        let key = route_leg_key(&leg.exchange, &leg.market, &leg.symbol);
+        if let Some(quote) = self.fresh_live_quote(&key).await {
+            return Ok(apply_live_quote(leg, quote));
+        }
+        self.ensure_live_quote_stream(leg).await;
+        // A newly-created stream normally publishes immediately. Waiting here
+        // keeps the first protected order off REST without delaying later loops.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(quote) = self.fresh_live_quote(&key).await {
+                return Ok(apply_live_quote(leg, quote));
+            }
+        }
+        tracing::warn!(
+            exchange = leg.exchange,
+            market = leg.market,
+            symbol = leg.symbol,
+            "websocket quote is not ready; using one REST bootstrap quote"
+        );
+        let refreshed = self.refresh_leg_quote_rest(leg).await?;
+        self.live_quote_cache.write().await.insert(
+            key,
+            LiveQuote {
+                at: Instant::now(),
+                bid: refreshed.bid,
+                ask: refreshed.ask,
+                bid_quantity: refreshed.bid_quantity,
+                ask_quantity: refreshed.ask_quantity,
+            },
+        );
+        Ok(refreshed)
+    }
+
+    async fn fresh_live_quote(&self, key: &str) -> Option<LiveQuote> {
+        self.live_quote_cache
+            .read()
+            .await
+            .get(key)
+            .copied()
+            .filter(|quote| quote.at.elapsed() <= Duration::from_secs(5))
+    }
+
+    async fn ensure_live_quote_stream(&self, leg: &Leg) {
+        let key = route_leg_key(&leg.exchange, &leg.market, &leg.symbol);
+        let mut streams = self.live_quote_streams.lock().await;
+        if !streams.insert(key.clone()) {
+            return;
+        }
+        let leg = leg.clone();
+        let cache = self.live_quote_cache.clone();
+        tokio::spawn(async move {
+            live_quote_stream_loop(leg, key, cache).await;
+        });
+    }
+
+    async fn refresh_leg_quote_rest(&self, leg: &Leg) -> Result<Leg> {
         let value: Value = match (leg.exchange.as_str(), leg.market.as_str()) {
             ("Binance", "perpetual") => {
                 self.get_json(format!(
@@ -1327,6 +1399,149 @@ impl MarketService {
     }
 }
 
+fn apply_live_quote(leg: &Leg, quote: LiveQuote) -> Leg {
+    let mut refreshed = leg.clone();
+    refreshed.bid = quote.bid;
+    refreshed.ask = quote.ask;
+    refreshed.bid_quantity = quote.bid_quantity;
+    refreshed.ask_quantity = quote.ask_quantity;
+    refreshed
+}
+
+async fn live_quote_stream_loop(leg: Leg, key: String, cache: Arc<RwLock<LiveQuoteCache>>) {
+    let mut retry_seconds = 1u64;
+    loop {
+        match run_live_quote_stream(&leg, &key, &cache).await {
+            Ok(()) => tracing::warn!(
+                exchange = leg.exchange,
+                market = leg.market,
+                symbol = leg.symbol,
+                "quote websocket closed"
+            ),
+            Err(error) => tracing::warn!(
+                exchange = leg.exchange,
+                market = leg.market,
+                symbol = leg.symbol,
+                "quote websocket failed: {error:#}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
+        retry_seconds = (retry_seconds * 2).min(30);
+    }
+}
+
+async fn run_live_quote_stream(
+    leg: &Leg,
+    key: &str,
+    cache: &Arc<RwLock<LiveQuoteCache>>,
+) -> Result<()> {
+    let (url, subscription) = match (leg.exchange.as_str(), leg.market.as_str()) {
+        ("Binance", "perpetual") => (
+            format!(
+                "wss://fstream.binance.com/ws/{}@bookTicker",
+                leg.symbol.to_ascii_lowercase()
+            ),
+            None,
+        ),
+        ("Binance", "spot") => (
+            format!(
+                "wss://stream.binance.com:9443/ws/{}@bookTicker",
+                leg.symbol.to_ascii_lowercase()
+            ),
+            None,
+        ),
+        ("Bybit", "perpetual") => (
+            "wss://stream.bybit.com/v5/public/linear".to_string(),
+            Some(serde_json::json!({
+                "op": "subscribe",
+                "args": [format!("tickers.{}", leg.symbol)]
+            })),
+        ),
+        ("Bybit", "spot") => (
+            "wss://stream.bybit.com/v5/public/spot".to_string(),
+            Some(serde_json::json!({
+                "op": "subscribe",
+                "args": [format!("tickers.{}", leg.symbol)]
+            })),
+        ),
+        _ => bail!("unsupported websocket quote route"),
+    };
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), connect_async(&url))
+        .await
+        .with_context(|| format!("connect {url} timed out"))?
+        .with_context(|| format!("connect {url}"))?;
+    if let Some(subscription) = subscription {
+        socket
+            .send(Message::Text(subscription.to_string().into()))
+            .await?;
+    }
+    tracing::info!(
+        exchange = leg.exchange,
+        market = leg.market,
+        symbol = leg.symbol,
+        "quote websocket connected"
+    );
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if leg.exchange == "Bybit" {
+                    socket
+                        .send(Message::Text(r#"{"op":"ping"}"#.into()))
+                        .await?;
+                }
+            }
+            message = socket.next() => {
+                let message = message.ok_or_else(|| anyhow!("websocket stream ended"))??;
+                match message {
+                    Message::Text(text) => {
+                        let value: Value = match serde_json::from_str(text.as_ref()) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                tracing::debug!("invalid quote websocket payload: {error}");
+                                continue;
+                            }
+                        };
+                        let quote = if leg.exchange == "Binance" {
+                            live_quote_from_binance(&value)
+                        } else {
+                            live_quote_from_bybit(&value)
+                        };
+                        if let Some(quote) = quote {
+                            cache.write().await.insert(key.to_string(), quote);
+                        }
+                    }
+                    Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+                    Message::Close(frame) => bail!("websocket closed: {frame:?}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn live_quote_from_binance(value: &Value) -> Option<LiveQuote> {
+    Some(LiveQuote {
+        at: Instant::now(),
+        bid: parse(&value["b"])?,
+        ask: parse(&value["a"])?,
+        bid_quantity: parse(&value["B"]).unwrap_or(0.0),
+        ask_quantity: parse(&value["A"]).unwrap_or(0.0),
+    })
+}
+
+fn live_quote_from_bybit(value: &Value) -> Option<LiveQuote> {
+    let data = value.get("data")?;
+    Some(LiveQuote {
+        at: Instant::now(),
+        bid: parse(&data["bid1Price"])?,
+        ask: parse(&data["ask1Price"])?,
+        bid_quantity: parse(&data["bid1Size"]).unwrap_or(0.0),
+        ask_quantity: parse(&data["ask1Size"]).unwrap_or(0.0),
+    })
+}
+
 fn strategy_reference_price(mark_price: f64, last_price: f64) -> (f64, bool) {
     let uses_last_price = last_price > 0.0 && (mark_price - last_price).abs() / last_price > 0.001;
     if uses_last_price {
@@ -1516,6 +1731,33 @@ fn hmac_sign(secret: &str, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_binance_book_ticker_websocket_quote() {
+        let quote = live_quote_from_binance(&serde_json::json!({
+            "b": "2.662", "B": "14.81", "a": "2.664", "A": "144.48"
+        }))
+        .expect("Binance quote");
+        assert_eq!(quote.bid, 2.662);
+        assert_eq!(quote.ask, 2.664);
+        assert_eq!(quote.bid_quantity, 14.81);
+        assert_eq!(quote.ask_quantity, 144.48);
+    }
+
+    #[test]
+    fn parses_bybit_ticker_websocket_quote() {
+        let quote = live_quote_from_bybit(&serde_json::json!({
+            "data": {
+                "bid1Price": "2.660", "bid1Size": "45.2",
+                "ask1Price": "2.665", "ask1Size": "4.4"
+            }
+        }))
+        .expect("Bybit quote");
+        assert_eq!(quote.bid, 2.660);
+        assert_eq!(quote.ask, 2.665);
+        assert_eq!(quote.bid_quantity, 45.2);
+        assert_eq!(quote.ask_quantity, 4.4);
+    }
 
     #[test]
     fn classifies_cmc_and_tradefi_independently() {

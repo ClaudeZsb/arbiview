@@ -1358,6 +1358,7 @@ impl TradingService {
         let mut completed = 0.0;
         let mut cumulative_edge_value = 0.0;
         let mut batch = 0usize;
+        let mut consecutive_empty_attempts = 0u32;
         while request.target_notional_usdt - completed > 10.0 {
             if self.batch_cancelled(&task_id).await {
                 self.update_batch(&task_id, |task| task.status = "cancelled".into())
@@ -1422,37 +1423,84 @@ impl TradingService {
                             quote.short.bid,
                         )
                     );
-                    (long.ok(), short.ok())
+                    (Some(long), Some(short))
                 }
                 (true, false) => (
-                    self.place_limit_ioc(
-                        &quote.long.exchange,
-                        &quote.long.market,
-                        &quote.long.symbol,
-                        "Buy",
-                        long_qty,
-                        quote.long.ask,
-                    )
-                    .await
-                    .ok(),
+                    Some(
+                        self.place_limit_ioc(
+                            &quote.long.exchange,
+                            &quote.long.market,
+                            &quote.long.symbol,
+                            "Buy",
+                            long_qty,
+                            quote.long.ask,
+                        )
+                        .await,
+                    ),
                     None,
                 ),
                 (false, true) => (
                     None,
-                    self.place_limit_ioc(
-                        &quote.short.exchange,
-                        &quote.short.market,
-                        &quote.short.symbol,
-                        "Sell",
-                        short_qty,
-                        quote.short.bid,
-                    )
-                    .await
-                    .ok(),
+                    Some(
+                        self.place_limit_ioc(
+                            &quote.short.exchange,
+                            &quote.short.market,
+                            &quote.short.symbol,
+                            "Sell",
+                            short_qty,
+                            quote.short.bid,
+                        )
+                        .await,
+                    ),
                 ),
                 (false, false) => unreachable!(),
             };
             drop(_execution_guard);
+
+            let long_error = long_result
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(|error| format!("{error:#}"));
+            let short_error = short_result
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(|error| format!("{error:#}"));
+            let long_result = long_result.and_then(Result::ok);
+            let short_result = short_result.and_then(Result::ok);
+            if long_result.is_none() && short_result.is_none() {
+                consecutive_empty_attempts += 1;
+                tracing::warn!(
+                    token = opportunity.token.symbol,
+                    attempt = batch,
+                    long_error = long_error.as_deref().unwrap_or("not submitted"),
+                    short_error = short_error.as_deref().unwrap_or("not submitted"),
+                    "spread-guard IOC attempt produced no fills"
+                );
+                self.record_spread_wait(&task_id, Some(quote.spread)).await;
+                let unexpected_error = long_error
+                    .iter()
+                    .chain(short_error.iter())
+                    .find(|error| !is_ioc_no_fill(error));
+                if consecutive_empty_attempts >= 3 {
+                    if let Some(error) = unexpected_error {
+                        self.fail_batch_task(
+                            &task_id,
+                            batch,
+                            format!(
+                                "IOC order failed repeatedly; no position was opened in the last {} attempts: {error}",
+                                consecutive_empty_attempts
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                let backoff_millis =
+                    (250u64.saturating_mul(1u64 << consecutive_empty_attempts.min(4))).min(5_000);
+                tokio::time::sleep(Duration::from_millis(backoff_millis)).await;
+                continue;
+            }
+            consecutive_empty_attempts = 0;
 
             let mut logs = Vec::new();
             if let Some(order) = long_result {
@@ -3421,7 +3469,7 @@ impl TradingService {
             )
         };
         let mut fill = binance_fill(&response);
-        if fill.1 <= 0.0 || fill.2 <= 0.0 {
+        if limit_price.is_none() && (fill.1 <= 0.0 || fill.2 <= 0.0) {
             for _ in 0..8 {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 response = self
@@ -4693,6 +4741,15 @@ fn format_price(value: f64) -> String {
 
 fn spread_guard_allows(current: f64, threshold: f64) -> bool {
     current + f64::EPSILON >= threshold
+}
+
+fn is_ioc_no_fill(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("status=expired")
+        || normalized.contains("status=cancelled")
+        || normalized.contains("status=canceled")
+        || normalized.contains("order ended with status=cancelled")
+        || normalized.contains("order ended with status=canceled")
 }
 
 fn executable_top_notional(opportunity: &Opportunity) -> f64 {
