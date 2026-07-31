@@ -1192,8 +1192,17 @@ impl TradingService {
 
     pub async fn start_batch_reduce(
         &self,
-        request: BatchReduceRequest,
+        mut request: BatchReduceRequest,
     ) -> Result<BatchIncreaseTask> {
+        let position = self
+            .positions()
+            .await?
+            .into_iter()
+            .find(|position| position.id == request.position_id)
+            .ok_or_else(|| anyhow!("position not found"))?;
+        if request.close_all {
+            request.target_notional_usdt = position.notional_usdt;
+        }
         if !(10.0..=1_000_000.0).contains(&request.target_notional_usdt) {
             bail!("targetNotionalUsdt must be between 10 and 1,000,000");
         }
@@ -1205,15 +1214,9 @@ impl TradingService {
         if !request.no_loss_guard && !(0.5..=3_600.0).contains(&request.interval_seconds) {
             bail!("intervalSeconds must be between 0.5 and 3,600");
         }
-        let position = self
-            .positions()
-            .await?
-            .into_iter()
-            .find(|position| position.id == request.position_id)
-            .ok_or_else(|| anyhow!("position not found"))?;
         let maximum_reduction =
             (position.notional_usdt - self.config.position_tolerance_usdt).max(0.0);
-        if request.target_notional_usdt > maximum_reduction {
+        if !request.close_all && request.target_notional_usdt > maximum_reduction {
             bail!(
                 "targetNotionalUsdt must leave at least {:.2} USDT per leg; use close for a full exit",
                 self.config.position_tolerance_usdt
@@ -1899,26 +1902,32 @@ impl TradingService {
                 return;
             }
             batch += 1;
-            let batch_notional = request
-                .order_notional_usdt
-                .min(request.target_notional_usdt - completed);
-            match self
-                .reduce(
+            let remaining = request.target_notional_usdt - completed;
+            let final_full_close = request.close_all && remaining <= request.order_notional_usdt;
+            let batch_notional = request.order_notional_usdt.min(remaining);
+            let result = if final_full_close {
+                self.close(&request.position_id).await
+            } else {
+                self.reduce(
                     &request.position_id,
                     AdjustPositionRequest {
                         notional_usdt: batch_notional,
                     },
                 )
                 .await
-            {
+            };
+            match result {
                 Ok(response) => {
                     completed += batch_notional;
                     let logs = batch_reduce_logs(&position, batch, &response, batch_notional);
-                    let current_position = response.position.clone();
+                    let current_position = (!final_full_close).then_some(response.position.clone());
                     self.update_batch(&task_id, |task| {
+                        if final_full_close {
+                            completed = task.target_notional_usdt;
+                        }
                         task.completed_notional_usdt = completed.min(task.target_notional_usdt);
                         task.completed_batches = batch;
-                        task.current_position = Some(current_position);
+                        task.current_position = current_position;
                         for mut log in logs {
                             log.sequence = task.logs.len() + 1;
                             task.logs.push(log);
@@ -2009,7 +2018,8 @@ impl TradingService {
         let mut cumulative_close_spread_value = 0.0;
         let mut spread_recovery = SpreadRecovery::default();
         let mut batch = 0usize;
-        while request.target_notional_usdt - completed > 10.0 {
+        let completion_tolerance = if request.close_all { 0.001 } else { 10.0 };
+        while request.target_notional_usdt - completed > completion_tolerance {
             if self.batch_cancelled(&task_id).await {
                 self.update_batch(&task_id, |task| task.status = "cancelled".into())
                     .await;
@@ -2225,6 +2235,24 @@ impl TradingService {
                 - close_unmatched_total(&unmatched_short))
             .abs();
             if residual > HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT {
+                let fully_closed = request.close_all
+                    && self.positions().await.ok().is_some_and(|positions| {
+                        !positions.iter().any(|item| item.id == position.id)
+                    });
+                if fully_closed {
+                    self.update_batch(&task_id, |task| {
+                        task.completed_notional_usdt = task.target_notional_usdt;
+                        task.completed_batches = batch;
+                        task.current_position = None;
+                        for mut log in logs {
+                            log.sequence = task.logs.len() + 1;
+                            task.logs.push(log);
+                        }
+                        task.status = "completed".into();
+                    })
+                    .await;
+                    return;
+                }
                 self.fail_batch_task(
                     &task_id,
                     batch,

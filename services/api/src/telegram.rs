@@ -124,8 +124,8 @@ impl TelegramBot {
                     {"command": "batch_open", "description": "批量开仓：TOKEN 目标 单笔 间隔 [杠杆]"},
                     {"command": "guard_open", "description": "保价差限价开仓：TOKEN 目标 [杠杆] [门槛%]"},
                     {"command": "reduce", "description": "减仓：TOKEN 金额"},
-                    {"command": "batch_reduce", "description": "批量减仓：TOKEN 目标 单笔 间隔"},
-                    {"command": "no_loss_close", "description": "保不亏限价平仓：TOKEN 目标"},
+                    {"command": "batch_reduce", "description": "批量减仓：TOKEN 金额/all 单笔 间隔"},
+                    {"command": "no_loss_close", "description": "保不亏限价平仓：TOKEN 金额/all"},
                     {"command": "leverage", "description": "调整杠杆：TOKEN 杠杆"},
                     {"command": "close", "description": "完全平仓：TOKEN"},
                     {"command": "autoclose", "description": "设置 APY 自动平仓"},
@@ -288,8 +288,23 @@ impl TelegramBot {
                 let token = parts
                     .next()
                     .ok_or_else(|| anyhow!("用法：/reduce TOKEN 金额"))?;
-                let amount = parse_f64(parts.next(), "金额")?;
                 let position = self.find_position_by_token(token).await?;
+                let amount_raw = parts.next().ok_or_else(|| anyhow!("缺少金额"))?;
+                if amount_raw.eq_ignore_ascii_case("all") {
+                    return self
+                        .send(
+                            &format!(
+                                "🚨 确认完全平掉 <b>{}</b> 的双腿仓位？此操作不可撤销。",
+                                html(&position.token)
+                            ),
+                            vec![vec![
+                                button("确认平仓", &format!("cx|{}", position.id)),
+                                button("取消", &format!("p|{}", position.id)),
+                            ]],
+                        )
+                        .await;
+                }
+                let amount = amount_raw.parse::<f64>().context("金额必须是数字或 all")?;
                 self.send(
                     &format!(
                         "⚠️ 确认减少 <b>{}</b> 每腿 ${:.2}？",
@@ -307,25 +322,27 @@ impl TelegramBot {
                 let token = parts.next().ok_or_else(|| {
                     anyhow!("用法：/batch_reduce TOKEN 目标金额 单笔金额 间隔秒数")
                 })?;
-                let target = parse_f64(parts.next(), "目标金额")?;
+                let target_raw = parts.next().ok_or_else(|| anyhow!("缺少目标金额"))?;
                 let order = parse_f64(parts.next(), "单笔金额")?;
                 let interval = parse_f64(parts.next(), "间隔秒数")?;
                 let position = self.find_position_by_token(token).await?;
-                self.confirm_batch_reduce(&position, target, order, interval)
+                let (target, close_all) = parse_close_target(target_raw, &position)?;
+                self.confirm_batch_reduce(&position, target, close_all, order, interval)
                     .await
             }
             "/no_loss_close" => {
                 let token = parts.next().ok_or_else(|| {
                     anyhow!("用法：/no_loss_close TOKEN 目标金额 [最高平仓价差%]")
                 })?;
-                let target = parse_f64(parts.next(), "目标金额")?;
+                let target_raw = parts.next().ok_or_else(|| anyhow!("缺少目标金额"))?;
                 let threshold = parts
                     .next()
                     .map(|value| value.parse::<f64>().map(|value| value / 100.0))
                     .transpose()
                     .context("最高平仓价差必须是数字")?;
                 let position = self.find_position_by_token(token).await?;
-                self.confirm_no_loss_close(&position, target, threshold)
+                let (target, close_all) = parse_close_target(target_raw, &position)?;
+                self.confirm_no_loss_close(&position, target, close_all, threshold)
                     .await
             }
             "/leverage" => {
@@ -583,21 +600,26 @@ impl TelegramBot {
             }
             ["brc", id, target, order, interval] => {
                 let position = self.find_position(id).await?;
+                let (target, close_all) = parse_close_target(target, &position)?;
                 self.confirm_batch_reduce(
                     &position,
-                    target.parse()?,
+                    target,
+                    close_all,
                     order.parse()?,
                     interval.parse()?,
                 )
                 .await
             }
             ["brx", id, target, order, interval] => {
+                let position = self.find_position(id).await?;
+                let (target_notional_usdt, close_all) = parse_close_target(target, &position)?;
                 let task = self
                     .state
                     .trading
                     .start_batch_reduce(BatchReduceRequest {
                         position_id: (*id).into(),
-                        target_notional_usdt: target.parse()?,
+                        target_notional_usdt,
+                        close_all,
                         order_notional_usdt: order.parse()?,
                         interval_seconds: interval.parse()?,
                         no_loss_guard: false,
@@ -607,12 +629,15 @@ impl TelegramBot {
                 self.show_batch_task(&task).await
             }
             ["nlx", id, target] => {
+                let position = self.find_position(id).await?;
+                let (target_notional_usdt, close_all) = parse_close_target(target, &position)?;
                 let task = self
                     .state
                     .trading
                     .start_batch_reduce(BatchReduceRequest {
                         position_id: (*id).into(),
-                        target_notional_usdt: target.parse()?,
+                        target_notional_usdt,
+                        close_all,
                         order_notional_usdt: 0.0,
                         interval_seconds: 0.25,
                         no_loss_guard: true,
@@ -622,12 +647,15 @@ impl TelegramBot {
                 self.show_batch_task(&task).await
             }
             ["nlx", id, target, threshold] => {
+                let position = self.find_position(id).await?;
+                let (target_notional_usdt, close_all) = parse_close_target(target, &position)?;
                 let task = self
                     .state
                     .trading
                     .start_batch_reduce(BatchReduceRequest {
                         position_id: (*id).into(),
-                        target_notional_usdt: target.parse()?,
+                        target_notional_usdt,
+                        close_all,
                         order_notional_usdt: 0.0,
                         interval_seconds: 0.25,
                         no_loss_guard: true,
@@ -1054,15 +1082,16 @@ impl TelegramBot {
         &self,
         position: &Position,
         target: f64,
+        close_all: bool,
         order: f64,
         interval: f64,
     ) -> Result<()> {
         validate_batch_settings(target, order, interval)?;
         self.send(
             &format!(
-                "⚠️ 确认批量减仓？\n<b>{}</b> · 每腿共减少 ${:.2}\n每单最多 ${:.2} · 间隔 {:.1}s\n预计 {} 批\n当前每腿约 ${:.2}",
+                "⚠️ 确认批量减仓？\n<b>{}</b> · 每腿目标 {}\n每单最多 ${:.2} · 间隔 {:.1}s\n预计 {} 批\n当前每腿约 ${:.2}",
                 html(&position.token),
-                target,
+                if close_all { "ALL（全平）".into() } else { format!("${target:.2}") },
                 order,
                 interval,
                 (target / order).ceil() as usize,
@@ -1071,7 +1100,7 @@ impl TelegramBot {
             vec![vec![
                 button(
                     "确认启动",
-                    &format!("brx|{}|{}|{}|{}", position.id, target, order, interval),
+                    &format!("brx|{}|{}|{}|{}", position.id, if close_all { "all".into() } else { target.to_string() }, order, interval),
                 ),
                 button("取消", &format!("p|{}", position.id)),
             ]],
@@ -1083,10 +1112,11 @@ impl TelegramBot {
         &self,
         position: &Position,
         target: f64,
+        close_all: bool,
         threshold: Option<f64>,
     ) -> Result<()> {
         let maximum = (position.notional_usdt - 10.0).max(0.0);
-        if !(10.0..=maximum).contains(&target) {
+        if !close_all && !(10.0..=maximum).contains(&target) {
             return Err(anyhow!(
                 "目标金额必须在 10 与 {:.2} USDT 之间；需保留至少 10 USDT，全部退出请使用普通平仓",
                 maximum
@@ -1094,17 +1124,17 @@ impl TelegramBot {
         }
         self.send(
             &format!(
-                "⚠️ 确认启动保价差且不亏限价平仓？\n<b>{}</b> · 每腿目标减少 ${:.2}\n最高平仓价差：{}\n同时满足价差门槛和累计仓位平仓盈亏不为负时下单；不包含资金费和手续费",
+                "⚠️ 确认启动保价差且不亏限价平仓？\n<b>{}</b> · 每腿目标 {}\n最高平仓价差：{}\n同时满足价差门槛和累计仓位平仓盈亏不为负时下单；不包含资金费和手续费",
                 html(&position.token),
-                target,
+                if close_all { "ALL（全平）".into() } else { format!("${target:.2}") },
                 threshold.map(|value| format!("{:+.4}%", value * 100.0)).unwrap_or_else(|| "启动时当前价差".into())
             ),
             vec![vec![
                 button(
                     "确认启动",
                     &threshold.map_or_else(
-                        || format!("nlx|{}|{}", position.id, target),
-                        |value| format!("nlx|{}|{}|{}", position.id, target, value),
+                        || format!("nlx|{}|{}", position.id, if close_all { "all".into() } else { target.to_string() }),
+                        |value| format!("nlx|{}|{}|{}", position.id, if close_all { "all".into() } else { target.to_string() }, value),
                     ),
                 ),
                 button("取消", &format!("p|{}", position.id)),
@@ -1513,7 +1543,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询双腿保护状态和事件\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额 — 减仓\n/batch_reduce TOKEN 目标 单笔 间隔 — 批量减仓\n/no_loss_close TOKEN 目标 [最高平仓价差%] — 保价差且不亏限价平仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 10 -1.5</code>\n<code>/batch_reduce DEXE 1000 100 2</code>\n<code>/no_loss_close DEXE 500 -0.5</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询孤腿保护状态和事件\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额/all — 减仓或全平\n/batch_reduce TOKEN 金额/all 单笔 间隔 — 批量减仓\n/no_loss_close TOKEN 金额/all [最高平仓价差%] — 保价差且不亏限价平仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 10 -1.5</code>\n<code>/batch_reduce DEXE all 100 2</code>\n<code>/no_loss_close DEXE all -0.5</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![
@@ -1770,6 +1800,19 @@ fn parse_f64(value: Option<&str>, name: &str) -> Result<f64> {
         .map_err(|_| anyhow!("{name}格式错误"))
 }
 
+fn parse_close_target(value: &str, position: &Position) -> Result<(f64, bool)> {
+    if value.eq_ignore_ascii_case("all") {
+        Ok((position.notional_usdt, true))
+    } else {
+        Ok((
+            value
+                .parse::<f64>()
+                .with_context(|| format!("目标金额必须是数字或 all：{value}"))?,
+            false,
+        ))
+    }
+}
+
 fn validate_batch_settings(target: f64, order: f64, interval: f64) -> Result<()> {
     if !(10.0..=1_000_000.0).contains(&target) {
         return Err(anyhow!("目标金额范围为 10–1,000,000 USDT"));
@@ -1898,6 +1941,33 @@ mod tests {
         assert!(validate_batch_settings(1_000.0, 100.0, 2.0).is_ok());
         assert!(validate_batch_settings(1_000.0, 2_000.0, 2.0).is_err());
         assert!(validate_batch_settings(1_000.0, 100.0, 0.1).is_err());
+    }
+
+    #[test]
+    fn parses_all_as_the_full_position_notional() {
+        let position = Position {
+            id: "live-TEST".into(),
+            token: "TEST".into(),
+            status: "open".into(),
+            opened_at: 0,
+            notional_usdt: 1_234.5,
+            leverage: 10,
+            long: test_leg("Binance", "long"),
+            short: test_leg("Bybit", "short"),
+            funding_earned: 0.0,
+            unrealized_pnl: 0.0,
+            current_funding_per_hour: None,
+            current_spread: None,
+            current_apy: None,
+        };
+        assert_eq!(
+            parse_close_target("ALL", &position).unwrap(),
+            (1_234.5, true)
+        );
+        assert_eq!(
+            parse_close_target("500", &position).unwrap(),
+            (500.0, false)
+        );
     }
 
     fn test_leg(exchange: &str, side: &str) -> crate::models::PositionLeg {

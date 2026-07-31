@@ -230,10 +230,12 @@ function TradeModal({ item, mode, onClose, onSubmit, busy }) {
 }
 
 function AdjustModal({ position, type, onClose, onSubmit, busy }) {
-  const [notional, setNotional] = useState(20);
+  const [notional, setNotional] = useState("20");
   const [leverage, setLeverage] = useState(position.leverage || 1);
   const isIncrease = type === "increase";
   const isLeverage = type === "leverage";
+  const closeAll = !isIncrease && !isLeverage && notional.trim().toLowerCase() === "all";
+  const numericNotional = Number(notional);
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="trade-modal">
@@ -242,15 +244,15 @@ function AdjustModal({ position, type, onClose, onSubmit, busy }) {
         <div className="trade-title"><h3>{isLeverage ? "调整" : isIncrease ? "增加" : "减少"} {position.token} {isLeverage ? "杠杆" : "双腿仓位"}</h3></div>
         {isLeverage
           ? <label>目标杠杆<select value={leverage} onChange={(e) => setLeverage(Number(e.target.value))}>{[1, 2, 3, 5, 10, 20].map((value) => <option key={value} value={value}>{value}×</option>)}</select></label>
-          : <label>每腿调整金额（USDT）<input type="number" min="10" step="10" value={notional} onChange={(e) => setNotional(Number(e.target.value))} /></label>}
+          : <label>每腿调整金额（USDT）<input type={isIncrease ? "number" : "text"} inputMode={isIncrease ? undefined : "decimal"} min="10" step="10" value={notional} placeholder={isIncrease ? undefined : "输入金额或 all"} onChange={(e) => setNotional(e.target.value)} />{!isIncrease && <small>输入 all 表示立即全部平仓。</small>}</label>}
         <div className={`trade-warning ${isIncrease || isLeverage ? "live" : "paper"}`}><ShieldCheck size={16} />
           {isLeverage
             ? "将同时修改 Binance 与 Bybit 对应合约的杠杆，不会改变当前仓位数量。提高杠杆会降低可用保证金缓冲。"
             : isIncrease
             ? "两条腿将按该金额并发加仓，成交后根据交易所实际仓位补齐并对冲。"
-            : "两条腿将按该金额并发减仓，成交后只减少较大腿完成金额对齐；全量退出请使用双腿平仓。"}
+            : closeAll ? "将立即按市价完全平掉两条腿。" : "两条腿将按该金额并发减仓，成交后只减少较大腿完成金额对齐。"}
         </div>
-        <button className={`confirm-trade ${isIncrease || isLeverage ? "live" : ""}`} disabled={busy || (!isLeverage && notional < 10)} onClick={() => onSubmit(isLeverage ? leverage : notional)}>
+        <button className={`confirm-trade ${isIncrease || isLeverage ? "live" : ""}`} disabled={busy || (!isLeverage && !closeAll && (!Number.isFinite(numericNotional) || numericNotional < 10))} onClick={() => onSubmit(isLeverage ? leverage : closeAll ? "all" : numericNotional)}>
           {busy ? "正在调整双腿…" : `确认${isLeverage ? "调整杠杆" : isIncrease ? "加仓" : "减仓"}`}
         </button>
       </div>
@@ -261,7 +263,7 @@ function AdjustModal({ position, type, onClose, onSubmit, busy }) {
 function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel, busy }) {
   const isReduce = action === "reduce";
   const maximumReduction = Math.max(0, position.notionalUsdt - 10);
-  const [target, setTarget] = useState(isReduce ? Math.min(1000, maximumReduction) : 1000);
+  const [target, setTarget] = useState(String(isReduce ? Math.min(1000, maximumReduction) : 1000));
   const [orderNotional, setOrderNotional] = useState(Math.min(100, isReduce ? maximumReduction : 100));
   const [intervalSeconds, setIntervalSeconds] = useState(2);
   const [spreadGuard, setSpreadGuard] = useState(false);
@@ -272,6 +274,8 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
     ? (initialShortClose - initialLongClose) / initialLongClose
     : (position.currentSpread || 0);
   const [spreadThreshold, setSpreadThreshold] = useState(Number((((isReduce ? initialCloseSpread : position.currentSpread) || 0) * 100).toFixed(4)));
+  const closeAll = isReduce && target.trim().toLowerCase() === "all";
+  const targetAmount = closeAll ? position.notionalUsdt : Number(target);
   const logRef = useRef(null);
   const progress = task
     ? Math.min(100, task.completedNotionalUsdt / task.targetNotionalUsdt * 100)
@@ -295,7 +299,7 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
         <span><i className="side-dot short" />SHORT · {position.short.exchange} · {position.short.market === "spot" ? "SPOT" : "PERP"}</span>
       </div>
       {!task && <>
-        <label>每腿目标{isReduce ? "减仓" : "加仓"}金额（USDT）<input type="number" min="10" max={isReduce ? maximumReduction : undefined} step="100" value={target} onChange={(event) => setTarget(Number(event.target.value))} /></label>
+        <label>每腿目标{isReduce ? "平仓" : "加仓"}金额（USDT）<input type={isReduce ? "text" : "number"} inputMode={isReduce ? "decimal" : undefined} min="10" max={isReduce ? maximumReduction : undefined} step="100" value={target} placeholder={isReduce ? "输入金额或 all" : undefined} onChange={(event) => setTarget(event.target.value)} />{isReduce && <small>输入 all 表示两腿全部平仓。</small>}</label>
         {!isReduce && <label>买入模式<select value={spreadGuard ? "guard" : "market"} onChange={(event) => setSpreadGuard(event.target.value === "guard")}>
           <option value="market">市价模式</option>
           <option value="guard">保价差限价模式</option>
@@ -313,12 +317,12 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
             ? "按实时盘口动态下单，单腿每次最多 $50；成交差额立即市价补腿，不利价差由后续 10 批分摊追回"
             : noLossGuard
               ? "同时满足目标平仓价差和累计仓位盈亏不为负才下单；不计资金费和手续费。单腿每次最多 $50，部分成交立即市价补腿，价差欠账由后续 10 批分摊追回"
-            : <>预计 {Math.ceil(target / Math.max(orderNotional, 1))} 批，约 {duration(Math.max(0, Math.ceil(target / Math.max(orderNotional, 1)) - 1) * intervalSeconds / 3600)}</>}
+            : <>预计 {Math.ceil(targetAmount / Math.max(orderNotional, 1))} 批，约 {duration(Math.max(0, Math.ceil(targetAmount / Math.max(orderNotional, 1)) - 1) * intervalSeconds / 3600)}</>}
         </div>
         <button
           className="batch-start"
-          disabled={busy || target < 10 || ((!spreadGuard && !noLossGuard) && (orderNotional < 10 || orderNotional > target || intervalSeconds < 0.5)) || (isReduce && target > maximumReduction)}
-          onClick={() => onStart({ targetNotionalUsdt: target, orderNotionalUsdt: spreadGuard || noLossGuard ? 0 : orderNotional, intervalSeconds: spreadGuard || noLossGuard ? 0.25 : intervalSeconds, spreadGuard, spreadThreshold: spreadThreshold / 100, noLossGuard, closeSpreadThreshold: noLossGuard ? spreadThreshold / 100 : undefined })}
+          disabled={busy || !Number.isFinite(targetAmount) || targetAmount < 10 || ((!spreadGuard && !noLossGuard) && (orderNotional < 10 || orderNotional > targetAmount || intervalSeconds < 0.5)) || (isReduce && !closeAll && targetAmount > maximumReduction)}
+          onClick={() => onStart({ targetNotionalUsdt: targetAmount, closeAll, orderNotionalUsdt: spreadGuard || noLossGuard ? 0 : orderNotional, intervalSeconds: spreadGuard || noLossGuard ? 0.25 : intervalSeconds, spreadGuard, spreadThreshold: spreadThreshold / 100, noLossGuard, closeSpreadThreshold: noLossGuard ? spreadThreshold / 100 : undefined })}
         >
           {busy ? "正在创建任务…" : `启动批量${isReduce ? "减仓" : "加仓"}`}
         </button>
@@ -992,11 +996,13 @@ export default function Dashboard() {
           body: JSON.stringify({ opportunityId: opportunity.id, notionalUsdt, leverage: adjustment.position.leverage })
         });
       } else if (adjustment.type === "reduce") {
-        response = await fetch(`/backend/positions/${adjustment.position.id}/reduce`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ notionalUsdt })
-        });
+        response = notionalUsdt === "all"
+          ? await fetch(`/backend/positions/${adjustment.position.id}/close`, { method: "POST" })
+          : await fetch(`/backend/positions/${adjustment.position.id}/reduce`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ notionalUsdt })
+            });
       } else {
         response = await fetch(`/backend/positions/${adjustment.position.id}/leverage`, {
           method: "POST",

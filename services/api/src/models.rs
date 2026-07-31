@@ -185,6 +185,8 @@ pub struct BatchIncreaseRequest {
 pub struct BatchReduceRequest {
     pub position_id: String,
     pub target_notional_usdt: f64,
+    #[serde(default)]
+    pub close_all: bool,
     pub order_notional_usdt: f64,
     pub interval_seconds: f64,
     #[serde(default)]
