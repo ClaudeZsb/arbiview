@@ -1004,7 +1004,7 @@ impl TelegramBot {
         );
         self.send(
             &format!(
-                "⚠️ 确认保价差限价开仓？\n<b>{}</b> · 每腿目标 ${:.2} · {}×\n仅当实时可执行价差 ≥ {:+.4}% 时提交 IOC 限价单；单腿每次最多 $50，成交差额跨批次保价补偿，不主动减仓\n当前参考价差 {:+.4}%",
+                "⚠️ 确认保价差限价开仓？\n<b>{}</b> · 每腿目标 ${:.2} · {}×\n仅当累计成交价差满足 {:+.4}% 门槛时提交 IOC 限价单；单腿每次最多 $50，成交差额立即市价补腿，不利价差由下一批提高门槛追回\n当前参考价差 {:+.4}%",
                 html(&opportunity.token.symbol),
                 target,
                 leverage,
@@ -1097,7 +1097,7 @@ impl TelegramBot {
             format!("{} / {}", task.completed_batches, task.total_batches)
         };
         let execution_description = if task.spread_guard {
-            "按实时盘口下单，单腿硬顶 $50；差额跨批次保价补偿，无人为间隔".to_string()
+            "单腿硬顶 $50；差额立即市价补齐，下一批追回价差欠账，无人为间隔".to_string()
         } else if task.no_loss_guard {
             "只看双腿仓位盈亏，单腿硬顶 $50；差额跨批次保不亏补偿".to_string()
         } else {
@@ -1128,6 +1128,15 @@ impl TelegramBot {
                     .map(|value| format!("{:+.4}%", value * 100.0))
                     .unwrap_or_else(|| "读取中".into()),
                 task.spread_wait_count
+            ));
+            text.push_str(&format!(
+                "\n动态要求：{} · 累计成交价差：{}",
+                task.effective_spread_threshold
+                    .map(|value| format!("{:+.4}%", value * 100.0))
+                    .unwrap_or_else(|| "读取中".into()),
+                task.cumulative_filled_spread
+                    .map(|value| format!("{:+.4}%", value * 100.0))
+                    .unwrap_or_else(|| "暂无".into())
             ));
         }
         if task.no_loss_guard {

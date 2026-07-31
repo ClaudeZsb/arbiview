@@ -212,7 +212,7 @@ function TradeModal({ item, mode, onClose, onSubmit, busy }) {
         <div className={`trade-warning ${isLive ? "live" : "paper"}`}><ShieldCheck size={16} />
           {isLive
             ? spreadGuard
-              ? `保价差模式：仅当实时可执行价差 ≥ ${spreadThreshold}% 时按盘口提交 IOC 限价单，单腿每次最多 $50；部分成交差额留到下一轮保价差补齐，不主动减仓。`
+              ? `保价差模式：仅当累计成交价差满足门槛时按盘口提交 IOC 限价单，单腿每次最多 $50；部分成交立即市价补腿，产生的价差欠账由下一批追回。`
               : "真实交易模式：两腿将并发提交市价单；不足目标时优先补仓，差额超过 10 USDT 时自动减仓对齐。"
             : mode === "paper"
               ? "模拟交易模式：只在后端记录模拟仓位，不会向交易所发送订单。"
@@ -304,7 +304,7 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
         {(!spreadGuard && !noLossGuard) && <label>批次间隔（秒）<input type="number" min="0.5" max="3600" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /></label>}
         <div className="batch-estimate">
           {spreadGuard && !isReduce
-            ? "按实时盘口动态下单，单腿每次最多 $50；成交差额在下一轮保价差补齐，不主动减仓"
+            ? "按实时盘口动态下单，单腿每次最多 $50；成交差额立即市价补腿，不利价差由下一批提高门槛追回"
             : noLossGuard
               ? "仅当两腿按可平仓价计算的仓位盈亏合计不为负时下单；不计资金费和手续费。单腿每次最多 $50，部分成交跨批次补齐"
             : <>预计 {Math.ceil(target / Math.max(orderNotional, 1))} 批，约 {duration(Math.max(0, Math.ceil(target / Math.max(orderNotional, 1)) - 1) * intervalSeconds / 3600)}</>}
@@ -324,13 +324,13 @@ function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel
           <div><span>批次</span><b>{task.spreadGuard || task.noLossGuard ? `${task.completedBatches} 次动态下单` : `${task.completedBatches} / ${task.totalBatches}`}</b></div>
         </div>
         {task.spreadGuard && <div className="batch-estimate">
-          保价差限价 · 门槛 {pct(task.spreadThreshold, 4)} · 当前 {task.currentSpread == null ? "读取中" : pct(task.currentSpread, 4)} · 已等待 {task.spreadWaitCount} 次
+          保价差限价 · 原门槛 {pct(task.spreadThreshold, 4)} · 当前要求 {task.effectiveSpreadThreshold == null ? "读取中" : pct(task.effectiveSpreadThreshold, 4)} · 当前盘口 {task.currentSpread == null ? "读取中" : pct(task.currentSpread, 4)} · 累计成交 {task.cumulativeFilledSpread == null ? "暂无" : pct(task.cumulativeFilledSpread, 4)} · 已等待 {task.spreadWaitCount} 次
         </div>}
         {task.noLossGuard && <div className="batch-estimate">
           保不亏限价平仓 · 当前可配对仓位盈亏 {task.currentClosePnlUsdt == null ? "读取中" : money(task.currentClosePnlUsdt)} · 已等待 {task.spreadWaitCount} 次
         </div>}
         <div className="batch-progress"><i style={{ width: `${progress}%` }} /></div>
-        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>{task.spreadGuard ? "实时盘口动态下单 · 单腿硬顶 $50 · 差额跨批次补偿" : task.noLossGuard ? "只看仓位盈亏 · 单腿硬顶 $50 · 差额跨批次补偿" : `单笔 ${money(task.orderNotionalUsdt)} · 间隔 ${task.intervalSeconds}s`}</span></div>
+        <div className="batch-progress-label"><b>{progress.toFixed(1)}%</b><span>{task.spreadGuard ? "单腿硬顶 $50 · 差额立即市价补齐 · 下一批追回价差欠账" : task.noLossGuard ? "只看仓位盈亏 · 单腿硬顶 $50 · 差额跨批次补偿" : `单笔 ${money(task.orderNotionalUsdt)} · 间隔 ${task.intervalSeconds}s`}</span></div>
         {task.error && <div className="batch-error">{task.error}</div>}
         <div className="batch-log" ref={logRef}>
           {task.logs.length === 0 && <div className="batch-log-empty">等待第一批成交…</div>}

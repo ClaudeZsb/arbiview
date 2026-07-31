@@ -224,6 +224,8 @@ pub struct BatchIncreaseTask {
     pub spread_guard: bool,
     pub spread_threshold: Option<f64>,
     pub current_spread: Option<f64>,
+    pub effective_spread_threshold: Option<f64>,
+    pub cumulative_filled_spread: Option<f64>,
     pub spread_wait_count: usize,
     pub no_loss_guard: bool,
     pub current_close_pnl_usdt: Option<f64>,

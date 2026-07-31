@@ -99,7 +99,6 @@ enum GuardFillSide {
 }
 
 struct GuardUnmatchedFill {
-    side: GuardFillSide,
     notional_usdt: f64,
     price: f64,
 }
@@ -988,6 +987,10 @@ impl TradingService {
                 .spread_guard
                 .then(|| request.spread_threshold.unwrap_or(opportunity.spread)),
             current_spread: Some(opportunity.spread),
+            effective_spread_threshold: request
+                .spread_guard
+                .then(|| request.spread_threshold.unwrap_or(opportunity.spread)),
+            cumulative_filled_spread: None,
             spread_wait_count: 0,
             no_loss_guard: false,
             current_close_pnl_usdt: None,
@@ -1085,6 +1088,8 @@ impl TradingService {
             spread_guard: false,
             spread_threshold: None,
             current_spread: None,
+            effective_spread_threshold: None,
+            cumulative_filled_spread: None,
             spread_wait_count: 0,
             no_loss_guard: request.no_loss_guard,
             current_close_pnl_usdt: None,
@@ -1351,11 +1356,9 @@ impl TradingService {
         let mut unmatched_long = VecDeque::new();
         let mut unmatched_short = VecDeque::new();
         let mut completed = 0.0;
+        let mut cumulative_edge_value = 0.0;
         let mut batch = 0usize;
-        while request.target_notional_usdt - completed > 10.0
-            || unmatched_total(&unmatched_long) > 10.0
-            || unmatched_total(&unmatched_short) > 10.0
-        {
+        while request.target_notional_usdt - completed > 10.0 {
             if self.batch_cancelled(&task_id).await {
                 self.update_batch(&task_id, |task| task.status = "cancelled".into())
                     .await;
@@ -1372,30 +1375,22 @@ impl TradingService {
             };
             self.update_batch(&task_id, |task| task.current_spread = Some(quote.spread))
                 .await;
-            if !spread_guard_allows(quote.spread, threshold)
-                || !compensation_prices_are_protected(
-                    &unmatched_long,
-                    &unmatched_short,
-                    quote.long.ask,
-                    quote.short.bid,
-                    threshold,
-                )
-            {
+            let remaining = (request.target_notional_usdt - completed).max(0.0);
+            let desired = SPREAD_GUARD_ORDER_CAP_USDT.min(remaining);
+            let effective_threshold =
+                required_next_spread(threshold, completed, cumulative_edge_value, desired);
+            self.update_batch(&task_id, |task| {
+                task.effective_spread_threshold = Some(effective_threshold)
+            })
+            .await;
+            if !spread_guard_allows(quote.spread, effective_threshold) {
                 self.record_spread_wait(&task_id, Some(quote.spread)).await;
                 tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
                 continue;
             }
 
-            let long_excess = unmatched_total(&unmatched_long);
-            let short_excess = unmatched_total(&unmatched_short);
-            let remaining = (request.target_notional_usdt - completed).max(0.0);
-            let desired = if remaining > 10.0 {
-                SPREAD_GUARD_ORDER_CAP_USDT.min(remaining)
-            } else {
-                SPREAD_GUARD_ORDER_CAP_USDT.min(long_excess.max(short_excess))
-            };
-            let (long_notional, short_notional) =
-                guard_order_notionals(desired, long_excess, short_excess);
+            let long_notional = desired;
+            let short_notional = desired;
             let long_qty = floor_step(long_notional / quote.long.ask, opportunity.long.qty_step);
             let short_qty =
                 floor_step(short_notional / quote.short.bid, opportunity.short.qty_step);
@@ -1464,38 +1459,125 @@ impl TradingService {
                 let notional = order.executed_quantity * order.average_price;
                 if notional > 0.0 {
                     unmatched_long.push_back(GuardUnmatchedFill {
-                        side: GuardFillSide::Long,
                         notional_usdt: notional,
                         price: order.average_price,
                     });
-                    logs.push(guard_batch_log(
-                        &opportunity,
-                        batch,
-                        "long",
-                        &order,
-                        short_excess > f64::EPSILON,
-                    ));
+                    logs.push(guard_batch_log(&opportunity, batch, "long", &order, false));
                 }
             }
             if let Some(order) = short_result {
                 let notional = order.executed_quantity * order.average_price;
                 if notional > 0.0 {
                     unmatched_short.push_back(GuardUnmatchedFill {
-                        side: GuardFillSide::Short,
                         notional_usdt: notional,
                         price: order.average_price,
                     });
-                    logs.push(guard_batch_log(
+                    logs.push(guard_batch_log(&opportunity, batch, "short", &order, false));
+                }
+            }
+            let (mut matched, mut edge_value) =
+                match_guard_fills_with_edge(&mut unmatched_long, &mut unmatched_short);
+            for attempt in 1..=MAX_RECONCILIATION_ATTEMPTS {
+                let long_excess = unmatched_total(&unmatched_long);
+                let short_excess = unmatched_total(&unmatched_short);
+                let difference = (long_excess - short_excess).abs();
+                if difference <= HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT {
+                    break;
+                }
+                let _supplement_guard = self.execution_lock.lock().await;
+                let supplement = if long_excess > short_excess {
+                    let quantity =
+                        floor_step(difference / quote.short.bid, opportunity.short.qty_step);
+                    if quantity <= 0.0 {
+                        None
+                    } else {
+                        self.place(
+                            &quote.short.exchange,
+                            &quote.short.market,
+                            &quote.short.symbol,
+                            "Sell",
+                            quantity,
+                            false,
+                        )
+                        .await
+                        .ok()
+                        .map(|order| (GuardFillSide::Short, order))
+                    }
+                } else {
+                    let quantity =
+                        floor_step(difference / quote.long.ask, opportunity.long.qty_step);
+                    if quantity <= 0.0 {
+                        None
+                    } else {
+                        self.place(
+                            &quote.long.exchange,
+                            &quote.long.market,
+                            &quote.long.symbol,
+                            "Buy",
+                            quantity,
+                            false,
+                        )
+                        .await
+                        .ok()
+                        .map(|order| (GuardFillSide::Long, order))
+                    }
+                };
+                drop(_supplement_guard);
+                let Some((side, order)) = supplement else {
+                    tracing::warn!(
+                        token = %opportunity.token.symbol,
+                        attempt,
+                        "immediate market leg supplement failed"
+                    );
+                    continue;
+                };
+                let notional = order.executed_quantity * order.average_price;
+                if side == GuardFillSide::Long {
+                    unmatched_long.push_back(GuardUnmatchedFill {
+                        notional_usdt: notional,
+                        price: order.average_price,
+                    });
+                    logs.push(guard_market_supplement_log(
+                        &opportunity,
+                        batch,
+                        "long",
+                        &order,
+                    ));
+                } else {
+                    unmatched_short.push_back(GuardUnmatchedFill {
+                        notional_usdt: notional,
+                        price: order.average_price,
+                    });
+                    logs.push(guard_market_supplement_log(
                         &opportunity,
                         batch,
                         "short",
                         &order,
-                        long_excess > f64::EPSILON,
                     ));
                 }
+                let (newly_matched, new_edge_value) =
+                    match_guard_fills_with_edge(&mut unmatched_long, &mut unmatched_short);
+                matched += newly_matched;
+                edge_value += new_edge_value;
             }
-            let matched = match_guard_fills(&mut unmatched_long, &mut unmatched_short);
+            let residual =
+                (unmatched_total(&unmatched_long) - unmatched_total(&unmatched_short)).abs();
+            if residual > HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT {
+                self.fail_batch_task(
+                    &task_id,
+                    batch,
+                    format!(
+                        "NAKED_EXPOSURE: immediate market supplement failed after {} attempts; residual mismatch {:.2} USDT",
+                        MAX_RECONCILIATION_ATTEMPTS, residual
+                    ),
+                )
+                .await;
+                return;
+            }
             completed = (completed + matched).min(request.target_notional_usdt);
+            cumulative_edge_value += edge_value;
+            let cumulative_spread =
+                (completed > f64::EPSILON).then_some(cumulative_edge_value / completed);
             let current_position = self.positions().await.ok().and_then(|positions| {
                 positions
                     .into_iter()
@@ -1505,6 +1587,7 @@ impl TradingService {
                 task.completed_notional_usdt = completed;
                 task.completed_batches = batch;
                 task.current_position = current_position;
+                task.cumulative_filled_spread = cumulative_spread;
                 for mut log in logs {
                     log.sequence = task.logs.len() + 1;
                     task.logs.push(log);
@@ -4263,6 +4346,28 @@ fn guard_batch_log(
     }
 }
 
+fn guard_market_supplement_log(
+    opportunity: &Opportunity,
+    batch: usize,
+    side: &str,
+    order: &OrderExecution,
+) -> BatchExecutionLog {
+    BatchExecutionLog {
+        sequence: 0,
+        batch,
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        exchange: order.exchange.clone(),
+        side: side.into(),
+        token: opportunity.token.symbol.clone(),
+        notional_usdt: order.executed_quantity * order.average_price,
+        executed_quantity: order.executed_quantity,
+        average_price: order.average_price,
+        status: order.status.clone(),
+        order_id: order.order_id.clone(),
+        message: "单腿差额立即市价补齐".into(),
+    }
+}
+
 fn unmatched_total(fills: &VecDeque<GuardUnmatchedFill>) -> f64 {
     fills.iter().map(|fill| fill.notional_usdt).sum()
 }
@@ -4277,14 +4382,16 @@ fn guard_order_notionals(desired: f64, unmatched_long: f64, unmatched_short: f64
     }
 }
 
-fn match_guard_fills(
+fn match_guard_fills_with_edge(
     long: &mut VecDeque<GuardUnmatchedFill>,
     short: &mut VecDeque<GuardUnmatchedFill>,
-) -> f64 {
+) -> (f64, f64) {
     let mut matched = 0.0;
+    let mut edge_value = 0.0;
     while let (Some(long_fill), Some(short_fill)) = (long.front_mut(), short.front_mut()) {
         let amount = long_fill.notional_usdt.min(short_fill.notional_usdt);
         matched += amount;
+        edge_value += amount * (short_fill.price - long_fill.price) / long_fill.price;
         long_fill.notional_usdt -= amount;
         short_fill.notional_usdt -= amount;
         if long_fill.notional_usdt <= f64::EPSILON {
@@ -4294,28 +4401,20 @@ fn match_guard_fills(
             short.pop_front();
         }
     }
-    matched
+    (matched, edge_value)
 }
 
-fn compensation_prices_are_protected(
-    unmatched_long: &VecDeque<GuardUnmatchedFill>,
-    unmatched_short: &VecDeque<GuardUnmatchedFill>,
-    long_ask: f64,
-    short_bid: f64,
+fn required_next_spread(
     threshold: f64,
-) -> bool {
-    if 1.0 + threshold <= 0.0 {
-        return false;
+    completed_notional: f64,
+    cumulative_edge_value: f64,
+    next_notional: f64,
+) -> f64 {
+    if next_notional <= f64::EPSILON {
+        threshold
+    } else {
+        (threshold * (completed_notional + next_notional) - cumulative_edge_value) / next_notional
     }
-    let short_covers_long = unmatched_long.iter().all(|fill| {
-        fill.side == GuardFillSide::Long
-            && short_bid + f64::EPSILON >= fill.price * (1.0 + threshold)
-    });
-    let long_covers_short = unmatched_short.iter().all(|fill| {
-        fill.side == GuardFillSide::Short
-            && long_ask <= fill.price / (1.0 + threshold) + f64::EPSILON
-    });
-    short_covers_long && long_covers_short
 }
 
 fn close_unmatched_total(fills: &VecDeque<CloseUnmatchedFill>) -> f64 {
@@ -5141,25 +5240,19 @@ mod tests {
     }
 
     #[test]
-    fn compensation_price_must_preserve_the_original_guarded_spread() {
+    fn market_supplement_shortfall_raises_the_next_required_spread() {
         let mut long = VecDeque::from([GuardUnmatchedFill {
-            side: GuardFillSide::Long,
             notional_usdt: 20.0,
             price: 100.0,
         }]);
-        let mut short = VecDeque::new();
-        assert!(compensation_prices_are_protected(
-            &long, &short, 100.0, 101.0, 0.01
-        ));
-        assert!(!compensation_prices_are_protected(
-            &long, &short, 99.0, 100.5, 0.01
-        ));
-        short.push_back(GuardUnmatchedFill {
-            side: GuardFillSide::Short,
+        let mut short = VecDeque::from([GuardUnmatchedFill {
             notional_usdt: 20.0,
-            price: 102.0,
-        });
-        assert!((match_guard_fills(&mut long, &mut short) - 20.0).abs() < 1e-9);
+            price: 100.5,
+        }]);
+        let (matched, edge_value) = match_guard_fills_with_edge(&mut long, &mut short);
+        assert!((matched - 20.0).abs() < 1e-9);
+        assert!((edge_value - 0.1).abs() < 1e-9);
+        assert!((required_next_spread(0.01, matched, edge_value, 20.0) - 0.015).abs() < 1e-9);
         assert!(long.is_empty());
         assert!(short.is_empty());
     }
