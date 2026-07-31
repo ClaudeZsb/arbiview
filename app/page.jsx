@@ -261,10 +261,10 @@ function AdjustModal({ position, type, onClose, onSubmit, busy }) {
   );
 }
 
-function BatchIncreasePanel({ position, action, task, onClose, onStart, onCancel, busy }) {
+function BatchIncreasePanel({ position, action, initialTarget, task, onClose, onStart, onCancel, busy }) {
   const isReduce = action === "reduce";
   const maximumReduction = Math.max(0, position.notionalUsdt - 10);
-  const [target, setTarget] = useState(String(isReduce ? Math.min(1000, maximumReduction) : 1000));
+  const [target, setTarget] = useState(String(initialTarget ?? (isReduce ? Math.min(1000, maximumReduction) : 1000)));
   const [orderNotional, setOrderNotional] = useState(Math.min(100, isReduce ? maximumReduction : 100));
   const [intervalSeconds, setIntervalSeconds] = useState(2);
   const [spreadGuard, setSpreadGuard] = useState(false);
@@ -643,7 +643,7 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
                 <button onClick={(event) => { event.preventDefault(); onAdjust(p, "increase"); }}>加仓</button>
                 <button onClick={(event) => { event.preventDefault(); onAdjust(p, "reduce"); }}>减仓</button>
                 <button onClick={(event) => { event.preventDefault(); onAdjust(p, "leverage"); }}>杠杆</button>
-                <button disabled={busyId === p.id} onClick={(event) => { event.preventDefault(); onClose(p.id); }}>{busyId === p.id ? "平仓中…" : "平仓"}</button>
+                <button disabled={busyId === p.id} onClick={(event) => { event.preventDefault(); onClose(p); }}>{busyId === p.id ? "平仓中…" : "平仓"}</button>
               </div>
             </summary>
             <div className="position-details">
@@ -714,7 +714,6 @@ export default function Dashboard() {
   const [adjustment, setAdjustment] = useState(null);
   const [batchPanel, setBatchPanel] = useState(null);
   const [batchTask, setBatchTask] = useState(null);
-  const [closingId, setClosingId] = useState("");
   const [notice, setNotice] = useState("");
   const [streamStatus, setStreamStatus] = useState({ Binance: "idle", Bybit: "idle" });
   const accountBackoffUntil = useRef(0);
@@ -960,21 +959,6 @@ export default function Dashboard() {
       await loadAccount();
     } catch (e) { setNotice(`开仓失败：${e.message}`); }
     finally { setTradeBusy(false); }
-  }
-
-  async function closePosition(id) {
-    setClosingId(id);
-    try {
-      const response = await fetch(`/backend/positions/${id}/close`, { method: "POST" });
-      const json = await response.json();
-      if (!response.ok) throw new Error(json.error);
-      const orderSummary = json.execution?.orders
-        ?.map((order) => `${order.exchange} ${order.status} #${order.orderId}`)
-        .join(" · ");
-      setNotice(orderSummary ? `${json.message} · ${orderSummary}` : json.message);
-      await loadAccount();
-    } catch (e) { setNotice(`平仓失败：${e.message}`); }
-    finally { setClosingId(""); }
   }
 
   async function adjustPosition(notionalUsdt) {
@@ -1310,7 +1294,14 @@ export default function Dashboard() {
 
       <AdvisorCard recommendation={advisor} />
 
-      <AccountBoard account={account} positions={positions} protection={protection} histories={opportunityHistories} historyLoading={historyLoading} onLoadHistory={loadPositionHistory} autoCloseRules={autoCloseRules} onSetAutoClose={setAutoClose} onCancelAutoClose={cancelAutoClose} autoCloseBusy={autoCloseBusy} onClose={closePosition} onAdjust={(position, type) => {
+      <AccountBoard account={account} positions={positions} protection={protection} histories={opportunityHistories} historyLoading={historyLoading} onLoadHistory={loadPositionHistory} autoCloseRules={autoCloseRules} onSetAutoClose={setAutoClose} onCancelAutoClose={cancelAutoClose} autoCloseBusy={autoCloseBusy} onClose={(position) => {
+        if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {
+          setNotice("已有批量仓位任务正在执行，请先等待完成或停止任务");
+          return;
+        }
+        setBatchPanel({ position, type: "reduce", initialTarget: "all" });
+        setBatchTask(null);
+      }} onAdjust={(position, type) => {
         if (type === "increase" || type === "reduce") {
           if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {
             setNotice("已有批量仓位任务正在执行，请先等待完成或停止任务");
@@ -1321,7 +1312,7 @@ export default function Dashboard() {
         } else {
           setAdjustment({ position, type });
         }
-      }} busyId={closingId} />
+      }} busyId="" />
 
       <section className="workspace" id="opportunities">
         <div className="section-head">
@@ -1430,6 +1421,7 @@ export default function Dashboard() {
       {batchPanel && <BatchIncreasePanel
         position={batchPanel.position}
         action={batchPanel.type}
+        initialTarget={batchPanel.initialTarget}
         task={batchTask}
         busy={tradeBusy}
         onStart={startBatchIncrease}
