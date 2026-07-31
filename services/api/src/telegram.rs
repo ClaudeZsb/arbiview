@@ -1295,10 +1295,8 @@ impl TelegramBot {
     async fn show_protection(&self) -> Result<()> {
         let status = self.state.trading.hedge_protection_status().await;
         let mut text = format!(
-            "<b>双腿仓位保护</b>\n状态：{}\n触发门槛：名义价值偏差同时超过 {:.2}% 和 ${:.2}\n孤腿退出：每单 ${:.2} / {:.1}s\n保护标的：{}",
+            "<b>孤腿仓位保护</b>\n状态：{}\n触发条件：仅当一条腿不存在时退出另一条腿\n双腿偏差：不自动调仓\n孤腿退出：每单 ${:.2} / {:.1}s\n保护标的：{}",
             if status.enabled { "运行中" } else { "未启用" },
-            status.tolerance_percent,
-            status.minimum_difference_usdt,
             status.order_notional_usdt,
             status.interval_seconds,
             if status.protected_tokens.is_empty() {

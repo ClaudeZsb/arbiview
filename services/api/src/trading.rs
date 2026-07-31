@@ -134,7 +134,6 @@ impl IncomeSummary {
 const MAX_RECONCILIATION_ATTEMPTS: u8 = 3;
 const HEDGE_PROTECTION_ORDER_USDT: f64 = 100.0;
 const HEDGE_PROTECTION_INTERVAL_SECONDS: f64 = 1.0;
-const HEDGE_PROTECTION_TOLERANCE_RATIO: f64 = 0.03;
 const POSITION_RECONCILIATION_TOLERANCE_RATIO: f64 = 0.01;
 const HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT: f64 = 10.0;
 const FUNDING_REFRESH_DELAY_SECONDS: i64 = 2 * 60;
@@ -377,12 +376,14 @@ impl TradingService {
         }
         let service = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
             loop {
+                service.account_store.wait_for_position_update().await;
+                // Debounce the two exchanges' near-simultaneous account events so a
+                // normal paired fill is observed as a pair instead of a transient orphan.
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 if let Err(error) = service.inspect_hedge_protection().await {
                     tracing::warn!("hedge protection inspection failed: {error:#}");
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
     }
@@ -399,8 +400,8 @@ impl TradingService {
         protected_tokens.dedup();
         HedgeProtectionStatus {
             enabled: self.config.trading_mode == TradingMode::Live,
-            tolerance_percent: HEDGE_PROTECTION_TOLERANCE_RATIO * 100.0,
-            minimum_difference_usdt: HEDGE_PROTECTION_MINIMUM_DIFFERENCE_USDT,
+            tolerance_percent: 0.0,
+            minimum_difference_usdt: 0.0,
             order_notional_usdt: HEDGE_PROTECTION_ORDER_USDT,
             interval_seconds: HEDGE_PROTECTION_INTERVAL_SECONDS,
             protected_tokens,
@@ -464,11 +465,7 @@ impl TradingService {
                 &route.symbol,
                 "short",
             );
-            let needs_protection = match (&long, &short) {
-                (Some(long), Some(short)) => hedge_notional_needs_protection(long, short),
-                (Some(_), None) | (None, Some(_)) => true,
-                (None, None) => false,
-            };
+            let needs_protection = matches!((&long, &short), (Some(_), None) | (None, Some(_)));
             if !needs_protection {
                 continue;
             }
@@ -503,11 +500,7 @@ impl TradingService {
                 &route.symbol,
                 "short",
             );
-            let still_unbalanced = match (&long, &short) {
-                (Some(long), Some(short)) => hedge_notional_needs_protection(long, short),
-                (Some(_), None) | (None, Some(_)) => true,
-                (None, None) => false,
-            };
+            let still_unbalanced = matches!((&long, &short), (Some(_), None) | (None, Some(_)));
             if still_unbalanced {
                 self.run_hedge_protection(route).await;
             }
@@ -547,7 +540,7 @@ impl TradingService {
             token: route.token.clone(),
             event_type: "detecting".into(),
             status: "running".into(),
-            message: "检测到双腿名义价值偏差超过 3% 且超过 10 USDT".into(),
+            message: "检测到一条腿不存在，准备退出剩余腿".into(),
             started_at: now,
             updated_at: now,
             initial_long_notional_usdt: None,
@@ -599,51 +592,25 @@ impl TradingService {
                 event.final_short_notional_usdt = Some(short_notional);
             })
             .await;
-            let (target, event_type, message) = match (long, short) {
+            let target = match (long, short) {
                 (None, None) => {
                     self.complete_protection_event(&event_id, "双腿仓位均已归零")
                         .await;
                     return;
                 }
-                (Some(leg), None) | (None, Some(leg)) => {
-                    (leg, "orphan_exit", "检测到一条腿归零，正在批量退出剩余腿")
-                }
-                (Some(long), Some(short)) => {
-                    if !hedge_notional_needs_protection(&long, &short) {
-                        self.complete_protection_event(
-                            &event_id,
-                            "当前差额未同时超过 3% 与 10 USDT，保护停止",
-                        )
+                (Some(leg), None) | (None, Some(leg)) => leg,
+                (Some(_), Some(_)) => {
+                    self.complete_protection_event(&event_id, "双腿均存在，孤腿保护停止")
                         .await;
-                        return;
-                    }
-                    if position_notional(&long) > position_notional(&short) {
-                        (long, "mismatch_reduce", "正在削减名义价值更大的 LONG 腿")
-                    } else {
-                        (short, "mismatch_reduce", "正在削减名义价值更大的 SHORT 腿")
-                    }
+                    return;
                 }
             };
             self.update_protection_event(&event_id, |event| {
-                event.event_type = event_type.into();
-                event.message = message.into();
+                event.event_type = "orphan_exit".into();
+                event.message = "检测到一条腿归零，正在批量退出剩余腿".into();
             })
             .await;
             let current_notional = position_notional(&target);
-            let other_notional = actual
-                .iter()
-                .find(|leg| {
-                    leg.symbol == target.symbol
-                        && leg.exchange != target.exchange
-                        && leg.side != target.side
-                })
-                .map(position_notional)
-                .unwrap_or(0.0);
-            let excess_notional = if event_type == "orphan_exit" {
-                current_notional
-            } else {
-                (current_notional - other_notional).max(0.0)
-            };
             let metadata = match market_legs.iter().find(|leg| {
                 leg.exchange == target.exchange
                     && leg.market == target.market
@@ -656,12 +623,8 @@ impl TradingService {
                     return;
                 }
             };
-            let quantity = protection_order_quantity(
-                &target,
-                excess_notional,
-                metadata.qty_step,
-                event_type == "orphan_exit",
-            );
+            let quantity =
+                protection_order_quantity(&target, current_notional, metadata.qty_step, true);
             if quantity <= 0.0 {
                 self.fail_protection_event(&event_id, "保护订单数量计算为零".into())
                     .await;
@@ -5174,10 +5137,6 @@ fn hedge_notional_imbalance_ratio(long: &PositionLeg, short: &PositionLeg) -> f6
     }
 }
 
-fn hedge_notional_needs_protection(long: &PositionLeg, short: &PositionLeg) -> bool {
-    hedge_notional_mismatch_exceeds(long, short, HEDGE_PROTECTION_TOLERANCE_RATIO)
-}
-
 fn hedge_notional_mismatch_exceeds(
     long: &PositionLeg,
     short: &PositionLeg,
@@ -5436,34 +5395,6 @@ mod tests {
         long.quantity = 0.0;
         short.quantity = 0.0;
         assert_eq!(hedge_notional_imbalance_ratio(&long, &short), 0.0);
-    }
-
-    #[test]
-    fn hedge_protection_ignores_differences_at_or_below_ten_usdt() {
-        let mut long = test_position().long;
-        let mut short = test_position().short;
-        long.quantity = 2.0;
-        short.quantity = 1.0;
-        long.mark_price = 10.0;
-        short.mark_price = 10.0;
-        assert!(!hedge_notional_needs_protection(&long, &short));
-
-        long.quantity = 2.01;
-        assert!(hedge_notional_needs_protection(&long, &short));
-    }
-
-    #[test]
-    fn hedge_protection_requires_more_than_three_percent_imbalance() {
-        let mut long = test_position().long;
-        let mut short = test_position().short;
-        long.mark_price = 10.0;
-        short.mark_price = 10.0;
-        long.quantity = 100.0;
-        short.quantity = 98.0;
-        assert!(!hedge_notional_needs_protection(&long, &short));
-
-        short.quantity = 96.0;
-        assert!(hedge_notional_needs_protection(&long, &short));
     }
 
     #[test]

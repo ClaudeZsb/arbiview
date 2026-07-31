@@ -606,8 +606,8 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
       <p className="balance-note">未实现盈亏仅统计当前未平仓仓位；已实现盈亏只统计当前跨所套利合约近 {account?.realizedPeriodDays || 7} 日的平仓损益加 Funding 净额再减交易手续费，不含账户内其他策略。Bybit 可用金额为 Unified Account 的 USD 口径，可能低于账户权益。</p>
       {protection?.enabled && (
         <div className="protection-status">
-          <b><ShieldCheck size={14} /> 双腿保护运行中</b>
-          <span>名义价值偏差同时超过 {protection.tolerancePercent}% 和 {money(protection.minimumDifferenceUsdt)} 才保护 · 孤腿退出每单 {money(protection.orderNotionalUsdt)} / {protection.intervalSeconds}s</span>
+          <b><ShieldCheck size={14} /> 孤腿保护运行中</b>
+          <span>仅当一条腿不存在时退出另一条腿 · 每单 {money(protection.orderNotionalUsdt)} / {protection.intervalSeconds}s · 双腿名义价值偏差不再自动调仓</span>
           <small>已保护：{protection.protectedTokens?.join("、") || "等待识别双腿仓位"}</small>
         </div>
       )}

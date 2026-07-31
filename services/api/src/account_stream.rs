@@ -37,6 +37,7 @@ pub struct AccountStore {
     leverage_hints: Arc<RwLock<HashMap<String, u8>>>,
     orders: Arc<RwLock<HashMap<String, OrderExecution>>>,
     order_notify: Arc<Notify>,
+    position_notify: Arc<Notify>,
 }
 
 impl AccountStore {
@@ -51,6 +52,7 @@ impl AccountStore {
         state.balance = balance;
         state.positions = position_map(positions);
         state.initialized = true;
+        self.position_notify.notify_one();
     }
 
     pub async fn seed_bybit(&self, balance: AccountBalance, positions: Vec<PositionLeg>) {
@@ -58,6 +60,7 @@ impl AccountStore {
         state.balance = balance;
         state.positions = position_map(positions);
         state.initialized = true;
+        self.position_notify.notify_one();
     }
 
     pub async fn seed_binance_margin(&self, positions: Vec<PositionLeg>) {
@@ -94,6 +97,10 @@ impl AccountStore {
         } else {
             self.bybit.read().await.connected
         }
+    }
+
+    pub async fn wait_for_position_update(&self) {
+        self.position_notify.notified().await;
     }
 
     pub async fn snapshot(&self, exchange: &str) -> Option<(AccountBalance, Vec<PositionLeg>)> {
@@ -188,6 +195,8 @@ impl AccountStore {
             state.balance.available = (cross_wallet_balance - initial_margin).max(0.0);
         }
         state.initialized = true;
+        drop(state);
+        self.position_notify.notify_one();
     }
 
     pub async fn apply_bybit_event(&self, value: &Value) {
@@ -205,6 +214,8 @@ impl AccountStore {
                         .unwrap_or(state.balance.unrealized_pnl),
                 };
                 state.initialized = true;
+                drop(state);
+                self.position_notify.notify_one();
             }
             Some("position") => {
                 let Some(positions) = value["data"].as_array() else {
@@ -254,6 +265,8 @@ impl AccountStore {
                     .map(|position| position.unrealized_pnl)
                     .sum();
                 state.initialized = true;
+                drop(state);
+                self.position_notify.notify_one();
             }
             Some("order") => {
                 if let Some(orders) = value["data"].as_array() {
