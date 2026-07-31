@@ -1454,14 +1454,14 @@ async fn run_live_quote_stream(
             "wss://stream.bybit.com/v5/public/linear".to_string(),
             Some(serde_json::json!({
                 "op": "subscribe",
-                "args": [format!("tickers.{}", leg.symbol)]
+                "args": [format!("orderbook.1.{}", leg.symbol)]
             })),
         ),
         ("Bybit", "spot") => (
             "wss://stream.bybit.com/v5/public/spot".to_string(),
             Some(serde_json::json!({
                 "op": "subscribe",
-                "args": [format!("tickers.{}", leg.symbol)]
+                "args": [format!("orderbook.1.{}", leg.symbol)]
             })),
         ),
         _ => bail!("unsupported websocket quote route"),
@@ -1533,6 +1533,26 @@ fn live_quote_from_binance(value: &Value) -> Option<LiveQuote> {
 
 fn live_quote_from_bybit(value: &Value) -> Option<LiveQuote> {
     let data = value.get("data")?;
+    if let (Some(bid), Some(ask)) = (
+        data["b"].as_array().and_then(|levels| levels.first()),
+        data["a"].as_array().and_then(|levels| levels.first()),
+    ) {
+        return Some(LiveQuote {
+            at: Instant::now(),
+            bid: bid.as_array().and_then(|level| parse(level.first()?))?,
+            ask: ask.as_array().and_then(|level| parse(level.first()?))?,
+            bid_quantity: bid
+                .as_array()
+                .and_then(|level| level.get(1))
+                .and_then(parse)
+                .unwrap_or(0.0),
+            ask_quantity: ask
+                .as_array()
+                .and_then(|level| level.get(1))
+                .and_then(parse)
+                .unwrap_or(0.0),
+        });
+    }
     Some(LiveQuote {
         at: Instant::now(),
         bid: parse(&data["bid1Price"])?,
@@ -1753,6 +1773,21 @@ mod tests {
             }
         }))
         .expect("Bybit quote");
+        assert_eq!(quote.bid, 2.660);
+        assert_eq!(quote.ask, 2.665);
+        assert_eq!(quote.bid_quantity, 45.2);
+        assert_eq!(quote.ask_quantity, 4.4);
+    }
+
+    #[test]
+    fn parses_bybit_orderbook_websocket_quote() {
+        let quote = live_quote_from_bybit(&serde_json::json!({
+            "data": {
+                "b": [["2.660", "45.2"]],
+                "a": [["2.665", "4.4"]]
+            }
+        }))
+        .expect("Bybit order book");
         assert_eq!(quote.bid, 2.660);
         assert_eq!(quote.ask, 2.665);
         assert_eq!(quote.bid_quantity, 45.2);
