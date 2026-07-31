@@ -3468,7 +3468,7 @@ impl TradingService {
         if market == "spot" {
             return Ok(());
         }
-        match exchange {
+        let result: Result<()> = match exchange {
             "Binance" => {
                 let creds = self
                     .config
@@ -3501,7 +3501,12 @@ impl TradingService {
                 Ok(())
             }
             _ => bail!("unsupported exchange {exchange}"),
-        }
+        };
+        result?;
+        self.account_store
+            .set_leverage_hint(exchange, symbol, leverage)
+            .await;
+        Ok(())
     }
 
     async fn binance_order(

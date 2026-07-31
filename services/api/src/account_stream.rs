@@ -34,12 +34,19 @@ pub struct AccountStore {
     binance: Arc<RwLock<ExchangeAccount>>,
     bybit: Arc<RwLock<ExchangeAccount>>,
     binance_margin_positions: Arc<RwLock<Option<Vec<PositionLeg>>>>,
+    leverage_hints: Arc<RwLock<HashMap<String, u8>>>,
     orders: Arc<RwLock<HashMap<String, OrderExecution>>>,
     order_notify: Arc<Notify>,
 }
 
 impl AccountStore {
     pub async fn seed_binance(&self, balance: AccountBalance, positions: Vec<PositionLeg>) {
+        {
+            let mut hints = self.leverage_hints.write().await;
+            for position in &positions {
+                hints.insert(format!("Binance:{}", position.symbol), position.leverage);
+            }
+        }
         let mut state = self.binance.write().await;
         state.balance = balance;
         state.positions = position_map(positions);
@@ -63,6 +70,13 @@ impl AccountStore {
 
     pub async fn invalidate_binance_margin(&self) {
         *self.binance_margin_positions.write().await = None;
+    }
+
+    pub async fn set_leverage_hint(&self, exchange: &str, symbol: &str, leverage: u8) {
+        self.leverage_hints
+            .write()
+            .await
+            .insert(format!("{exchange}:{symbol}"), leverage);
     }
 
     pub async fn set_connected(&self, exchange: &str, connected: bool) {
@@ -106,13 +120,15 @@ impl AccountStore {
 
     async fn apply_binance_account(&self, value: &Value) {
         let account = &value["a"];
+        let leverage_hints = self.leverage_hints.read().await.clone();
         let mut state = self.binance.write().await;
-        if let Some(balance) = account["B"]
+        let cross_wallet_balance = account["B"]
             .as_array()
             .and_then(|balances| balances.iter().find(|balance| balance["a"] == "USDT"))
-        {
-            state.balance.equity = number(&balance["wb"]).unwrap_or(state.balance.equity);
-        }
+            .and_then(|balance| {
+                state.balance.equity = number(&balance["wb"]).unwrap_or(state.balance.equity);
+                number(&balance["cw"])
+            });
         if let Some(positions) = account["P"].as_array() {
             for position in positions {
                 let Some(symbol) = position["s"].as_str() else {
@@ -135,6 +151,7 @@ impl AccountStore {
                     .positions
                     .get(&key)
                     .map(|position| position.leverage)
+                    .or_else(|| leverage_hints.get(&format!("Binance:{symbol}")).copied())
                     .unwrap_or(1);
                 state.positions.insert(
                     key,
@@ -159,6 +176,17 @@ impl AccountStore {
             .values()
             .map(|position| position.unrealized_pnl)
             .sum();
+        if let Some(cross_wallet_balance) = cross_wallet_balance {
+            let initial_margin = state
+                .positions
+                .values()
+                .filter(|position| position.market == "perpetual")
+                .map(|position| {
+                    position.quantity * position.entry_price / position.leverage.max(1) as f64
+                })
+                .sum::<f64>();
+            state.balance.available = (cross_wallet_balance - initial_margin).max(0.0);
+        }
         state.initialized = true;
     }
 
