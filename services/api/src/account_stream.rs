@@ -33,6 +33,7 @@ struct ExchangeAccount {
 pub struct AccountStore {
     binance: Arc<RwLock<ExchangeAccount>>,
     bybit: Arc<RwLock<ExchangeAccount>>,
+    binance_margin_positions: Arc<RwLock<Option<Vec<PositionLeg>>>>,
     orders: Arc<RwLock<HashMap<String, OrderExecution>>>,
     order_notify: Arc<Notify>,
 }
@@ -50,6 +51,18 @@ impl AccountStore {
         state.balance = balance;
         state.positions = position_map(positions);
         state.initialized = true;
+    }
+
+    pub async fn seed_binance_margin(&self, positions: Vec<PositionLeg>) {
+        *self.binance_margin_positions.write().await = Some(positions);
+    }
+
+    pub async fn binance_margin_positions(&self) -> Option<Vec<PositionLeg>> {
+        self.binance_margin_positions.read().await.clone()
+    }
+
+    pub async fn invalidate_binance_margin(&self) {
+        *self.binance_margin_positions.write().await = None;
     }
 
     pub async fn set_connected(&self, exchange: &str, connected: bool) {

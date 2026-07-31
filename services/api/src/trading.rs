@@ -14,7 +14,7 @@ use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -22,7 +22,6 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 type FundingTotals = HashMap<String, f64>;
 type FundingCache = Option<(i64, IncomeSummary, IncomeSummary)>;
-type MarginPositionCache = Option<(Instant, Vec<PositionLeg>)>;
 const SPREAD_GUARD_POLL_SECONDS: f64 = 0.25;
 const POSITION_SETTLEMENT_CHECKS: usize = 3;
 const SPREAD_GUARD_ORDER_CAP_USDT: f64 = 50.0;
@@ -129,7 +128,6 @@ pub struct TradingService {
     market: MarketService,
     paper_positions: Arc<RwLock<HashMap<String, Position>>>,
     funding_cache: Arc<RwLock<FundingCache>>,
-    margin_position_cache: Arc<RwLock<MarginPositionCache>>,
     margin_position_lock: Arc<Mutex<()>>,
     income_refresh_lock: Arc<Mutex<()>>,
     batch_tasks: Arc<RwLock<HashMap<String, BatchIncreaseTask>>>,
@@ -158,7 +156,6 @@ impl TradingService {
             client: Client::builder().timeout(Duration::from_secs(15)).build()?,
             paper_positions: Arc::new(RwLock::new(HashMap::new())),
             funding_cache: Arc::new(RwLock::new(None)),
-            margin_position_cache: Arc::new(RwLock::new(None)),
             margin_position_lock: Arc::new(Mutex::new(())),
             income_refresh_lock: Arc::new(Mutex::new(())),
             batch_tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -216,6 +213,7 @@ impl TradingService {
             }
             let mut binance_connected = false;
             let mut bybit_connected = false;
+            let mut margin_refresh_seconds = 30u64;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let current_binance = service.account_store.connected("Binance").await;
@@ -246,6 +244,19 @@ impl TradingService {
                 }
                 binance_connected = current_binance;
                 bybit_connected = current_bybit;
+                margin_refresh_seconds = margin_refresh_seconds.saturating_add(1);
+                if margin_refresh_seconds >= 30 {
+                    match service.fetch_binance_margin_positions().await {
+                        Ok(positions) => {
+                            service.account_store.seed_binance_margin(positions).await;
+                            margin_refresh_seconds = 0;
+                        }
+                        Err(error) => {
+                            tracing::warn!("Binance margin snapshot refresh failed: {error:#}");
+                            margin_refresh_seconds = 25;
+                        }
+                    }
+                }
             }
         });
     }
@@ -3686,7 +3697,7 @@ impl TradingService {
                 fill.0
             );
         }
-        *self.margin_position_cache.write().await = None;
+        self.account_store.invalidate_binance_margin().await;
         Ok(OrderExecution {
             exchange: "Binance Spot Margin".into(),
             client_order_id: client_order_id.into(),
@@ -3989,17 +4000,21 @@ impl TradingService {
     }
 
     async fn binance_margin_positions(&self) -> Result<Vec<PositionLeg>> {
-        if let Some((at, positions)) = self.margin_position_cache.read().await.as_ref() {
-            if at.elapsed() < Duration::from_millis(1500) {
-                return Ok(positions.clone());
-            }
+        if let Some(positions) = self.account_store.binance_margin_positions().await {
+            return Ok(positions);
         }
         let _guard = self.margin_position_lock.lock().await;
-        if let Some((at, positions)) = self.margin_position_cache.read().await.as_ref() {
-            if at.elapsed() < Duration::from_millis(1500) {
-                return Ok(positions.clone());
-            }
+        if let Some(positions) = self.account_store.binance_margin_positions().await {
+            return Ok(positions);
         }
+        let positions = self.fetch_binance_margin_positions().await?;
+        self.account_store
+            .seed_binance_margin(positions.clone())
+            .await;
+        Ok(positions)
+    }
+
+    async fn fetch_binance_margin_positions(&self) -> Result<Vec<PositionLeg>> {
         let managed = self.managed_symbols.read().await.clone();
         if managed.is_empty() {
             return Ok(Vec::new());
@@ -4077,7 +4092,6 @@ impl TradingService {
                 leverage: 1,
             });
         }
-        *self.margin_position_cache.write().await = Some((Instant::now(), positions.clone()));
         Ok(positions)
     }
 
