@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const BINANCE_FEE: f64 = 0.0005;
@@ -18,6 +18,7 @@ const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
 const SPREAD_AVERAGE_HALF_LIFE_HOURS: f64 = 6.0;
 const SPREAD_OPPORTUNITY_DEVIATION_THRESHOLD: f64 = 0.005;
+const SPREAD_HISTORY_CONCURRENCY: usize = 8;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 type SpreadAverageCache = HashMap<String, (Instant, f64)>;
@@ -469,12 +470,18 @@ impl MarketService {
 
     async fn enrich_opportunity_averages(&self, opportunities: &mut [Opportunity]) {
         let mut average_tasks = tokio::task::JoinSet::new();
+        let permits = Arc::new(Semaphore::new(SPREAD_HISTORY_CONCURRENCY));
         for (index, opportunity) in opportunities.iter().enumerate() {
             let service = self.clone();
+            let permits = permits.clone();
             let long = opportunity.long.clone();
             let short = opportunity.short.clone();
             let symbol = opportunity.long.symbol.clone();
             average_tasks.spawn(async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .expect("spread-history semaphore remains open");
                 (
                     index,
                     symbol.clone(),
