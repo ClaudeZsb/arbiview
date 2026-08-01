@@ -1,12 +1,10 @@
 mod account_stream;
-mod advisor;
 mod config;
 mod market;
 mod models;
 mod telegram;
 mod trading;
 
-use advisor::AdvisorService;
 use axum::{
     extract::{Path, State},
     http::{HeaderValue, Method, StatusCode},
@@ -29,7 +27,6 @@ use trading::TradingService;
 struct AppState {
     market: MarketService,
     trading: TradingService,
-    advisor: AdvisorService,
 }
 
 #[tokio::main]
@@ -45,16 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let market = MarketService::new(config.clone())?;
     let trading = TradingService::new(config.clone(), market.clone())?;
-    let advisor = AdvisorService::new(
-        market.clone(),
-        trading.clone(),
-        config.advisor_state_path.clone(),
-    )?;
-    let state = Arc::new(AppState {
-        market,
-        trading,
-        advisor,
-    });
+    let state = Arc::new(AppState { market, trading });
     state.trading.spawn_auto_close_monitor();
     state.trading.spawn_hedge_protection_monitor();
     state.trading.spawn_account_streams();
@@ -68,8 +56,6 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/api/opportunities", get(opportunities))
-        .route("/api/advisor/recommendation", get(advisor_recommendation))
-        .route("/api/advisor/latest", get(latest_advisor_recommendation))
         .route("/api/position-quotes", get(position_quotes))
         .route("/api/spread-history/:symbol", get(spread_history))
         .route(
@@ -109,18 +95,6 @@ async fn main() -> anyhow::Result<()> {
 
 async fn opportunities(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.market.opportunities().await?))
-}
-
-async fn advisor_recommendation(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(state.advisor.recommendation().await?))
-}
-
-async fn latest_advisor_recommendation(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(state.advisor.latest_actionable().await?))
 }
 
 async fn position_quotes(

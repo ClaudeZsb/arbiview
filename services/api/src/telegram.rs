@@ -1,5 +1,4 @@
 use crate::{
-    advisor::AdvisorResponse,
     config::TelegramConfig,
     models::{
         AdjustPositionRequest, BatchIncreaseRequest, BatchIncreaseTask, BatchReduceRequest,
@@ -100,9 +99,6 @@ pub fn spawn(config: TelegramConfig, state: Arc<AppState>) {
         }
     });
     tokio::spawn(async move {
-        bot.run_advisor_notifications().await;
-    });
-    tokio::spawn(async move {
         spread_bot.run_spread_notifications().await;
     });
 }
@@ -119,7 +115,6 @@ impl TelegramBot {
                     {"command": "positions", "description": "查询和管理当前仓位"},
                     {"command": "account", "description": "查询账户余额和盈亏"},
                     {"command": "protection", "description": "查询双腿保护状态和事件"},
-                    {"command": "advisor", "description": "查询最新策略建议"},
                     {"command": "open", "description": "开仓：TOKEN 金额 [杠杆]"},
                     {"command": "batch_open", "description": "批量开仓：TOKEN 目标 单笔 间隔 [杠杆]"},
                     {"command": "guard_open", "description": "保价差限价开仓：TOKEN 目标 [杠杆] [门槛%]"},
@@ -226,7 +221,6 @@ impl TelegramBot {
             "/positions" | "/status" => self.show_positions().await,
             "/account" | "/balance" => self.show_account().await,
             "/protection" => self.show_protection().await,
-            "/advisor" | "/advice" => self.show_advisor().await,
             "/open" => {
                 let token = parts
                     .next()
@@ -1363,53 +1357,6 @@ impl TelegramBot {
             .await
     }
 
-    async fn show_advisor(&self) -> Result<()> {
-        let recommendation = self.state.advisor.recommendation().await?;
-        self.send(&format_advisor(&recommendation), vec![]).await
-    }
-
-    async fn run_advisor_notifications(&self) {
-        let mut notified_entry_settlement = None;
-        let mut notified_take_profit_positions = std::collections::HashSet::new();
-        // Allow market and account caches to warm before publishing the first result.
-        tokio::time::sleep(Duration::from_secs(8)).await;
-        loop {
-            match self.state.advisor.recommendation().await {
-                Ok(recommendation) => {
-                    let new_take_profit_positions = recommendation
-                        .positions
-                        .iter()
-                        .filter(|position| {
-                            position.take_profit_allowed
-                                && !notified_take_profit_positions.contains(&position.position_id)
-                        })
-                        .map(|position| position.position_id.clone())
-                        .collect::<Vec<_>>();
-                    let should_send = match recommendation.action.as_str() {
-                        "enter" => {
-                            notified_entry_settlement != Some(recommendation.next_settlement_at)
-                        }
-                        "take_profit_allowed" => !new_take_profit_positions.is_empty(),
-                        _ => false,
-                    };
-                    if should_send {
-                        if let Err(error) =
-                            self.send(&format_advisor(&recommendation), vec![]).await
-                        {
-                            tracing::warn!("Telegram advisor notification failed: {error:#}");
-                        } else if recommendation.action == "enter" {
-                            notified_entry_settlement = Some(recommendation.next_settlement_at);
-                        } else {
-                            notified_take_profit_positions.extend(new_take_profit_positions);
-                        }
-                    }
-                }
-                Err(error) => tracing::warn!("advisor evaluation failed: {error:#}"),
-            }
-            tokio::time::sleep(Duration::from_secs(15)).await;
-        }
-    }
-
     async fn run_spread_notifications(&self) {
         const DEVIATION_THRESHOLD: f64 = 0.01;
         const TOKEN_COOLDOWN: Duration = Duration::from_secs(15 * 60);
@@ -1724,61 +1671,6 @@ fn funding_schedule(leg: &crate::models::Leg) -> String {
         leg.interval_hours,
         settlement
     )
-}
-
-fn format_advisor(recommendation: &AdvisorResponse) -> String {
-    let settlement = chrono::DateTime::from_timestamp_millis(recommendation.next_settlement_at)
-        .map(|time| {
-            time.with_timezone(&chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid offset"))
-                .format("%H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|| "—".into());
-    let mut text = match recommendation.action.as_str() {
-        "enter" => {
-            let entry = recommendation.entry.as_ref().expect("entry recommendation");
-            format!(
-                "🟢 <b>策略建议：允许入场</b>\n<b>{}</b> · LONG {} / SHORT {}\nAPY：{:.2}%（结算候选第 {} 名）\n回本时间：{:.2} 小时\n价差：当前 {:+.3}% / 24h 加权基准 {:+.3}% / 偏离 {:+.3}%\n下一结算：{}\n\n{}",
-                html(&entry.token),
-                html(&entry.long_exchange),
-                html(&entry.short_exchange),
-                entry.apy_percent,
-                entry.apy_rank,
-                entry.break_even_hours,
-                entry.spread_percent,
-                entry.average_spread_24h_percent,
-                entry.spread_vs_average_percent,
-                settlement,
-                html(&recommendation.reason)
-            )
-        }
-        "take_profit_allowed" => format!(
-            "🟠 <b>策略建议：允许止盈退出</b>\n{}",
-            html(&recommendation.reason)
-        ),
-        _ => format!(
-            "⚪️ <b>策略建议：继续等待</b>\n{}\n下一整点：{}",
-            html(&recommendation.reason),
-            settlement
-        ),
-    };
-    for position in &recommendation.positions {
-        text.push_str(&format!(
-            "\n\n<b>{}</b> · {}\n净收益 ${:+.2} / 门槛 ${:.2}\nFunding ${:+.2} + 未实现 ${:+.2} − 手续费 ${:.2}",
-            html(&position.token),
-            if position.take_profit_allowed {
-                "允许止盈"
-            } else {
-                "继续持有"
-            },
-            position.net_profit_usdt,
-            position.take_profit_threshold_usdt,
-            position.funding_received_usdt,
-            position.unrealized_pnl_usdt,
-            position.estimated_fees_usdt
-        ));
-    }
-    text
 }
 
 fn button(text: &str, callback_data: &str) -> Button {

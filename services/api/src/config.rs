@@ -35,7 +35,6 @@ pub struct Config {
     pub auto_close_state_path: Option<PathBuf>,
     pub managed_symbols_state_path: Option<PathBuf>,
     pub position_funding_state_path: Option<PathBuf>,
-    pub advisor_state_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -65,15 +64,6 @@ impl Config {
                 auto_close_state_path
                     .as_ref()
                     .map(|path| path.with_file_name("managed-symbols.json"))
-            });
-        let advisor_state_path = std::env::var("ADVISOR_STATE_PATH")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                auto_close_state_path
-                    .as_ref()
-                    .map(|path| path.with_file_name("latest-advisor-recommendation.json"))
             });
         let position_funding_state_path = std::env::var("POSITION_FUNDING_STATE_PATH")
             .ok()
@@ -107,7 +97,6 @@ impl Config {
             auto_close_state_path,
             managed_symbols_state_path,
             position_funding_state_path,
-            advisor_state_path,
         })
     }
 }
