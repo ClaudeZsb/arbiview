@@ -242,11 +242,15 @@ impl MarketService {
         let (mut cross_opportunities, mut spot_candidates): (Vec<_>, Vec<_>) = opportunities
             .into_iter()
             .partition(|opportunity| opportunity.route_type == "cross_perpetual");
+        // Use the current-hour realized settlement edge as a cheap prefilter.
+        // Only the ten strongest candidates need 24h funding history and the
+        // more expensive projection through the next 8-hour boundary.
+        cross_opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
+        cross_opportunities.truncate(10);
         self.enrich_cross_funding_projections(&mut cross_opportunities)
             .await;
         cross_opportunities.retain(|opportunity| opportunity.funding_per_hour > 0.0);
         cross_opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
-        cross_opportunities.truncate(10);
         spot_candidates.sort_by(|a, b| b.apy.total_cmp(&a.apy));
         let mut spot_opportunities = Vec::with_capacity(10);
         for opportunity in spot_candidates {
