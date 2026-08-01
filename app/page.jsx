@@ -122,6 +122,7 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
           <span className="metric-label">资金费率 APY</span>
           <strong>{pct(item.apy, 1)}</strong>
           <small>净收益 {pct(item.fundingPerHour, 4)} / 小时</small>
+          {item.routeType === "cross_perpetual" && <small>最佳平均收益需持有 {item.apyHorizonHours} 小时</small>}
           {item.borrowInterestPerHour > 0 &&
             <small className="borrow-cost">借币成本 −{pct(item.borrowInterestPerHour, 4).replace("+", "")} / 小时</small>}
         </div>

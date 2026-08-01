@@ -39,6 +39,7 @@ pub struct Opportunity {
     pub funding_per_hour: f64,
     pub borrow_interest_per_hour: f64,
     pub apy: f64,
+    pub apy_horizon_hours: u8,
     pub spread: f64,
     pub average_spread_24h: f64,
     pub spread_vs_average: f64,

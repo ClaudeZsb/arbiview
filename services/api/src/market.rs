@@ -17,12 +17,14 @@ const BINANCE_FEE: f64 = 0.0005;
 const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
 const SPREAD_AVERAGE_HALF_LIFE_HOURS: f64 = 6.0;
+const FUNDING_AVERAGE_HALF_LIFE_HOURS: f64 = SPREAD_AVERAGE_HALF_LIFE_HOURS;
 const SPREAD_OPPORTUNITY_ABSOLUTE_THRESHOLD: f64 = 0.005;
 const SPREAD_OPPORTUNITY_DEVIATION_THRESHOLD: f64 = 0.005;
 const SPREAD_HISTORY_CONCURRENCY: usize = 8;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
 type VolumeCache = Option<(Instant, HashMap<String, f64>)>;
 type SpreadAverageCache = HashMap<String, (Instant, f64)>;
+type FundingAverageCache = HashMap<String, (Instant, f64)>;
 type BorrowRateCache = HashMap<String, (Instant, f64)>;
 type BorrowAvailabilityCache = HashMap<String, (Instant, bool)>;
 type RouteLegCache = HashMap<String, Leg>;
@@ -61,6 +63,7 @@ pub struct MarketService {
     binance_volume_cache: Arc<RwLock<VolumeCache>>,
     binance_volume_lock: Arc<Mutex<()>>,
     spread_average_cache: Arc<RwLock<SpreadAverageCache>>,
+    funding_average_cache: Arc<RwLock<FundingAverageCache>>,
     borrow_rate_cache: Arc<RwLock<BorrowRateCache>>,
     borrow_availability_cache: Arc<RwLock<BorrowAvailabilityCache>>,
     route_leg_cache: Arc<RwLock<RouteLegCache>>,
@@ -84,6 +87,7 @@ impl MarketService {
             binance_volume_cache: Arc::new(RwLock::new(None)),
             binance_volume_lock: Arc::new(Mutex::new(())),
             spread_average_cache: Arc::new(RwLock::new(HashMap::new())),
+            funding_average_cache: Arc::new(RwLock::new(HashMap::new())),
             borrow_rate_cache: Arc::new(RwLock::new(HashMap::new())),
             borrow_availability_cache: Arc::new(RwLock::new(HashMap::new())),
             route_leg_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -169,10 +173,7 @@ impl MarketService {
                 }
                 matched.insert(symbol);
                 let token = classify_token(symbol, cmc.get(symbol), b, y);
-                if let Some(x) = make_opportunity(&token, b, y) {
-                    opportunities.push(x);
-                }
-                if let Some(x) = make_opportunity(&token, y, b) {
+                if let Some(x) = make_cross_candidate(&token, b, y) {
                     opportunities.push(x);
                 }
                 if let Some(spread_opportunity) = make_spread_opportunity(&token, b, y) {
@@ -241,6 +242,9 @@ impl MarketService {
         let (mut cross_opportunities, mut spot_candidates): (Vec<_>, Vec<_>) = opportunities
             .into_iter()
             .partition(|opportunity| opportunity.route_type == "cross_perpetual");
+        self.enrich_cross_funding_projections(&mut cross_opportunities)
+            .await;
+        cross_opportunities.retain(|opportunity| opportunity.funding_per_hour > 0.0);
         cross_opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
         cross_opportunities.truncate(10);
         spot_candidates.sort_by(|a, b| b.apy.total_cmp(&a.apy));
@@ -314,7 +318,19 @@ impl MarketService {
         };
         let funding_per_hour = match (long.market.as_str(), short.market.as_str()) {
             ("perpetual", "perpetual") => {
-                short.rate / short.interval_hours - long.rate / long.interval_hours
+                let (long_average, short_average) = tokio::try_join!(
+                    self.weighted_funding_average(&long),
+                    self.weighted_funding_average(&short)
+                )?;
+                cross_funding_projection(
+                    &long,
+                    &short,
+                    chrono::Utc::now().timestamp_millis(),
+                    long_average,
+                    short_average,
+                )
+                .map(|(average, _)| average)
+                .unwrap_or(0.0)
             }
             ("perpetual", "spot") => {
                 let borrow_rate = self.spot_borrow_rate(&short.exchange, &short.base).await?;
@@ -499,6 +515,59 @@ impl MarketService {
                     tracing::warn!(symbol, "24h hourly spread average unavailable: {error:#}");
                 }
                 Err(error) => tracing::warn!("24h spread-average task failed: {error}"),
+            }
+        }
+    }
+
+    async fn enrich_cross_funding_projections(&self, opportunities: &mut [Opportunity]) {
+        let mut tasks = tokio::task::JoinSet::new();
+        let permits = Arc::new(Semaphore::new(SPREAD_HISTORY_CONCURRENCY));
+        for opportunity in opportunities.iter_mut() {
+            opportunity.funding_per_hour = 0.0;
+            opportunity.apy = 0.0;
+        }
+        for (index, opportunity) in opportunities.iter().enumerate() {
+            let service = self.clone();
+            let permits = permits.clone();
+            let long = opportunity.long.clone();
+            let short = opportunity.short.clone();
+            tasks.spawn(async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .expect("funding-history semaphore remains open");
+                let averages = tokio::try_join!(
+                    service.weighted_funding_average(&long),
+                    service.weighted_funding_average(&short)
+                );
+                (index, long, short, averages)
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((index, long, short, Ok((long_average, short_average)))) => {
+                    let opportunity = &mut opportunities[index];
+                    if let Some((average_per_hour, horizon_hours)) = cross_funding_projection(
+                        &long,
+                        &short,
+                        chrono::Utc::now().timestamp_millis(),
+                        long_average,
+                        short_average,
+                    ) {
+                        opportunity.funding_per_hour = average_per_hour;
+                        opportunity.apy = average_per_hour * YEAR_HOURS;
+                        opportunity.apy_horizon_hours = horizon_hours;
+                    } else {
+                        opportunity.funding_per_hour = 0.0;
+                        opportunity.apy = 0.0;
+                    }
+                }
+                Ok((index, _, _, Err(error))) => {
+                    opportunities[index].funding_per_hour = 0.0;
+                    opportunities[index].apy = 0.0;
+                    tracing::warn!("cross-exchange funding projection unavailable: {error:#}");
+                }
+                Err(error) => tracing::warn!("funding-projection task failed: {error}"),
             }
         }
     }
@@ -1240,6 +1309,32 @@ impl MarketService {
         Ok(rates)
     }
 
+    async fn weighted_funding_average(&self, leg: &Leg) -> Result<f64> {
+        let key = format!("{}:{}", leg.exchange, leg.symbol);
+        if let Some((at, average)) = self.funding_average_cache.read().await.get(&key) {
+            // Historical settlement data only changes at funding boundaries; avoid
+            // refetching every instrument on each 20-second opportunity scan.
+            if at.elapsed() < Duration::from_secs(60 * 60) {
+                return Ok(*average);
+            }
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let cutoff = now - 24 * 60 * 60 * 1_000;
+        let points = self
+            .funding_history(leg)
+            .await?
+            .into_iter()
+            .filter(|(timestamp, _)| *timestamp >= cutoff && *timestamp <= now)
+            .collect::<Vec<_>>();
+        let average =
+            time_weighted_average(&points, FUNDING_AVERAGE_HALF_LIFE_HOURS).unwrap_or(leg.rate);
+        self.funding_average_cache
+            .write()
+            .await
+            .insert(key, (Instant::now(), average));
+        Ok(average)
+    }
+
     async fn spot_borrow_rate(&self, exchange: &str, asset: &str) -> Result<f64> {
         let key = format!("{exchange}:{asset}");
         if let Some((at, rate)) = self.borrow_rate_cache.read().await.get(&key) {
@@ -1571,6 +1666,10 @@ fn live_quote_from_bybit(value: &Value) -> Option<LiveQuote> {
 }
 
 fn time_weighted_spread_average(points: &[(i64, f64)], half_life_hours: f64) -> Option<f64> {
+    time_weighted_average(points, half_life_hours)
+}
+
+fn time_weighted_average(points: &[(i64, f64)], half_life_hours: f64) -> Option<f64> {
     if points.is_empty() || !half_life_hours.is_finite() || half_life_hours <= 0.0 {
         return None;
     }
@@ -1595,37 +1694,78 @@ fn strategy_reference_price(mark_price: f64, last_price: f64) -> (f64, bool) {
     }
 }
 
-fn make_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunity> {
-    make_cross_opportunity_at(token, long, short, chrono::Utc::now().timestamp_millis())
+fn make_cross_candidate(token: &Token, first: &Leg, second: &Leg) -> Option<Opportunity> {
+    make_cross_candidate_at(token, first, second, chrono::Utc::now().timestamp_millis())
 }
 
-fn make_cross_opportunity_at(
+fn make_cross_candidate_at(
     token: &Token,
+    first: &Leg,
+    second: &Leg,
+    now: i64,
+) -> Option<Opportunity> {
+    const HOUR_MILLIS: i64 = 60 * 60 * 1_000;
+    let current_hour = now.div_euclid(HOUR_MILLIS) * HOUR_MILLIS + HOUR_MILLIS;
+    let first_rate = projected_rate_at(first, current_hour, 0.0);
+    let second_rate = projected_rate_at(second, current_hour, 0.0);
+    let (long, short, current_hour_return) = if second_rate > first_rate {
+        (first, second, second_rate - first_rate)
+    } else if first_rate > second_rate {
+        (second, first, first_rate - second_rate)
+    } else {
+        return None;
+    };
+    Some(build_opportunity(token, long, short, current_hour_return))
+}
+
+fn settles_at(leg: &Leg, settlement_at: i64) -> bool {
+    const HOUR_MILLIS: i64 = 60 * 60 * 1_000;
+    const SETTLEMENT_TOLERANCE_MILLIS: i64 = 60 * 1_000;
+    if leg.market != "perpetual"
+        || leg.next_funding_time <= 0
+        || settlement_at < leg.next_funding_time - SETTLEMENT_TOLERANCE_MILLIS
+    {
+        return false;
+    }
+    let interval_millis = (leg.interval_hours.round() as i64).max(1) * HOUR_MILLIS;
+    let offset = settlement_at - leg.next_funding_time;
+    offset.rem_euclid(interval_millis) <= SETTLEMENT_TOLERANCE_MILLIS
+        || interval_millis - offset.rem_euclid(interval_millis) <= SETTLEMENT_TOLERANCE_MILLIS
+}
+
+fn projected_rate_at(leg: &Leg, settlement_at: i64, weighted_average: f64) -> f64 {
+    if !settles_at(leg, settlement_at) {
+        0.0
+    } else if (settlement_at - leg.next_funding_time).abs() <= 60 * 1_000 {
+        leg.rate
+    } else {
+        weighted_average
+    }
+}
+
+fn cross_funding_projection(
     long: &Leg,
     short: &Leg,
     now_millis: i64,
-) -> Option<Opportunity> {
-    let long_settles = settles_at_next_hour(long, now_millis);
-    let short_settles = settles_at_next_hour(short, now_millis);
-    if !long_settles && !short_settles {
-        return None;
-    }
-    let next_hour_return =
-        if short_settles { short.rate } else { 0.0 } - if long_settles { long.rate } else { 0.0 };
-    if next_hour_return <= 0.0 {
-        return None;
-    }
-    Some(build_opportunity(token, long, short, next_hour_return))
-}
-
-fn settles_at_next_hour(leg: &Leg, now_millis: i64) -> bool {
+    long_weighted_average: f64,
+    short_weighted_average: f64,
+) -> Option<(f64, u8)> {
     const HOUR_MILLIS: i64 = 60 * 60 * 1_000;
-    const SETTLEMENT_TOLERANCE_MILLIS: i64 = 60 * 1_000;
-    if leg.market != "perpetual" || leg.next_funding_time <= now_millis {
-        return false;
+    const EIGHT_HOURS_MILLIS: i64 = 8 * HOUR_MILLIS;
+    let first_hour = now_millis.div_euclid(HOUR_MILLIS) * HOUR_MILLIS + HOUR_MILLIS;
+    let end = now_millis.div_euclid(EIGHT_HOURS_MILLIS) * EIGHT_HOURS_MILLIS + EIGHT_HOURS_MILLIS;
+    let mut cumulative = 0.0;
+    let mut best: Option<(f64, u8)> = None;
+    for (index, settlement_at) in (first_hour..=end).step_by(HOUR_MILLIS as usize).enumerate() {
+        cumulative += projected_rate_at(short, settlement_at, short_weighted_average)
+            - projected_rate_at(long, settlement_at, long_weighted_average);
+        let elapsed_hours = (index + 1) as u8;
+        let average_per_hour = cumulative / f64::from(elapsed_hours);
+        if best.is_none_or(|(best_average, _)| average_per_hour > best_average) {
+            best = Some((average_per_hour, elapsed_hours));
+        }
     }
-    let next_hour = now_millis.div_euclid(HOUR_MILLIS) * HOUR_MILLIS + HOUR_MILLIS;
-    (leg.next_funding_time - next_hour).abs() <= SETTLEMENT_TOLERANCE_MILLIS
+    best.filter(|(average, _)| *average > 0.0)
 }
 
 fn make_spot_short_perpetual_long(
@@ -1731,6 +1871,7 @@ fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f
         funding_per_hour,
         borrow_interest_per_hour: 0.0,
         apy: funding_per_hour * YEAR_HOURS,
+        apy_horizon_hours: 1,
         spread,
         average_spread_24h,
         spread_vs_average,
@@ -2021,38 +2162,8 @@ mod tests {
     }
 
     #[test]
-    fn cross_opportunity_only_counts_legs_settling_at_the_next_hour() {
-        let now = 30 * 60 * 1_000;
-        let next_hour = 60 * 60 * 1_000;
-        let four_hours = 4 * 60 * 60 * 1_000;
-        let token = Token {
-            symbol: "TEST".into(),
-            name: "TEST".into(),
-            rank: None,
-            tags: vec![],
-        };
-        let mut long = test_leg("Binance", vec![]);
-        long.rate = 0.01;
-        long.interval_hours = 4.0;
-        long.next_funding_time = four_hours;
-        let mut short = test_leg("Bybit", vec![]);
-        short.rate = 0.002;
-        short.interval_hours = 1.0;
-        short.next_funding_time = next_hour;
-
-        let opportunity =
-            make_cross_opportunity_at(&token, &long, &short, now).expect("next-hour settlement");
-        assert!((opportunity.funding_per_hour - 0.002).abs() < 1e-12);
-        assert!((opportunity.apy - 0.002 * YEAR_HOURS).abs() < 1e-9);
-
-        short.next_funding_time = four_hours;
-        assert!(make_cross_opportunity_at(&token, &long, &short, now).is_none());
-    }
-
-    #[test]
-    fn cross_opportunity_combines_both_rates_when_both_legs_settle_next_hour() {
-        let now = 3 * 60 * 60 * 1_000 + 30 * 60 * 1_000;
-        let settlement = 4 * 60 * 60 * 1_000;
+    fn cross_funding_projection_uses_live_rate_for_current_cycle_and_weighted_rate_later() {
+        let now = 9 * 60 * 60 * 1_000 + 30 * 60 * 1_000;
         let token = Token {
             symbol: "TEST".into(),
             name: "TEST".into(),
@@ -2062,14 +2173,46 @@ mod tests {
         let mut long = test_leg("Binance", vec![]);
         long.rate = 0.001;
         long.interval_hours = 4.0;
-        long.next_funding_time = settlement;
+        long.next_funding_time = 12 * 60 * 60 * 1_000;
         let mut short = test_leg("Bybit", vec![]);
-        short.rate = 0.003;
+        short.rate = 0.002;
         short.interval_hours = 1.0;
-        short.next_funding_time = settlement;
+        short.next_funding_time = 10 * 60 * 60 * 1_000;
 
-        let opportunity =
-            make_cross_opportunity_at(&token, &long, &short, now).expect("both settle");
-        assert!((opportunity.funding_per_hour - 0.002).abs() < 1e-12);
+        let candidate =
+            make_cross_candidate_at(&token, &long, &short, now).expect("funding direction");
+        assert_eq!(candidate.long.exchange, "Binance");
+        assert_eq!(candidate.short.exchange, "Bybit");
+        let (average, hours) = cross_funding_projection(&long, &short, now, 0.002, 0.001)
+            .expect("profitable projection");
+        assert_eq!(hours, 1);
+        assert!((average - 0.002).abs() < 1e-12);
+        assert_eq!(
+            projected_rate_at(&short, 10 * 60 * 60 * 1_000, 0.001),
+            0.002
+        );
+        assert_eq!(
+            projected_rate_at(&short, 11 * 60 * 60 * 1_000, 0.001),
+            0.001
+        );
+        assert_eq!(projected_rate_at(&long, 11 * 60 * 60 * 1_000, 0.002), 0.0);
+    }
+
+    #[test]
+    fn cross_funding_projection_selects_maximum_average_and_horizon() {
+        let now = 8 * 60 * 60 * 1_000 + 30 * 60 * 1_000;
+        let mut long = test_leg("Binance", vec![]);
+        long.rate = 0.008;
+        long.interval_hours = 8.0;
+        long.next_funding_time = 16 * 60 * 60 * 1_000;
+        let mut short = test_leg("Bybit", vec![]);
+        short.rate = 0.001;
+        short.interval_hours = 1.0;
+        short.next_funding_time = 9 * 60 * 60 * 1_000;
+
+        let (average, hours) = cross_funding_projection(&long, &short, now, 0.008, 0.002)
+            .expect("profitable projection");
+        assert_eq!(hours, 7);
+        assert!((average - (0.001 + 6.0 * 0.002) / 7.0).abs() < 1e-12);
     }
 }

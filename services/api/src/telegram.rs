@@ -779,13 +779,14 @@ impl TelegramBot {
         let mut keyboard = vec![];
         for (index, opportunity) in snapshot.opportunities.iter().take(10).enumerate() {
             text.push_str(&format!(
-                "{}. <b>{}</b>{} {}→{} · APY {:+.1}% · 价差 {:+.3}% · 回本 {}\n",
+                "{}. <b>{}</b>{} {}→{} · APY {:+.1}%（{}h）· 价差 {:+.3}% · 回本 {}\n",
                 index + 1,
                 html(&opportunity.token.symbol),
                 telegram_tags(&opportunity.token.tags),
                 html(&opportunity.long.exchange),
                 html(&opportunity.short.exchange),
                 opportunity.apy * 100.0,
+                opportunity.apy_horizon_hours,
                 opportunity.spread * 100.0,
                 break_even(opportunity.break_even_hours)
             ));
@@ -844,7 +845,7 @@ impl TelegramBot {
             short_exchange(&opportunity.short.exchange)
         );
         let text = format!(
-            "<b>{}/USDT</b>{}\n🟢 LONG {} · {} @ ${:.6} · 24h {}\n   {}\n🔴 SHORT {} · {} @ ${:.6} · 24h {}\n   {}\n\n资金 APY：{:+.2}%\n开仓价差：{:+.3}%\n预计回本：{}\n资金净收益：{:+.5}%/小时{}",
+            "<b>{}/USDT</b>{}\n🟢 LONG {} · {} @ ${:.6} · 24h {}\n   {}\n🔴 SHORT {} · {} @ ${:.6} · 24h {}\n   {}\n\n资金 APY：{:+.2}%{}\n开仓价差：{:+.3}%\n预计回本：{}\n资金净收益：{:+.5}%/小时{}",
             html(&opportunity.token.symbol),
             telegram_tags(&opportunity.token.tags),
             html(&opportunity.long.exchange),
@@ -858,6 +859,11 @@ impl TelegramBot {
             compact_usdt(opportunity.short.volume_24h_usdt),
             funding_schedule(&opportunity.short),
             opportunity.apy * 100.0,
+            if opportunity.route_type == "cross_perpetual" {
+                format!("（最佳平均收益需持有 {} 小时）", opportunity.apy_horizon_hours)
+            } else {
+                String::new()
+            },
             opportunity.spread * 100.0,
             break_even(opportunity.break_even_hours),
             opportunity.funding_per_hour * 100.0,
