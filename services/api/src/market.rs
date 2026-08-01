@@ -17,6 +17,7 @@ const BINANCE_FEE: f64 = 0.0005;
 const BYBIT_FEE: f64 = 0.00055;
 const YEAR_HOURS: f64 = 365.0 * 24.0;
 const SPREAD_AVERAGE_HALF_LIFE_HOURS: f64 = 6.0;
+const SPREAD_OPPORTUNITY_ABSOLUTE_THRESHOLD: f64 = 0.005;
 const SPREAD_OPPORTUNITY_DEVIATION_THRESHOLD: f64 = 0.005;
 const SPREAD_HISTORY_CONCURRENCY: usize = 8;
 type QuoteCache = Option<(Instant, Vec<PositionQuote>)>;
@@ -174,16 +175,8 @@ impl MarketService {
                 if let Some(x) = make_opportunity(&token, y, b) {
                     opportunities.push(x);
                 }
-                let mut spread_candidates = [
-                    make_spread_opportunity(&token, b, y),
-                    make_spread_opportunity(&token, y, b),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-                spread_candidates.sort_by(|a, b| b.spread.total_cmp(&a.spread));
-                if let Some(best) = spread_candidates.into_iter().next() {
-                    spread_opportunities.push(best);
+                if let Some(spread_opportunity) = make_spread_opportunity(&token, b, y) {
+                    spread_opportunities.push(spread_opportunity);
                 }
             }
             if let Some(spot) = b_spot_map.get(symbol) {
@@ -1700,7 +1693,17 @@ fn is_tradefi(leg: &Leg) -> bool {
     leg.tags.iter().any(|tag| tag == "tradefi")
 }
 
-fn make_spread_opportunity(token: &Token, long: &Leg, short: &Leg) -> Option<Opportunity> {
+fn make_spread_opportunity(token: &Token, first: &Leg, second: &Leg) -> Option<Opportunity> {
+    let first_long_spread = (second.bid - first.ask) / first.ask;
+    let second_long_spread = (first.bid - second.ask) / second.ask;
+    let (long, short, spread) = if first_long_spread > second_long_spread {
+        (first, second, first_long_spread)
+    } else {
+        (second, first, second_long_spread)
+    };
+    if spread <= SPREAD_OPPORTUNITY_ABSOLUTE_THRESHOLD {
+        return None;
+    }
     let funding_per_hour = short.rate / short.interval_hours - long.rate / long.interval_hours;
     Some(build_opportunity(token, long, short, funding_per_hour))
 }
@@ -1966,6 +1969,55 @@ mod tests {
             tags,
             volume_24h_usdt: 1_000_000.0,
         }
+    }
+
+    #[test]
+    fn spread_arbitrage_has_one_direction_from_low_price_to_high_price() {
+        let token = Token {
+            symbol: "TEST".into(),
+            name: "TEST".into(),
+            rank: None,
+            tags: vec![],
+        };
+        let mut binance = test_leg("Binance", vec![]);
+        binance.bid = 99.9;
+        binance.ask = 100.0;
+        let mut bybit = test_leg("Bybit", vec![]);
+        bybit.bid = 101.0;
+        bybit.ask = 101.1;
+
+        let opportunity =
+            make_spread_opportunity(&token, &binance, &bybit).expect("price dislocation");
+        assert_eq!(opportunity.long.exchange, "Binance");
+        assert_eq!(opportunity.short.exchange, "Bybit");
+        assert!((opportunity.spread - 0.01).abs() < 1e-12);
+
+        binance.bid = 102.0;
+        binance.ask = 102.1;
+        bybit.bid = 100.0;
+        bybit.ask = 100.1;
+        let reverse =
+            make_spread_opportunity(&token, &binance, &bybit).expect("reverse dislocation");
+        assert_eq!(reverse.long.exchange, "Bybit");
+        assert_eq!(reverse.short.exchange, "Binance");
+    }
+
+    #[test]
+    fn spread_arbitrage_prefilter_requires_more_than_half_percent_absolute_gap() {
+        let token = Token {
+            symbol: "TEST".into(),
+            name: "TEST".into(),
+            rank: None,
+            tags: vec![],
+        };
+        let mut binance = test_leg("Binance", vec![]);
+        binance.ask = 100.0;
+        let mut bybit = test_leg("Bybit", vec![]);
+        bybit.bid = 100.5;
+        assert!(make_spread_opportunity(&token, &binance, &bybit).is_none());
+
+        bybit.bid = 100.51;
+        assert!(make_spread_opportunity(&token, &binance, &bybit).is_some());
     }
 
     #[test]
