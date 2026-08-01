@@ -678,7 +678,9 @@ impl MarketService {
             })
             .collect::<Vec<_>>();
         points.sort_by_key(|point| point.timestamp);
-        points.retain(|point| point.timestamp < current_hour_start_millis());
+        // History charts include the current in-progress hour as a live snapshot.
+        // The weighted baseline below intentionally continues to use only closed hours.
+        points.retain(|point| point.timestamp <= current_hour_start_millis());
         if points.len() > 24 {
             points.drain(..points.len() - 24);
         }
@@ -771,7 +773,7 @@ impl MarketService {
             })
             .collect::<Vec<_>>();
         points.sort_by_key(|point| point.timestamp);
-        points.retain(|point| point.timestamp < current_hour_start_millis());
+        points.retain(|point| point.timestamp <= current_hour_start_millis());
         if points.len() > 24 {
             points.drain(..points.len() - 24);
         }
