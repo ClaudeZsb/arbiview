@@ -261,14 +261,16 @@ function AdjustModal({ position, type, onClose, onSubmit, busy }) {
   );
 }
 
-function BatchIncreasePanel({ position, action, initialTarget, task, onClose, onStart, onCancel, busy }) {
+function BatchIncreasePanel({ position, action, initialTarget, initialCloseMode, task, onClose, onStart, onMarketClose, onCancel, busy }) {
   const isReduce = action === "reduce";
   const maximumReduction = Math.max(0, position.notionalUsdt - 10);
   const [target, setTarget] = useState(String(initialTarget ?? (isReduce ? Math.min(1000, maximumReduction) : 1000)));
   const [orderNotional, setOrderNotional] = useState(Math.min(100, isReduce ? maximumReduction : 100));
   const [intervalSeconds, setIntervalSeconds] = useState(2);
   const [spreadGuard, setSpreadGuard] = useState(false);
-  const [noLossGuard, setNoLossGuard] = useState(false);
+  const [closeMode, setCloseMode] = useState(initialCloseMode || "market");
+  const noLossGuard = isReduce && closeMode === "no-loss";
+  const marketFullClose = isReduce && closeMode === "market-full";
   const initialLongClose = position.long.closePrice || position.long.markPrice;
   const initialShortClose = position.short.closePrice || position.short.markPrice;
   const initialCloseSpread = initialLongClose > 0 && initialShortClose > 0
@@ -300,21 +302,25 @@ function BatchIncreasePanel({ position, action, initialTarget, task, onClose, on
         <span><i className="side-dot short" />SHORT · {position.short.exchange} · {position.short.market === "spot" ? "SPOT" : "PERP"}</span>
       </div>
       {!task && <>
-        <label>每腿目标{isReduce ? "平仓" : "加仓"}金额（USDT）<input type={isReduce ? "text" : "number"} inputMode={isReduce ? "decimal" : undefined} min="10" max={isReduce ? maximumReduction : undefined} step="100" value={target} placeholder={isReduce ? "输入金额或 all" : undefined} onChange={(event) => setTarget(event.target.value)} />{isReduce && <small>输入 all 表示两腿全部平仓。</small>}</label>
+        {!marketFullClose && <label>每腿目标{isReduce ? "平仓" : "加仓"}金额（USDT）<input type={isReduce ? "text" : "number"} inputMode={isReduce ? "decimal" : undefined} min="10" max={isReduce ? maximumReduction : undefined} step="100" value={target} placeholder={isReduce ? "输入金额或 all" : undefined} onChange={(event) => setTarget(event.target.value)} />{isReduce && <small>输入 all 表示两腿全部平仓。</small>}</label>}
+        {marketFullClose && <label>平仓金额<input type="text" value="all" readOnly /><small>直接按两所实际剩余仓位数量全部市价平仓。</small></label>}
         {!isReduce && <label>买入模式<select value={spreadGuard ? "guard" : "market"} onChange={(event) => setSpreadGuard(event.target.value === "guard")}>
           <option value="market">市价模式</option>
           <option value="guard">保价差限价模式</option>
         </select></label>}
         {!isReduce && spreadGuard && <label>最低可执行价差（%）<input type="number" step="0.01" value={spreadThreshold} onChange={(event) => setSpreadThreshold(Number(event.target.value))} /></label>}
-        {isReduce && <label>平仓模式<select value={noLossGuard ? "no-loss" : "market"} onChange={(event) => setNoLossGuard(event.target.value === "no-loss")}>
+        {isReduce && <label>平仓模式<select value={closeMode} onChange={(event) => setCloseMode(event.target.value)}>
           <option value="market">市价批量减仓</option>
           <option value="no-loss">保不亏限价平仓</option>
+          <option value="market-full">市价全平</option>
         </select></label>}
         {isReduce && noLossGuard && <label>最高可执行平仓价差（%）<input type="number" step="0.01" value={spreadThreshold} onChange={(event) => setSpreadThreshold(Number(event.target.value))} /><small>默认取当前可平仓价差；数值调低表示等待更有利、潜在盈利更高的退出价差。</small></label>}
-        {(!spreadGuard && !noLossGuard) && <label>单次每腿下单金额（USDT）<input type="number" min="10" step="10" value={orderNotional} onChange={(event) => setOrderNotional(Number(event.target.value))} /></label>}
-        {(!spreadGuard && !noLossGuard) && <label>批次间隔（秒）<input type="number" min="0.5" max="3600" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /></label>}
+        {(!spreadGuard && !noLossGuard && !marketFullClose) && <label>单次每腿下单金额（USDT）<input type="number" min="10" step="10" value={orderNotional} onChange={(event) => setOrderNotional(Number(event.target.value))} /></label>}
+        {(!spreadGuard && !noLossGuard && !marketFullClose) && <label>批次间隔（秒）<input type="number" min="0.5" max="3600" step="0.5" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))} /></label>}
         <div className="batch-estimate">
-          {spreadGuard && !isReduce
+          {marketFullClose
+            ? "二次确认后立即按交易所实际仓位分别发送 reduceOnly 市价全平单；不受最小批次金额限制。"
+            : spreadGuard && !isReduce
             ? "按实时盘口动态下单，单腿每次最多 $50；成交差额立即市价补腿，不利价差由后续 10 批分摊追回"
             : noLossGuard
               ? "同时满足目标平仓价差和累计仓位盈亏不为负才下单；不计资金费和手续费。单腿每次最多 $50，部分成交立即市价补腿，价差欠账由后续 10 批分摊追回"
@@ -322,10 +328,10 @@ function BatchIncreasePanel({ position, action, initialTarget, task, onClose, on
         </div>
         <button
           className="batch-start"
-          disabled={busy || !Number.isFinite(targetAmount) || targetAmount < 10 || ((!spreadGuard && !noLossGuard) && (orderNotional < 10 || orderNotional > targetAmount || intervalSeconds < 0.5)) || (isReduce && !closeAll && targetAmount > maximumReduction)}
-          onClick={() => onStart({ targetNotionalUsdt: targetAmount, closeAll, orderNotionalUsdt: spreadGuard || noLossGuard ? 0 : orderNotional, intervalSeconds: spreadGuard || noLossGuard ? 0.25 : intervalSeconds, spreadGuard, spreadThreshold: spreadThreshold / 100, noLossGuard, closeSpreadThreshold: noLossGuard ? spreadThreshold / 100 : undefined })}
+          disabled={busy || (!marketFullClose && (!Number.isFinite(targetAmount) || targetAmount < 10 || ((!spreadGuard && !noLossGuard) && (orderNotional < 10 || orderNotional > targetAmount || intervalSeconds < 0.5)) || (isReduce && !closeAll && targetAmount > maximumReduction)))}
+          onClick={() => marketFullClose ? onMarketClose(position.id) : onStart({ targetNotionalUsdt: targetAmount, closeAll, orderNotionalUsdt: spreadGuard || noLossGuard ? 0 : orderNotional, intervalSeconds: spreadGuard || noLossGuard ? 0.25 : intervalSeconds, spreadGuard, spreadThreshold: spreadThreshold / 100, noLossGuard, closeSpreadThreshold: noLossGuard ? spreadThreshold / 100 : undefined })}
         >
-          {busy ? "正在创建任务…" : `启动批量${isReduce ? "减仓" : "加仓"}`}
+          {busy ? (marketFullClose ? "正在市价全平…" : "正在创建任务…") : marketFullClose ? "确认市价全平" : `启动批量${isReduce ? "减仓" : "加仓"}`}
         </button>
       </>}
       {task && <>
@@ -1072,6 +1078,30 @@ export default function Dashboard() {
     }
   }
 
+  async function marketClosePosition(positionId) {
+    setTradeBusy(true);
+    try {
+      const response = await fetch(`/backend/positions/${positionId}/close`, {
+        method: "POST",
+        signal: AbortSignal.timeout(30000)
+      });
+      const result = await readJson(response, "市价全平接口");
+      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      const orderSummary = result.execution?.orders
+        ?.map((order) => `${order.exchange} ${order.status} #${order.orderId}`)
+        .join(" · ");
+      setNotice(orderSummary ? `${result.message} · ${orderSummary}` : result.message);
+      setBatchPanel(null);
+      setBatchTask(null);
+      await loadAccount();
+    } catch (error) {
+      setNotice(`市价全平失败：${error.message}`);
+      await loadAccount();
+    } finally {
+      setTradeBusy(false);
+    }
+  }
+
   const refreshBatchTask = useCallback(async (taskId) => {
     try {
       const response = await fetch(`/backend/trades/batch-increase/${taskId}`, { cache: "no-store" });
@@ -1299,7 +1329,7 @@ export default function Dashboard() {
           setNotice("已有批量仓位任务正在执行，请先等待完成或停止任务");
           return;
         }
-        setBatchPanel({ position, type: "reduce", initialTarget: "all" });
+        setBatchPanel({ position, type: "reduce", initialTarget: "all", initialCloseMode: "market-full" });
         setBatchTask(null);
       }} onAdjust={(position, type) => {
         if (type === "increase" || type === "reduce") {
@@ -1422,9 +1452,11 @@ export default function Dashboard() {
         position={batchPanel.position}
         action={batchPanel.type}
         initialTarget={batchPanel.initialTarget}
+        initialCloseMode={batchPanel.initialCloseMode}
         task={batchTask}
         busy={tradeBusy}
         onStart={startBatchIncrease}
+        onMarketClose={marketClosePosition}
         onCancel={cancelBatchIncrease}
         onClose={() => {
           setBatchPanel(null);
