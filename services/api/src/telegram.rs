@@ -1259,11 +1259,12 @@ impl TelegramBot {
         for position in &positions {
             let market_metrics = position_market_metrics(position);
             text.push_str(&format!(
-                "<b>{}</b> · ${:.2} · {}× · 未实现 {:+.2}\n{}\n",
+                "<b>{}</b> · ${:.2} · {}× · 当前盈亏 {:+.2} · ROI {:+.2}%\n{}\n",
                 html(&position.token),
                 position.notional_usdt,
                 position.leverage,
-                position.unrealized_pnl,
+                position.current_pnl_usdt,
+                position.current_roi * 100.0,
                 market_metrics
             ));
             keyboard.push(vec![button(
@@ -1278,7 +1279,7 @@ impl TelegramBot {
     async fn show_position(&self, position: &Position) -> Result<()> {
         self.send(
             &format!(
-                "<b>{}/USDT</b> · 每腿约 ${:.2} · {}×\n\n🟢 LONG {}: {:.6} @ {:.6}\n🔴 SHORT {}: {:.6} @ {:.6}\n未实现盈亏：{:+.4} USDT\n累计 Funding：{:+.4} USDT\n{}",
+                "<b>{}/USDT</b> · 每腿约 ${:.2} · {}×\n\n🟢 LONG {}: {:.6} @ {:.6}\n🔴 SHORT {}: {:.6} @ {:.6}\n未实现盈亏：{:+.4} USDT\n累计 Funding：{:+.4} USDT\n当前盈亏：{:+.4} USDT\n当前 ROI：{:+.3}%（保证金基数 ${:.2}）\n<i>ROI 暂不含交易手续费</i>\n{}",
                 html(&position.token),
                 position.notional_usdt,
                 position.leverage,
@@ -1290,6 +1291,9 @@ impl TelegramBot {
                 position.short.mark_price,
                 position.unrealized_pnl,
                 position.funding_earned,
+                position.current_pnl_usdt,
+                position.current_roi * 100.0,
+                position.roi_basis_usdt,
                 position_market_metrics(position)
             ),
             position_keyboard(position),
@@ -1823,6 +1827,9 @@ mod tests {
             short: test_leg("Bybit", "short"),
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            current_pnl_usdt: 0.0,
+            current_roi: 0.0,
+            roi_basis_usdt: 200.0,
             current_funding_per_hour: None,
             current_spread: None,
             current_apy: None,
@@ -1854,6 +1861,9 @@ mod tests {
             short: test_leg("Bybit", "short"),
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            current_pnl_usdt: 0.0,
+            current_roi: 0.0,
+            roi_basis_usdt: 200.0,
             current_funding_per_hour: None,
             current_spread: None,
             current_apy: None,

@@ -2411,6 +2411,7 @@ impl TradingService {
             TradingMode::Live => self.live_positions().await,
         }?;
         for position in &mut positions {
+            update_position_roi(position);
             match self.market.position_market_metrics(position).await {
                 Ok((funding_per_hour, spread, apy)) => {
                     position.current_funding_per_hour = Some(funding_per_hour);
@@ -2644,6 +2645,9 @@ impl TradingService {
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            current_pnl_usdt: 0.0,
+            current_roi: 0.0,
+            roi_basis_usdt: request.notional_usdt * 2.0 / f64::from(request.leverage),
             current_funding_per_hour: None,
             current_spread: None,
             current_apy: None,
@@ -2974,7 +2978,8 @@ impl TradingService {
         let short =
             short.ok_or_else(|| anyhow!("NAKED_EXPOSURE: actual short position is missing"))?;
         report.outcome = "filled_and_balanced".into();
-        let position = Position {
+        let roi_basis_usdt = position_margin_basis(&long, &short);
+        let mut position = Position {
             id: format!("live-{}", opportunity.token.symbol),
             token: opportunity.token.symbol,
             status: "open".into(),
@@ -2985,10 +2990,14 @@ impl TradingService {
             short,
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            current_pnl_usdt: 0.0,
+            current_roi: 0.0,
+            roi_basis_usdt,
             current_funding_per_hour: None,
             current_spread: None,
             current_apy: None,
         };
+        update_position_roi(&mut position);
         Ok(TradeResponse {
             position,
             mode: "live".into(),
@@ -3348,7 +3357,8 @@ impl TradingService {
         let short =
             short.ok_or_else(|| anyhow!("position was fully closed; refresh the position list"))?;
         report.outcome = "reduced_and_balanced".into();
-        let reduced = Position {
+        let roi_basis_usdt = position_margin_basis(&long, &short);
+        let mut reduced = Position {
             id: position.id,
             token: position.token,
             status: "open".into(),
@@ -3357,12 +3367,16 @@ impl TradingService {
             leverage: position.leverage,
             funding_earned: position.funding_earned,
             unrealized_pnl: long.unrealized_pnl + short.unrealized_pnl,
+            current_pnl_usdt: 0.0,
+            current_roi: 0.0,
+            roi_basis_usdt,
             current_funding_per_hour: position.current_funding_per_hour,
             current_spread: position.current_spread,
             current_apy: position.current_apy,
             long,
             short,
         };
+        update_position_roi(&mut reduced);
         Ok(TradeResponse {
             position: reduced,
             mode: "live".into(),
@@ -4065,6 +4079,7 @@ impl TradingService {
                 let short = legs.iter().find(|x| x.side == "short")?.clone();
                 let pnl = long.unrealized_pnl + short.unrealized_pnl;
                 let funding_earned = long.funding_earned + short.funding_earned;
+                let roi_basis_usdt = position_margin_basis(&long, &short);
                 Some(Position {
                     id: format!("live-{token}"),
                     token,
@@ -4076,6 +4091,9 @@ impl TradingService {
                     short,
                     funding_earned,
                     unrealized_pnl: pnl,
+                    current_pnl_usdt: 0.0,
+                    current_roi: 0.0,
+                    roi_basis_usdt,
                     current_funding_per_hour: None,
                     current_spread: None,
                     current_apy: None,
@@ -5124,6 +5142,22 @@ fn position_notional(leg: &PositionLeg) -> f64 {
     leg.quantity * leg.mark_price
 }
 
+fn position_margin_basis(long: &PositionLeg, short: &PositionLeg) -> f64 {
+    let margin =
+        |leg: &PositionLeg| leg.quantity * leg.entry_price / f64::from(leg.leverage.max(1));
+    margin(long) + margin(short)
+}
+
+fn update_position_roi(position: &mut Position) {
+    position.current_pnl_usdt = position.unrealized_pnl + position.funding_earned;
+    position.roi_basis_usdt = position_margin_basis(&position.long, &position.short);
+    position.current_roi = if position.roi_basis_usdt > f64::EPSILON {
+        position.current_pnl_usdt / position.roi_basis_usdt
+    } else {
+        0.0
+    };
+}
+
 fn reduced_notional_at_reference(
     original_quantity: f64,
     final_quantity: f64,
@@ -5444,6 +5478,19 @@ mod tests {
     }
 
     #[test]
+    fn position_roi_uses_both_legs_margin_and_current_lifecycle_profit() {
+        let mut position = test_position();
+        position.long.leverage = 10;
+        position.short.leverage = 5;
+        position.unrealized_pnl = 4.0;
+        position.funding_earned = 2.0;
+        update_position_roi(&mut position);
+        assert!((position.roi_basis_usdt - 30.0).abs() < 1e-9);
+        assert!((position.current_pnl_usdt - 6.0).abs() < 1e-9);
+        assert!((position.current_roi - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
     fn auto_close_never_treats_missing_market_data_as_zero_apy() {
         let position = test_position();
         assert_eq!(held_route_apy_percent(&position, &[]), None);
@@ -5509,6 +5556,9 @@ mod tests {
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            current_pnl_usdt: 0.0,
+            current_roi: 0.0,
+            roi_basis_usdt: 200.0,
             current_funding_per_hour: None,
             current_spread: None,
             current_apy: None,
