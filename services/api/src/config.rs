@@ -35,6 +35,8 @@ pub struct Config {
     pub auto_close_state_path: Option<PathBuf>,
     pub managed_symbols_state_path: Option<PathBuf>,
     pub position_funding_state_path: Option<PathBuf>,
+    pub spread_strategy_state_path: Option<PathBuf>,
+    pub spread_strategy_enabled: bool,
 }
 
 impl Config {
@@ -74,6 +76,15 @@ impl Config {
                     .as_ref()
                     .map(|path| path.with_file_name("position-funding-baselines.json"))
             });
+        let spread_strategy_state_path = std::env::var("SPREAD_STRATEGY_STATE_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                auto_close_state_path
+                    .as_ref()
+                    .map(|path| path.with_file_name("spread-strategy.json"))
+            });
         Ok(Self {
             port: std::env::var("PORT")
                 .ok()
@@ -97,6 +108,10 @@ impl Config {
             auto_close_state_path,
             managed_symbols_state_path,
             position_funding_state_path,
+            spread_strategy_state_path,
+            spread_strategy_enabled: std::env::var("SPREAD_STRATEGY_ENABLED")
+                .unwrap_or_else(|_| "true".into())
+                .parse()?,
         })
     }
 }

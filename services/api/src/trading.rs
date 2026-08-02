@@ -1167,6 +1167,7 @@ impl TradingService {
             spread_wait_count: 0,
             no_loss_guard: false,
             current_close_pnl_usdt: None,
+            minimum_roi: None,
             completed_notional_usdt: 0.0,
             completed_batches: 0,
             total_batches,
@@ -1272,6 +1273,7 @@ impl TradingService {
             spread_wait_count: 0,
             no_loss_guard: request.no_loss_guard,
             current_close_pnl_usdt: None,
+            minimum_roi: request.minimum_roi,
             completed_notional_usdt: 0.0,
             completed_batches: 0,
             total_batches,
@@ -2080,13 +2082,24 @@ impl TradingService {
                     price: short_quote.ask,
                 });
             }
-            let (_, projected_pnl, _) =
+            let (projected_matched, projected_pnl, _) =
                 match_close_fills(&mut projected_long, &mut projected_short);
             self.update_batch(&task_id, |task| {
                 task.current_close_pnl_usdt = Some(realized_position_pnl + projected_pnl)
             })
             .await;
-            if !no_loss_next_batch_allowed(realized_position_pnl, projected_pnl) {
+            let projected_total = (completed + projected_matched).max(f64::EPSILON);
+            let required_total_price_pnl = request.minimum_roi.unwrap_or(0.0)
+                * position.roi_basis_usdt
+                + position.estimated_trading_fees_usdt
+                - position.funding_earned;
+            let required_projected_pnl = required_total_price_pnl
+                * (projected_total / request.target_notional_usdt.max(f64::EPSILON));
+            if !minimum_position_pnl_allowed(
+                realized_position_pnl,
+                projected_pnl,
+                required_projected_pnl,
+            ) {
                 self.record_spread_wait(&task_id, None).await;
                 tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
                 continue;
@@ -4842,8 +4855,12 @@ fn match_close_fills(
     (matched, pnl, spread_value)
 }
 
-fn no_loss_next_batch_allowed(realized_position_pnl: f64, projected_batch_pnl: f64) -> bool {
-    realized_position_pnl + projected_batch_pnl >= -1e-8
+fn minimum_position_pnl_allowed(
+    realized_position_pnl: f64,
+    projected_batch_pnl: f64,
+    required_position_pnl: f64,
+) -> bool {
+    realized_position_pnl + projected_batch_pnl + 1e-8 >= required_position_pnl
 }
 
 fn no_loss_batch_log(
@@ -5805,8 +5822,9 @@ mod tests {
         }]);
         let (_, pnl, _) = match_close_fills(&mut long, &mut short);
         assert!(pnl < 0.0);
-        assert!(!no_loss_next_batch_allowed(-0.40, 0.30));
-        assert!(no_loss_next_batch_allowed(-0.40, 0.40));
-        assert!(no_loss_next_batch_allowed(0.20, -0.10));
+        assert!(!minimum_position_pnl_allowed(-0.40, 0.30, 0.0));
+        assert!(minimum_position_pnl_allowed(-0.40, 0.40, 0.0));
+        assert!(minimum_position_pnl_allowed(0.20, -0.10, 0.0));
+        assert!(!minimum_position_pnl_allowed(0.20, -0.10, 0.15));
     }
 }

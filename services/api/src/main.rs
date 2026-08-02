@@ -2,6 +2,7 @@ mod account_stream;
 mod config;
 mod market;
 mod models;
+mod spread_strategy;
 mod telegram;
 mod trading;
 
@@ -19,6 +20,7 @@ use models::{
     OpenTradeRequest, SetAutoCloseRequest,
 };
 use serde_json::json;
+use spread_strategy::SpreadStrategyService;
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use trading::TradingService;
@@ -27,6 +29,7 @@ use trading::TradingService;
 struct AppState {
     market: MarketService,
     trading: TradingService,
+    spread_strategy: SpreadStrategyService,
 }
 
 #[tokio::main]
@@ -42,10 +45,21 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let market = MarketService::new(config.clone())?;
     let trading = TradingService::new(config.clone(), market.clone())?;
-    let state = Arc::new(AppState { market, trading });
+    let spread_strategy = SpreadStrategyService::new(
+        market.clone(),
+        trading.clone(),
+        config.spread_strategy_state_path.clone(),
+        config.spread_strategy_enabled,
+    )?;
+    let state = Arc::new(AppState {
+        market,
+        trading,
+        spread_strategy,
+    });
     state.trading.spawn_auto_close_monitor();
     state.trading.spawn_hedge_protection_monitor();
     state.trading.spawn_account_streams();
+    state.spread_strategy.spawn();
     if let Some(telegram) = config.telegram.clone() {
         telegram::spawn(telegram, state.clone());
     }
@@ -65,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/account/summary", get(account_summary))
         .route("/api/account/stream-status", get(account_stream_status))
         .route("/api/account/hedge-protection", get(hedge_protection))
+        .route("/api/spread-strategy", get(spread_strategy_status))
         .route("/api/auto-close", get(auto_close_rules))
         .route("/api/auto-close/:id/cancel", post(cancel_auto_close))
         .route("/api/positions", get(positions))
@@ -107,6 +122,12 @@ async fn account_stream_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.account_stream_status().await))
+}
+
+async fn spread_strategy_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.spread_strategy.status().await))
 }
 
 async fn spread_history(

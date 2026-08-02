@@ -197,6 +197,8 @@ pub struct BatchReduceRequest {
     #[serde(default)]
     pub no_loss_guard: bool,
     pub close_spread_threshold: Option<f64>,
+    #[serde(default)]
+    pub minimum_roi: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +239,7 @@ pub struct BatchIncreaseTask {
     pub spread_wait_count: usize,
     pub no_loss_guard: bool,
     pub current_close_pnl_usdt: Option<f64>,
+    pub minimum_roi: Option<f64>,
     pub completed_notional_usdt: f64,
     pub completed_batches: usize,
     pub total_batches: usize,

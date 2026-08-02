@@ -10,11 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 const API_TIMEOUT_SECONDS: u64 = 25;
 const DEFAULT_NOTIONAL: f64 = 100.0;
@@ -91,15 +87,11 @@ pub fn spawn(config: TelegramConfig, state: Arc<AppState>) {
         state,
     };
     let polling_bot = bot.clone();
-    let spread_bot = bot.clone();
     tokio::spawn(async move {
         tracing::info!("Telegram bot enabled with long polling");
         if let Err(error) = polling_bot.run().await {
             tracing::error!("Telegram bot stopped: {error:#}");
         }
-    });
-    tokio::spawn(async move {
-        spread_bot.run_spread_notifications().await;
     });
 }
 
@@ -115,6 +107,7 @@ impl TelegramBot {
                     {"command": "positions", "description": "查询和管理当前仓位"},
                     {"command": "account", "description": "查询账户余额和盈亏"},
                     {"command": "protection", "description": "查询双腿保护状态和事件"},
+                    {"command": "spread_strategy", "description": "查询价差回归策略状态"},
                     {"command": "open", "description": "开仓：TOKEN 金额 [杠杆]"},
                     {"command": "batch_open", "description": "批量开仓：TOKEN 目标 单笔 间隔 [杠杆]"},
                     {"command": "guard_open", "description": "保价差限价开仓：TOKEN 目标 [杠杆] [门槛%]"},
@@ -221,6 +214,7 @@ impl TelegramBot {
             "/positions" | "/status" => self.show_positions().await,
             "/account" | "/balance" => self.show_account().await,
             "/protection" => self.show_protection().await,
+            "/spread_strategy" => self.show_spread_strategy().await,
             "/open" => {
                 let token = parts
                     .next()
@@ -618,6 +612,7 @@ impl TelegramBot {
                         interval_seconds: interval.parse()?,
                         no_loss_guard: false,
                         close_spread_threshold: None,
+                        minimum_roi: None,
                     })
                     .await?;
                 self.show_batch_task(&task).await
@@ -636,6 +631,7 @@ impl TelegramBot {
                         interval_seconds: 0.25,
                         no_loss_guard: true,
                         close_spread_threshold: None,
+                        minimum_roi: None,
                     })
                     .await?;
                 self.show_batch_task(&task).await
@@ -654,6 +650,7 @@ impl TelegramBot {
                         interval_seconds: 0.25,
                         no_loss_guard: true,
                         close_spread_threshold: Some(threshold.parse()?),
+                        minimum_roi: None,
                     })
                     .await?;
                 self.show_batch_task(&task).await
@@ -1368,65 +1365,34 @@ impl TelegramBot {
             .await
     }
 
-    async fn run_spread_notifications(&self) {
-        const DEVIATION_THRESHOLD: f64 = 0.01;
-        const TOKEN_COOLDOWN: Duration = Duration::from_secs(15 * 60);
-        let mut last_sent = HashMap::<String, Instant>::new();
-        tokio::time::sleep(Duration::from_secs(12)).await;
-        loop {
-            match self.state.market.opportunities().await {
-                Ok(snapshot) => {
-                    for opportunity in snapshot.spread_opportunities {
-                        if opportunity.spread_vs_average <= DEVIATION_THRESHOLD {
-                            continue;
-                        }
-                        let token = opportunity.token.symbol.to_ascii_uppercase();
-                        if last_sent
-                            .get(&token)
-                            .is_some_and(|sent| sent.elapsed() < TOKEN_COOLDOWN)
-                        {
-                            continue;
-                        }
-                        let message = format!(
-                            "📐 <b>价差偏离提醒 · {}</b>\n\n🟢 LONG {} @ ${:.6}\n🔴 SHORT {} @ ${:.6}\n\n当前方向价差：{:+.3}%\n24h 时间加权基准：{:+.3}%\n高于基准：<b>{:+.3}%</b>\n\n当前价差显著高于近期加权基准，可关注 LONG 低价腿、SHORT 高价腿并等待价差回归。加权半衰期 6 小时；资金费与手续费仍需单独评估。",
-                            html(&opportunity.token.symbol),
-                            html(&opportunity.long.exchange),
-                            opportunity.long.ask,
-                            html(&opportunity.short.exchange),
-                            opportunity.short.bid,
-                            opportunity.spread * 100.0,
-                            opportunity.average_spread_24h * 100.0,
-                            opportunity.spread_vs_average * 100.0
-                        );
-                        match self
-                            .send(
-                                &message,
-                                vec![vec![
-                                    button("查看资费机会", "opps"),
-                                    button("查看持仓", "pos"),
-                                ]],
-                            )
-                            .await
-                        {
-                            Ok(()) => {
-                                last_sent.insert(token, Instant::now());
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    symbol = opportunity.token.symbol,
-                                    "Telegram spread notification failed: {error:#}"
-                                );
-                            }
-                        }
-                    }
-                    last_sent.retain(|_, sent| sent.elapsed() < TOKEN_COOLDOWN);
-                }
-                Err(error) => {
-                    tracing::warn!("spread notification scan failed: {error:#}");
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(20)).await;
-        }
+    async fn show_spread_strategy(&self) -> Result<()> {
+        let Some(trade) = self.state.spread_strategy.status().await else {
+            return self
+                .send("<b>价差回归策略</b>\n状态：等待价差偏离达到 1%", vec![])
+                .await;
+        };
+        self.send(
+            &format!(
+                "<b>价差回归策略 · {}</b>\n状态：{}\n入场偏离：{:+.3}%\n入场价差：{:+.3}%\n当前 ROI：{}\n止盈目标：{}\n退出原因：{}{}",
+                html(&trade.token),
+                html(&trade.status),
+                trade.entry_deviation * 100.0,
+                trade.entry_spread * 100.0,
+                trade.current_roi
+                    .map(|value| format!("{:+.3}%", value * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                trade.target_roi
+                    .map(|value| format!("{:+.3}%", value * 100.0))
+                    .unwrap_or_else(|| "—".into()),
+                trade.exit_reason.as_deref().map(html).unwrap_or_else(|| "—".into()),
+                trade.error
+                    .as_deref()
+                    .map(|error| format!("\n错误：{}", html(error)))
+                    .unwrap_or_default()
+            ),
+            vec![],
+        )
+        .await
     }
 
     async fn confirm_auto_close(
@@ -1501,7 +1467,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询孤腿保护状态和事件\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额/all — 减仓或全平\n/batch_reduce TOKEN 金额/all 单笔 间隔 — 批量减仓\n/no_loss_close TOKEN 金额/all [最高平仓价差%] — 保价差且不亏限价平仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 10 -1.5</code>\n<code>/batch_reduce DEXE all 100 2</code>\n<code>/no_loss_close DEXE all -0.5</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询孤腿保护状态和事件\n/spread_strategy — 查询价差回归策略状态\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额/all — 减仓或全平\n/batch_reduce TOKEN 金额/all 单笔 间隔 — 批量减仓\n/no_loss_close TOKEN 金额/all [最高平仓价差%] — 保价差且不亏限价平仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 10 -1.5</code>\n<code>/batch_reduce DEXE all 100 2</code>\n<code>/no_loss_close DEXE all -0.5</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![
