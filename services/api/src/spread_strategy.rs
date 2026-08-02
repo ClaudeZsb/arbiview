@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 const ENTRY_DEVIATION: f64 = 0.01;
 const ENTRY_NOTIONAL_USDT: f64 = 100.0;
-const ENTRY_LEVERAGE: u8 = 10;
+const ENTRY_LEVERAGE: u8 = 5;
 const ROI_STEP_PER_HOUR: f64 = 0.002;
 const ROI_FLOOR_AFTER_HOURS: i64 = 5;
 const STOP_LOSS_ROI: f64 = -0.02;

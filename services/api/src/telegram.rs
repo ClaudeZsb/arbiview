@@ -226,7 +226,7 @@ impl TelegramBot {
                         .find_position_by_token(token)
                         .await
                         .map(|position| position.leverage)
-                        .unwrap_or(10),
+                        .unwrap_or(5),
                 };
                 let opportunity = self.find_opportunity(token, None, None).await?;
                 self.confirm_open(&opportunity, notional, leverage).await
@@ -244,7 +244,7 @@ impl TelegramBot {
                         .find_position_by_token(token)
                         .await
                         .map(|position| position.leverage)
-                        .unwrap_or(10),
+                        .unwrap_or(5),
                 };
                 let opportunity = self.find_opportunity(token, None, None).await?;
                 self.confirm_batch_open(&opportunity, target, order, interval, leverage)
@@ -261,7 +261,7 @@ impl TelegramBot {
                         .find_position_by_token(token)
                         .await
                         .map(|position| position.leverage)
-                        .unwrap_or(10),
+                        .unwrap_or(5),
                 };
                 let opportunity = self.find_opportunity(token, None, None).await?;
                 let threshold = parts
@@ -875,11 +875,11 @@ impl TelegramBot {
         );
         let keyboard = vec![
             vec![
-                button("开仓 $100 · 10×", &format!("oc|{route}|100|10")),
-                button("开仓 $500 · 10×", &format!("oc|{route}|500|10")),
+                button("开仓 $100 · 5×", &format!("oc|{route}|100|5")),
+                button("开仓 $500 · 5×", &format!("oc|{route}|500|5")),
             ],
             vec![
-                button("开仓 $1000 · 10×", &format!("oc|{route}|1000|10")),
+                button("开仓 $1000 · 5×", &format!("oc|{route}|1000|5")),
                 button("刷新机会", &format!("o|{route}")),
             ],
             vec![button("查看 24h 价差与资费", &format!("oh|{route}"))],
@@ -1467,7 +1467,7 @@ impl TelegramBot {
     async fn send_help(&self) -> Result<()> {
         self.send(
             &format!(
-                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询孤腿保护状态和事件\n/spread_strategy — 查询价差回归策略状态\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 10×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额/all — 减仓或全平\n/batch_reduce TOKEN 金额/all 单笔 间隔 — 批量减仓\n/no_loss_close TOKEN 金额/all [最高平仓价差%] — 保价差且不亏限价平仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 10 -1.5</code>\n<code>/batch_reduce DEXE all 100 2</code>\n<code>/no_loss_close DEXE all -0.5</code>\n所有交易动作均需按钮二次确认。",
+                "<b>ArbiView Telegram Bot</b>\n\n/opportunities — 查询前 10 个资费套利机会\n/positions — 查询并管理仓位\n/account — 查询账户余额和盈亏\n/protection — 查询孤腿保护状态和事件\n/spread_strategy — 查询价差回归策略状态\n/open TOKEN 金额 [杠杆] — 开仓或加仓；新仓默认 5×，加仓沿用当前杠杆\n/batch_open TOKEN 目标 单笔 间隔 [杠杆] — 市价批量加仓\n/guard_open TOKEN 目标 [杠杆] [门槛%] — 按实时盘口容量保价差限价开仓\n/reduce TOKEN 金额/all — 减仓或全平\n/batch_reduce TOKEN 金额/all 单笔 间隔 — 批量减仓\n/no_loss_close TOKEN 金额/all [最高平仓价差%] — 保价差且不亏限价平仓\n/leverage TOKEN 杠杆 — 调整双腿杠杆\n/close TOKEN — 完全平仓\n/autoclose TOKEN APY [单笔] [间隔] — APY 跌破阈值后批量全平\n/autoclose_list — 查询自动平仓规则\n/autoclose_cancel RULE_ID — 取消自动平仓规则\n/help — 显示帮助\n\n示例：<code>/open DEXE {} 2</code>\n<code>/batch_open DEXE 1000 100 2 3</code>\n<code>/guard_open DEXE 1000 5 -1.5</code>\n<code>/batch_reduce DEXE all 100 2</code>\n<code>/no_loss_close DEXE all -0.5</code>\n所有交易动作均需按钮二次确认。",
                 DEFAULT_NOTIONAL
             ),
             vec![
