@@ -2645,6 +2645,7 @@ impl TradingService {
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            estimated_trading_fees_usdt: 0.0,
             current_pnl_usdt: 0.0,
             current_roi: 0.0,
             roi_basis_usdt: request.notional_usdt * 2.0 / f64::from(request.leverage),
@@ -2990,6 +2991,7 @@ impl TradingService {
             short,
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            estimated_trading_fees_usdt: 0.0,
             current_pnl_usdt: 0.0,
             current_roi: 0.0,
             roi_basis_usdt,
@@ -3367,6 +3369,7 @@ impl TradingService {
             leverage: position.leverage,
             funding_earned: position.funding_earned,
             unrealized_pnl: long.unrealized_pnl + short.unrealized_pnl,
+            estimated_trading_fees_usdt: 0.0,
             current_pnl_usdt: 0.0,
             current_roi: 0.0,
             roi_basis_usdt,
@@ -4091,6 +4094,7 @@ impl TradingService {
                     short,
                     funding_earned,
                     unrealized_pnl: pnl,
+                    estimated_trading_fees_usdt: 0.0,
                     current_pnl_usdt: 0.0,
                     current_roi: 0.0,
                     roi_basis_usdt,
@@ -5149,7 +5153,20 @@ fn position_margin_basis(long: &PositionLeg, short: &PositionLeg) -> f64 {
 }
 
 fn update_position_roi(position: &mut Position) {
-    position.current_pnl_usdt = position.unrealized_pnl + position.funding_earned;
+    let fee_rate = |exchange: &str| match exchange {
+        "Binance" => 0.0005,
+        "Bybit" => 0.00055,
+        _ => 0.0,
+    };
+    position.estimated_trading_fees_usdt = [&position.long, &position.short]
+        .into_iter()
+        .map(|leg| {
+            let rate = fee_rate(&leg.exchange);
+            leg.quantity * (leg.entry_price + leg.mark_price) * rate
+        })
+        .sum();
+    position.current_pnl_usdt =
+        position.unrealized_pnl + position.funding_earned - position.estimated_trading_fees_usdt;
     position.roi_basis_usdt = position_margin_basis(&position.long, &position.short);
     position.current_roi = if position.roi_basis_usdt > f64::EPSILON {
         position.current_pnl_usdt / position.roi_basis_usdt
@@ -5486,8 +5503,9 @@ mod tests {
         position.funding_earned = 2.0;
         update_position_roi(&mut position);
         assert!((position.roi_basis_usdt - 30.0).abs() < 1e-9);
-        assert!((position.current_pnl_usdt - 6.0).abs() < 1e-9);
-        assert!((position.current_roi - 0.2).abs() < 1e-9);
+        assert!((position.estimated_trading_fees_usdt - 0.21).abs() < 1e-9);
+        assert!((position.current_pnl_usdt - 5.79).abs() < 1e-9);
+        assert!((position.current_roi - 0.193).abs() < 1e-9);
     }
 
     #[test]
@@ -5556,6 +5574,7 @@ mod tests {
             },
             funding_earned: 0.0,
             unrealized_pnl: 0.0,
+            estimated_trading_fees_usdt: 0.0,
             current_pnl_usdt: 0.0,
             current_roi: 0.0,
             roi_basis_usdt: 200.0,

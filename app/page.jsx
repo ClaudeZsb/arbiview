@@ -611,7 +611,7 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
               <div><span>LONG · {p.long.exchange} · {p.long.market === "spot" ? "SPOT" : "PERP"}</span><b>{p.long.quantity} @ {price(p.long.entryPrice)}</b></div>
               <div><span>SHORT · {p.short.exchange} · {p.short.market === "spot" ? "SPOT" : "PERP"}</span><b>{p.short.quantity} @ {price(p.short.entryPrice)}</b></div>
               <div><span>名义价值 / 杠杆</span><b>{price(p.notionalUsdt)} · {p.long.leverage === p.short.leverage ? `${p.long.leverage}×` : `${p.long.leverage}× / ${p.short.leverage}×`}</b></div>
-              <div title="当前盈亏 = 未实现盈亏 + 本次持仓累计 Funding/借币利息；暂不含交易手续费"><span>当前盈亏 / ROI</span><b className={p.currentPnlUsdt >= 0 ? "positive" : "negative"}>{price(p.currentPnlUsdt)} · {pct(p.currentRoi, 2)}</b></div>
+              <div title="当前盈亏 = 未实现盈亏 + 本次持仓累计 Funding/借币利息 − 两腿预计往返 taker 手续费"><span>扣费盈亏 / ROI</span><b className={p.currentPnlUsdt >= 0 ? "positive" : "negative"}>{price(p.currentPnlUsdt)} · {pct(p.currentRoi, 2)}</b></div>
               <div className="position-actions">
                 <button onClick={(event) => { event.preventDefault(); onAdjust(p, "increase"); }}>加仓</button>
                 <button onClick={(event) => { event.preventDefault(); onAdjust(p, "reduce"); }}>减仓</button>
@@ -624,7 +624,7 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
                 <span>当前资费净差 <b>{p.currentFundingPerHour == null ? "行情暂不可用" : `${pct(p.currentFundingPerHour, 4)} / 小时`}</b></span>
                 <span>当前方向价差 <b className={(p.currentSpread ?? 0) >= 0 ? "positive" : "negative"}>{p.currentSpread == null ? "行情暂不可用" : pct(p.currentSpread, 3)}</b></span>
                 <span>当前净 APY <b className={(p.currentApy ?? 0) >= 0 ? "positive" : "negative"}>{p.currentApy == null ? "行情暂不可用" : pct(p.currentApy, 1)}</b></span>
-                <span title="ROI 分母为双腿按各自实际杠杆计算的开仓保证金之和；暂不含交易手续费">当前 ROI <b className={p.currentRoi >= 0 ? "positive" : "negative"}>{pct(p.currentRoi, 2)}</b> · 盈亏 {money(p.currentPnlUsdt)} / 基数 {money(p.roiBasisUsdt)}</span>
+                <span title="已扣除预计入场及按当前价格退出的两腿 taker 手续费；ROI 分母为双腿按各自实际杠杆计算的开仓保证金之和">扣费 ROI <b className={p.currentRoi >= 0 ? "positive" : "negative"}>{pct(p.currentRoi, 2)}</b> · 盈亏 {money(p.currentPnlUsdt)} / 手续费 {money(p.estimatedTradingFeesUsdt)} / 基数 {money(p.roiBasisUsdt)}</span>
               </div>
               <div className="position-detail-head">
                 <span>方向 / 交易所</span>

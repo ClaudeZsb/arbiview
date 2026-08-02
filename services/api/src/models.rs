@@ -150,6 +150,7 @@ pub struct Position {
     pub short: PositionLeg,
     pub funding_earned: f64,
     pub unrealized_pnl: f64,
+    pub estimated_trading_fees_usdt: f64,
     pub current_pnl_usdt: f64,
     pub current_roi: f64,
     pub roi_basis_usdt: f64,
