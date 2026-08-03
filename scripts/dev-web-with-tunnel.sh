@@ -37,4 +37,9 @@ if ! curl --noproxy '*' --silent --fail --max-time 2 "http://127.0.0.1:${TUNNEL_
   done
 fi
 
-env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy next dev --port 3000
+env \
+  -u HTTP_PROXY -u HTTPS_PROXY \
+  -u http_proxy -u https_proxy \
+  -u ALL_PROXY -u all_proxy \
+  -u NO_PROXY -u no_proxy \
+  next dev --port 3000
