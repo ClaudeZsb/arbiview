@@ -1207,7 +1207,13 @@ impl TradingService {
         if request.close_all {
             request.target_notional_usdt = position.notional_usdt;
         }
-        if !(10.0..=1_000_000.0).contains(&request.target_notional_usdt) {
+        if request.close_all {
+            if !(0.0..=1_000_000.0).contains(&request.target_notional_usdt)
+                || request.target_notional_usdt <= f64::EPSILON
+            {
+                bail!("close-all target position must be greater than zero");
+            }
+        } else if !(10.0..=1_000_000.0).contains(&request.target_notional_usdt) {
             bail!("targetNotionalUsdt must be between 10 and 1,000,000");
         }
         if !request.no_loss_guard
@@ -2131,6 +2137,66 @@ impl TradingService {
                 * position.roi_basis_usdt
                 + position.estimated_trading_fees_usdt
                 - position.funding_earned;
+            if request.close_all && remaining < 10.0 {
+                let current_position = self.positions().await.ok().and_then(|positions| {
+                    positions.into_iter().find(|item| item.id == position.id)
+                });
+                let Some(current_position) = current_position else {
+                    self.update_batch(&task_id, |task| {
+                        task.completed_notional_usdt = task.target_notional_usdt;
+                        task.current_position = None;
+                        task.status = "completed".into();
+                    })
+                    .await;
+                    return;
+                };
+                let residual_price_pnl = current_position.long.quantity
+                    * (long_quote.bid - current_position.long.entry_price)
+                    + current_position.short.quantity
+                        * (current_position.short.entry_price - short_quote.ask);
+                self.update_batch(&task_id, |task| {
+                    task.current_close_pnl_usdt = Some(realized_position_pnl + residual_price_pnl)
+                })
+                .await;
+                if realized_position_pnl + residual_price_pnl + 1e-8 < required_total_price_pnl {
+                    self.record_spread_wait(&task_id, None).await;
+                    tokio::time::sleep(Duration::from_secs_f64(SPREAD_GUARD_POLL_SECONDS)).await;
+                    continue;
+                }
+                batch += 1;
+                match self.close(&current_position.id).await {
+                    Ok(response) => {
+                        let residual_notional = (current_position.long.quantity * long_quote.bid)
+                            .max(current_position.short.quantity * short_quote.ask);
+                        let logs = batch_reduce_logs(
+                            &current_position,
+                            batch,
+                            &response,
+                            residual_notional,
+                        );
+                        self.update_batch(&task_id, |task| {
+                            task.completed_notional_usdt = task.target_notional_usdt;
+                            task.completed_batches = batch;
+                            task.current_position = None;
+                            for mut log in logs {
+                                log.sequence = task.logs.len() + 1;
+                                task.logs.push(log);
+                            }
+                            task.status = "completed".into();
+                        })
+                        .await;
+                    }
+                    Err(error) => {
+                        self.fail_batch_task(
+                            &task_id,
+                            batch,
+                            format!("close-all residual finalization failed: {error:#}"),
+                        )
+                        .await;
+                    }
+                }
+                return;
+            }
             let required_projected_pnl = required_total_price_pnl
                 * (projected_total / request.target_notional_usdt.max(f64::EPSILON));
             if !minimum_position_pnl_allowed(
