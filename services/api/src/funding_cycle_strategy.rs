@@ -375,16 +375,64 @@ impl FundingCycleStrategyService {
         if let Some(task_id) = snapshot.entry_task_id {
             if let Ok(task) = self.trading.batch_task(&task_id).await {
                 if matches!(task.status.as_str(), "completed" | "failed" | "cancelled") {
+                    let completed = task.status == "completed";
+                    let completed_notional = task.completed_notional_usdt;
+                    let task_error = task.error.clone();
                     let mut state = self.state.write().await;
                     state.entry_task_id = None;
-                    state.state = if task.status == "completed" {
+                    state.state = if completed {
                         "holding".into()
                     } else {
                         "waiting".into()
                     };
-                    state.error = task.error;
+                    state.error = task_error.clone();
                     drop(state);
                     self.persist().await?;
+                    self.notify(if completed {
+                        format!(
+                            "✅ <b>DEXE 周期策略入场完成</b>\n每腿累计成交：约 ${completed_notional:.2}\n状态：持仓中"
+                        )
+                    } else {
+                        format!(
+                            "⚠️ <b>DEXE 周期策略入场{}</b>\n{}",
+                            if task.status == "failed" { "失败" } else { "已取消" },
+                            task_error.unwrap_or_else(|| "未提供错误信息".into())
+                        )
+                    })
+                    .await;
+                }
+            }
+        }
+        let exit_task_id = self.state.read().await.exit_task_id.clone();
+        if let Some(task_id) = exit_task_id {
+            if let Ok(task) = self.trading.batch_task(&task_id).await {
+                if matches!(task.status.as_str(), "completed" | "failed" | "cancelled") {
+                    let completed = task.status == "completed";
+                    let completed_notional = task.completed_notional_usdt;
+                    let task_error = task.error.clone();
+                    {
+                        let mut state = self.state.write().await;
+                        state.exit_task_id = None;
+                        state.state = if completed {
+                            "exit_verifying".into()
+                        } else {
+                            "waiting_cleanup".into()
+                        };
+                        state.error = task_error.clone();
+                    }
+                    self.persist().await?;
+                    self.notify(if completed {
+                        format!(
+                            "✅ <b>DEXE 周期策略批量退场完成</b>\n每腿累计平仓：约 ${completed_notional:.2}\n将在整点 +45s 再次检查残仓"
+                        )
+                    } else {
+                        format!(
+                            "⚠️ <b>DEXE 周期策略批量退场{}</b>\n{}\n将在整点 +45s 尝试清理残仓",
+                            if task.status == "failed" { "失败" } else { "已取消" },
+                            task_error.unwrap_or_else(|| "未提供错误信息".into())
+                        )
+                    })
+                    .await;
                 }
             }
         }
