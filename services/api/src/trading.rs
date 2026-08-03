@@ -2137,7 +2137,7 @@ impl TradingService {
                 * position.roi_basis_usdt
                 + position.estimated_trading_fees_usdt
                 - position.funding_earned;
-            if request.close_all && remaining < 10.0 {
+            if request.close_all && remaining <= SPREAD_GUARD_ORDER_CAP_USDT {
                 let current_position = self.positions().await.ok().and_then(|positions| {
                     positions.into_iter().find(|item| item.id == position.id)
                 });
