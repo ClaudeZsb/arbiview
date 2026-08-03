@@ -16,6 +16,9 @@ const ROI_FLOOR_AFTER_HOURS: i64 = 5;
 const STOP_LOSS_ROI: f64 = -0.02;
 const MAX_HOLD_MILLIS: i64 = 10 * 60 * 60 * 1_000;
 const REENTRY_COOLDOWN_MILLIS: i64 = 15 * 60 * 1_000;
+const POSITION_RECONCILE_REST_AFTER_MILLIS: i64 = 6_000;
+const POSITION_RECONCILE_WARN_AFTER_MILLIS: i64 = 30_000;
+const POSITION_RECONCILE_STABLE_SNAPSHOTS: u8 = 2;
 
 fn take_profit_target(entry_deviation: f64, held_hours: i64) -> f64 {
     if held_hours >= ROI_FLOOR_AFTER_HOURS {
@@ -44,6 +47,16 @@ pub struct SpreadStrategyTrade {
     pub current_roi: Option<f64>,
     pub exit_reason: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub expected_long_quantity: Option<f64>,
+    #[serde(default)]
+    pub expected_short_quantity: Option<f64>,
+    #[serde(default)]
+    pub reconciliation_started_at: Option<i64>,
+    #[serde(default)]
+    pub reconciliation_stable_snapshots: u8,
+    #[serde(default)]
+    pub reconciliation_rest_refreshed: bool,
 }
 
 #[derive(Clone)]
@@ -110,6 +123,9 @@ impl SpreadStrategyService {
                 Ok(())
             }
             Some(trade) if trade.status == "entering" => self.monitor_entry(trade).await,
+            Some(trade) if trade.status == "reconciling" => {
+                self.monitor_reconciliation(trade).await
+            }
             Some(trade) if trade.status == "active" => self.monitor_active(trade).await,
             Some(trade) if trade.status == "market_exit" => self.monitor_market_exit(trade).await,
             Some(_) => Ok(()),
@@ -150,6 +166,11 @@ impl SpreadStrategyService {
             current_roi: None,
             exit_reason: None,
             error: None,
+            expected_long_quantity: None,
+            expected_short_quantity: None,
+            reconciliation_started_at: None,
+            reconciliation_stable_snapshots: 0,
+            reconciliation_rest_refreshed: false,
         };
         self.replace_state(Some(trade.clone())).await?;
         match self
@@ -206,16 +227,80 @@ impl SpreadStrategyService {
         if task.status != "completed" {
             return Ok(());
         }
-        let positions = self.trading.positions().await?;
-        if let Some(position) = positions.into_iter().find(|p| p.token == trade.token) {
+        let expected_long = task
+            .logs
+            .iter()
+            .filter(|log| log.side == "long" && log.executed_quantity > 0.0)
+            .map(|log| log.executed_quantity)
+            .sum::<f64>();
+        let expected_short = task
+            .logs
+            .iter()
+            .filter(|log| log.side == "short" && log.executed_quantity > 0.0)
+            .map(|log| log.executed_quantity)
+            .sum::<f64>();
+        if expected_long <= f64::EPSILON || expected_short <= f64::EPSILON {
+            return self
+                .fail(
+                    trade,
+                    "entry completed without a complete two-leg fill ledger".into(),
+                )
+                .await;
+        }
+        trade.status = "reconciling".into();
+        trade.expected_long_quantity = Some(expected_long);
+        trade.expected_short_quantity = Some(expected_short);
+        trade.reconciliation_started_at = Some(chrono::Utc::now().timestamp_millis());
+        trade.reconciliation_stable_snapshots = 0;
+        trade.reconciliation_rest_refreshed = false;
+        trade.error = None;
+        self.replace_state(Some(trade)).await
+    }
+
+    async fn monitor_reconciliation(&self, mut trade: SpreadStrategyTrade) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let started_at = trade.reconciliation_started_at.unwrap_or(now);
+        let positions = if now - started_at >= POSITION_RECONCILE_REST_AFTER_MILLIS
+            && !trade.reconciliation_rest_refreshed
+        {
+            let positions = self.trading.refresh_positions_authoritatively().await?;
+            trade.reconciliation_rest_refreshed = true;
+            positions
+        } else {
+            self.trading.positions().await?
+        };
+        let position = positions
+            .into_iter()
+            .find(|position| position.token == trade.token);
+        let expected_long = trade.expected_long_quantity.unwrap_or(0.0);
+        let expected_short = trade.expected_short_quantity.unwrap_or(0.0);
+        let matches = position.as_ref().is_some_and(|position| {
+            quantity_reconciled(position.long.quantity, expected_long)
+                && quantity_reconciled(position.short.quantity, expected_short)
+        });
+        if matches {
+            trade.reconciliation_stable_snapshots =
+                trade.reconciliation_stable_snapshots.saturating_add(1);
+        } else {
+            trade.reconciliation_stable_snapshots = 0;
+        }
+        if trade.reconciliation_stable_snapshots >= POSITION_RECONCILE_STABLE_SNAPSHOTS {
+            let position = position.expect("matched position must exist");
             trade.status = "active".into();
-            trade.opened_at = Some(chrono::Utc::now().timestamp_millis());
+            trade.opened_at = Some(now);
             trade.position_id = Some(position.id);
             trade.entry_task_id = None;
-            return self.replace_state(Some(trade)).await;
+            trade.error = None;
+        } else if now - started_at >= POSITION_RECONCILE_WARN_AFTER_MILLIS {
+            trade.error = Some(format!(
+                "waiting for authoritative position reconciliation: expected long {:.8}, short {:.8}; actual long {:.8}, short {:.8}",
+                expected_long,
+                expected_short,
+                position.as_ref().map(|p| p.long.quantity).unwrap_or(0.0),
+                position.as_ref().map(|p| p.short.quantity).unwrap_or(0.0)
+            ));
         }
-        self.fail(trade, "entry completed but position is unavailable".into())
-            .await
+        self.replace_state(Some(trade)).await
     }
 
     async fn monitor_active(&self, mut trade: SpreadStrategyTrade) -> Result<()> {
@@ -344,9 +429,14 @@ impl SpreadStrategyService {
     }
 }
 
+fn quantity_reconciled(actual: f64, expected: f64) -> bool {
+    let tolerance = (expected.abs() * 0.001).max(1e-8);
+    (actual - expected).abs() <= tolerance
+}
+
 #[cfg(test)]
 mod tests {
-    use super::take_profit_target;
+    use super::{quantity_reconciled, take_profit_target};
 
     #[test]
     fn take_profit_roi_drops_each_hour_and_reaches_zero_at_five_hours() {
@@ -355,5 +445,13 @@ mod tests {
         assert!((take_profit_target(0.012, 4) - 0.004).abs() < 1e-12);
         assert_eq!(take_profit_target(0.012, 5), 0.0);
         assert_eq!(take_profit_target(0.012, 8), 0.0);
+    }
+
+    #[test]
+    fn position_reconciliation_rejects_a_stale_half_position() {
+        assert!(quantity_reconciled(7_857.0, 7_857.0));
+        assert!(quantity_reconciled(7_853.0, 7_857.0));
+        assert!(!quantity_reconciled(3_960.0, 7_857.0));
+        assert!(!quantity_reconciled(0.0, 7_857.0));
     }
 }

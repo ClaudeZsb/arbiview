@@ -1195,9 +1195,12 @@ impl TradingService {
         &self,
         mut request: BatchReduceRequest,
     ) -> Result<BatchIncreaseTask> {
-        let position = self
-            .positions()
-            .await?
+        let positions = if request.close_all {
+            self.refresh_positions_authoritatively().await?
+        } else {
+            self.positions().await?
+        };
+        let position = positions
             .into_iter()
             .find(|position| position.id == request.position_id)
             .ok_or_else(|| anyhow!("position not found"))?;
@@ -1879,9 +1882,44 @@ impl TradingService {
     async fn run_batch_reduce(
         &self,
         task_id: String,
-        position: Position,
-        request: BatchReduceRequest,
+        mut position: Position,
+        mut request: BatchReduceRequest,
     ) {
+        if request.close_all {
+            match self.refresh_positions_authoritatively().await {
+                Ok(positions) => {
+                    let fresh = positions.into_iter().find(|item| {
+                        item.id == request.position_id || item.token == position.token
+                    });
+                    let Some(fresh) = fresh else {
+                        self.update_batch(&task_id, |task| {
+                            task.completed_notional_usdt = task.target_notional_usdt;
+                            task.current_position = None;
+                            task.status = "completed".into();
+                        })
+                        .await;
+                        return;
+                    };
+                    position = fresh;
+                    request.position_id = position.id.clone();
+                    request.target_notional_usdt = position.notional_usdt;
+                    self.update_batch(&task_id, |task| {
+                        task.target_notional_usdt = position.notional_usdt;
+                        task.current_position = Some(position.clone());
+                    })
+                    .await;
+                }
+                Err(error) => {
+                    self.fail_batch_task(
+                        &task_id,
+                        0,
+                        format!("authoritative close-all position refresh failed: {error:#}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
         if request.no_loss_guard && matches!(self.config.trading_mode, TradingMode::Live) {
             self.run_no_loss_reduce(task_id, position, request).await;
             return;
@@ -2443,6 +2481,23 @@ impl TradingService {
             }
         }
         Ok(positions)
+    }
+
+    /// Refreshes both perpetual account snapshots from the exchanges before composing positions.
+    /// This is intentionally reserved for post-trade reconciliation, not polling paths.
+    pub async fn refresh_positions_authoritatively(&self) -> Result<Vec<Position>> {
+        if self.config.trading_mode != TradingMode::Live {
+            return self.positions().await;
+        }
+        let (binance, bybit) = tokio::try_join!(
+            async {
+                tokio::try_join!(self.fetch_binance_balance(), self.fetch_binance_positions())
+            },
+            async { tokio::try_join!(self.fetch_bybit_balance(), self.fetch_bybit_positions()) }
+        )?;
+        self.account_store.seed_binance(binance.0, binance.1).await;
+        self.account_store.seed_bybit(bybit.0, bybit.1).await;
+        self.positions().await
     }
 
     pub async fn account_summary(&self) -> Result<AccountSummary> {
