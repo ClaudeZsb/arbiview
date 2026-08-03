@@ -71,6 +71,51 @@ struct Button {
 type Keyboard = Vec<Vec<Button>>;
 
 #[derive(Clone)]
+pub struct TelegramNotifier {
+    config: TelegramConfig,
+    client: Client,
+}
+
+impl TelegramNotifier {
+    pub fn new(config: TelegramConfig) -> Self {
+        Self {
+            config,
+            client: Client::builder()
+                .timeout(Duration::from_secs(API_TIMEOUT_SECONDS + 5))
+                .build()
+                .expect("Telegram notification HTTP client"),
+        }
+    }
+
+    pub async fn send_html(&self, text: &str) -> Result<()> {
+        let mut payload = json!({
+            "chat_id": self.config.chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        });
+        if let Some(topic_id) = self.config.topic_id {
+            payload["message_thread_id"] = json!(topic_id);
+        }
+        let response = self
+            .client
+            .post(format!(
+                "https://api.telegram.org/bot{}/sendMessage",
+                self.config.token
+            ))
+            .json(&payload)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Telegram notification failed: HTTP {}",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 struct TelegramBot {
     config: TelegramConfig,
     client: Client,

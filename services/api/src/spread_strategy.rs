@@ -1,6 +1,7 @@
 use crate::{
     market::MarketService,
     models::{BatchIncreaseRequest, BatchReduceRequest},
+    telegram::TelegramNotifier,
     trading::TradingService,
 };
 use anyhow::{Context, Result};
@@ -57,6 +58,10 @@ pub struct SpreadStrategyTrade {
     pub reconciliation_stable_snapshots: u8,
     #[serde(default)]
     pub reconciliation_rest_refreshed: bool,
+    #[serde(default)]
+    pub entry_notified: bool,
+    #[serde(default)]
+    pub exit_notified: bool,
 }
 
 #[derive(Clone)]
@@ -66,6 +71,7 @@ pub struct SpreadStrategyService {
     state: Arc<RwLock<Option<SpreadStrategyTrade>>>,
     state_path: Option<PathBuf>,
     enabled: bool,
+    notifier: Option<TelegramNotifier>,
 }
 
 impl SpreadStrategyService {
@@ -74,6 +80,7 @@ impl SpreadStrategyService {
         trading: TradingService,
         state_path: Option<PathBuf>,
         enabled: bool,
+        notifier: Option<TelegramNotifier>,
     ) -> Result<Self> {
         let state = match state_path.as_deref() {
             Some(path) if path.exists() => Some(
@@ -88,6 +95,7 @@ impl SpreadStrategyService {
             state: Arc::new(RwLock::new(state)),
             state_path,
             enabled,
+            notifier,
         })
     }
 
@@ -171,6 +179,8 @@ impl SpreadStrategyService {
             reconciliation_started_at: None,
             reconciliation_stable_snapshots: 0,
             reconciliation_rest_refreshed: false,
+            entry_notified: false,
+            exit_notified: false,
         };
         self.replace_state(Some(trade.clone())).await?;
         match self
@@ -288,9 +298,29 @@ impl SpreadStrategyService {
             let position = position.expect("matched position must exist");
             trade.status = "active".into();
             trade.opened_at = Some(now);
-            trade.position_id = Some(position.id);
+            trade.position_id = Some(position.id.clone());
             trade.entry_task_id = None;
             trade.error = None;
+            if !trade.entry_notified {
+                trade.entry_notified = true;
+                let message = format!(
+                    "🟢 <b>价差策略入场完成 · {}</b>\nLONG {} · {:.8} @ ${:.8}\nSHORT {} · {:.8} @ ${:.8}\n每腿名义价值：约 ${:.2} · 杠杆：{}×\n信号价差：{:+.3}% · 加权偏离：{:+.3}%",
+                    trade.token,
+                    position.long.exchange,
+                    position.long.quantity,
+                    position.long.entry_price,
+                    position.short.exchange,
+                    position.short.quantity,
+                    position.short.entry_price,
+                    position.notional_usdt,
+                    position.leverage,
+                    trade.entry_spread * 100.0,
+                    trade.entry_deviation * 100.0,
+                );
+                self.replace_state(Some(trade)).await?;
+                self.notify(message).await;
+                return Ok(());
+            }
         } else if now - started_at >= POSITION_RECONCILE_WARN_AFTER_MILLIS {
             trade.error = Some(format!(
                 "waiting for authoritative position reconciliation: expected long {:.8}, short {:.8}; actual long {:.8}, short {:.8}",
@@ -308,9 +338,7 @@ impl SpreadStrategyService {
         let Some(position) = positions.into_iter().find(|p| {
             trade.position_id.as_deref() == Some(p.id.as_str()) || p.token == trade.token
         }) else {
-            trade.status = "closed".into();
-            trade.closed_at = Some(chrono::Utc::now().timestamp_millis());
-            return self.replace_state(Some(trade)).await;
+            return self.finish_exit(trade, "position_closed").await;
         };
         trade.position_id = Some(position.id.clone());
         trade.current_roi = Some(position.current_roi);
@@ -327,10 +355,7 @@ impl SpreadStrategyService {
         if let Some(task_id) = trade.exit_task_id.clone() {
             match self.trading.batch_task(&task_id).await {
                 Ok(task) if task.status == "completed" => {
-                    trade.status = "closed".into();
-                    trade.closed_at = Some(now);
-                    trade.exit_reason = Some("take_profit".into());
-                    return self.replace_state(Some(trade)).await;
+                    return self.finish_exit(trade, "take_profit").await;
                 }
                 Ok(task) if matches!(task.status.as_str(), "queued" | "running" | "cancelling") => {
                     if trade.target_hour != Some(held_hours) && task.status != "cancelling" {
@@ -384,15 +409,19 @@ impl SpreadStrategyService {
         }
         let positions = self.trading.positions().await?;
         let Some(position) = positions.into_iter().find(|p| p.token == trade.token) else {
-            trade.status = "closed".into();
-            trade.closed_at = Some(chrono::Utc::now().timestamp_millis());
-            return self.replace_state(Some(trade)).await;
+            let reason = trade
+                .exit_reason
+                .clone()
+                .unwrap_or_else(|| "market_exit".into());
+            return self.finish_exit(trade, &reason).await;
         };
         match self.trading.close(&position.id).await {
             Ok(_) => {
-                trade.status = "closed".into();
-                trade.closed_at = Some(chrono::Utc::now().timestamp_millis());
-                self.replace_state(Some(trade)).await
+                let reason = trade
+                    .exit_reason
+                    .clone()
+                    .unwrap_or_else(|| "market_exit".into());
+                self.finish_exit(trade, &reason).await
             }
             Err(error) => {
                 self.fail(trade, format!("market exit failed: {error:#}"))
@@ -406,6 +435,41 @@ impl SpreadStrategyService {
         trade.error = Some(error);
         trade.closed_at = Some(chrono::Utc::now().timestamp_millis());
         self.replace_state(Some(trade)).await
+    }
+
+    async fn finish_exit(&self, mut trade: SpreadStrategyTrade, reason: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        trade.status = "closed".into();
+        trade.closed_at = Some(now);
+        trade.exit_reason = Some(reason.into());
+        let should_notify = !trade.exit_notified;
+        trade.exit_notified = true;
+        let held_minutes = (now - trade.opened_at.unwrap_or(trade.signal_at)).max(0) / 60_000;
+        let message = format!(
+            "🔴 <b>价差策略退场完成 · {}</b>\n退出原因：{}\n最后 ROI：{}\n持有时间：{} 小时 {} 分钟",
+            trade.token,
+            exit_reason_label(reason),
+            trade
+                .current_roi
+                .map(|roi| format!("{:+.3}%", roi * 100.0))
+                .unwrap_or_else(|| "—".into()),
+            held_minutes / 60,
+            held_minutes % 60,
+        );
+        self.replace_state(Some(trade)).await?;
+        if should_notify {
+            self.notify(message).await;
+        }
+        Ok(())
+    }
+
+    async fn notify(&self, message: String) {
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+        if let Err(error) = notifier.send_html(&message).await {
+            tracing::warn!("spread strategy Telegram notification failed: {error:#}");
+        }
     }
 
     async fn replace_state(&self, value: Option<SpreadStrategyTrade>) -> Result<()> {
@@ -432,6 +496,16 @@ impl SpreadStrategyService {
 fn quantity_reconciled(actual: f64, expected: f64) -> bool {
     let tolerance = (expected.abs() * 0.001).max(1e-8);
     (actual - expected).abs() <= tolerance
+}
+
+fn exit_reason_label(reason: &str) -> &str {
+    match reason {
+        "take_profit" => "止盈",
+        "stop_loss" => "止损",
+        "max_hold_time" => "达到最长持有时间",
+        "position_closed" => "仓位已在外部关闭",
+        _ => "市价退出",
+    }
 }
 
 #[cfg(test)]

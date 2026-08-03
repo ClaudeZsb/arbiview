@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         trading.clone(),
         config.spread_strategy_state_path.clone(),
         config.spread_strategy_enabled,
+        config.telegram.clone().map(telegram::TelegramNotifier::new),
     )?;
     let state = Arc::new(AppState {
         market,
