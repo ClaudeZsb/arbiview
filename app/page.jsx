@@ -852,7 +852,24 @@ export default function Dashboard() {
           };
           const long = updateLeg(position.long);
           const short = updateLeg(position.short);
-          return { ...position, long, short, unrealizedPnl: long.unrealizedPnl + short.unrealizedPnl };
+          const unrealizedPnl = long.unrealizedPnl + short.unrealizedPnl;
+          const feeRate = (exchange) => exchange === "Binance" ? 0.0005 : exchange === "Bybit" ? 0.00055 : 0;
+          const estimatedTradingFeesUsdt = [long, short].reduce((total, leg) =>
+            total + leg.quantity * (leg.entryPrice + leg.markPrice) * feeRate(leg.exchange), 0);
+          const roiBasisUsdt = [long, short].reduce((total, leg) =>
+            total + leg.quantity * leg.entryPrice / Math.max(1, leg.leverage || 1), 0);
+          const currentPnlUsdt = unrealizedPnl + Number(position.fundingEarned || 0) - estimatedTradingFeesUsdt;
+          const currentRoi = roiBasisUsdt > 0 ? currentPnlUsdt / roiBasisUsdt : 0;
+          return {
+            ...position,
+            long,
+            short,
+            unrealizedPnl,
+            estimatedTradingFeesUsdt,
+            roiBasisUsdt,
+            currentPnlUsdt,
+            currentRoi
+          };
         }));
         setStreamStatus({
           Binance: [...relevant.values()].some((quote) => quote.exchange === "Binance") ? "live" : "offline",
