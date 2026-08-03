@@ -1033,7 +1033,10 @@ export default function Dashboard() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(20000)
+        // The backend is reached through an SSH tunnel. Keep the request alive
+        // through temporary tunnel stalls; the server makes task creation
+        // idempotent, so recovery can safely attach to the created task.
+        signal: AbortSignal.timeout(60000)
       });
       const task = await response.json();
       if (!response.ok) throw new Error(task.error);
@@ -1042,7 +1045,7 @@ export default function Dashboard() {
       try {
         const recoveryResponse = await fetch("/backend/trades/batch-tasks", {
           cache: "no-store",
-          signal: AbortSignal.timeout(10000)
+          signal: AbortSignal.timeout(30000)
         });
         const tasks = await recoveryResponse.json();
         const action = batchPanel.type === "reduce" ? "reduce" : "increase";
