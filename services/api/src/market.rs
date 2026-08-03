@@ -333,7 +333,7 @@ impl MarketService {
                     long_average,
                     short_average,
                 )
-                .map(|(average, _)| average)
+                .map(|(average, _, _, _)| average)
                 .unwrap_or(0.0)
             }
             ("perpetual", "spot") => {
@@ -529,6 +529,8 @@ impl MarketService {
         for opportunity in opportunities.iter_mut() {
             opportunity.funding_per_hour = 0.0;
             opportunity.apy = 0.0;
+            opportunity.maximum_cumulative_funding_return = 0.0;
+            opportunity.maximum_cumulative_funding_horizon_hours = 0;
         }
         for (index, opportunity) in opportunities.iter().enumerate() {
             let service = self.clone();
@@ -551,7 +553,12 @@ impl MarketService {
             match result {
                 Ok((index, long, short, Ok((long_average, short_average)))) => {
                     let opportunity = &mut opportunities[index];
-                    if let Some((average_per_hour, horizon_hours)) = cross_funding_projection(
+                    if let Some((
+                        average_per_hour,
+                        horizon_hours,
+                        maximum_cumulative_return,
+                        maximum_cumulative_horizon_hours,
+                    )) = cross_funding_projection(
                         &long,
                         &short,
                         chrono::Utc::now().timestamp_millis(),
@@ -561,14 +568,21 @@ impl MarketService {
                         opportunity.funding_per_hour = average_per_hour;
                         opportunity.apy = average_per_hour * YEAR_HOURS;
                         opportunity.apy_horizon_hours = horizon_hours;
+                        opportunity.maximum_cumulative_funding_return = maximum_cumulative_return;
+                        opportunity.maximum_cumulative_funding_horizon_hours =
+                            maximum_cumulative_horizon_hours;
                     } else {
                         opportunity.funding_per_hour = 0.0;
                         opportunity.apy = 0.0;
+                        opportunity.maximum_cumulative_funding_return = 0.0;
+                        opportunity.maximum_cumulative_funding_horizon_hours = 0;
                     }
                 }
                 Ok((index, _, _, Err(error))) => {
                     opportunities[index].funding_per_hour = 0.0;
                     opportunities[index].apy = 0.0;
+                    opportunities[index].maximum_cumulative_funding_return = 0.0;
+                    opportunities[index].maximum_cumulative_funding_horizon_hours = 0;
                     tracing::warn!("cross-exchange funding projection unavailable: {error:#}");
                 }
                 Err(error) => tracing::warn!("funding-projection task failed: {error}"),
@@ -1753,23 +1767,32 @@ fn cross_funding_projection(
     now_millis: i64,
     long_weighted_average: f64,
     short_weighted_average: f64,
-) -> Option<(f64, u8)> {
+) -> Option<(f64, u8, f64, u8)> {
     const HOUR_MILLIS: i64 = 60 * 60 * 1_000;
     const EIGHT_HOURS_MILLIS: i64 = 8 * HOUR_MILLIS;
     let first_hour = now_millis.div_euclid(HOUR_MILLIS) * HOUR_MILLIS + HOUR_MILLIS;
     let end = now_millis.div_euclid(EIGHT_HOURS_MILLIS) * EIGHT_HOURS_MILLIS + EIGHT_HOURS_MILLIS;
     let mut cumulative = 0.0;
-    let mut best: Option<(f64, u8)> = None;
+    let mut best_average: Option<(f64, u8)> = None;
+    let mut best_cumulative: Option<(f64, u8)> = None;
     for (index, settlement_at) in (first_hour..=end).step_by(HOUR_MILLIS as usize).enumerate() {
         cumulative += projected_rate_at(short, settlement_at, short_weighted_average)
             - projected_rate_at(long, settlement_at, long_weighted_average);
         let elapsed_hours = (index + 1) as u8;
         let average_per_hour = cumulative / f64::from(elapsed_hours);
-        if best.is_none_or(|(best_average, _)| average_per_hour > best_average) {
-            best = Some((average_per_hour, elapsed_hours));
+        if best_average.is_none_or(|(best, _)| average_per_hour > best) {
+            best_average = Some((average_per_hour, elapsed_hours));
+        }
+        if best_cumulative.is_none_or(|(best, _)| cumulative > best) {
+            best_cumulative = Some((cumulative, elapsed_hours));
         }
     }
-    best.filter(|(average, _)| *average > 0.0)
+    match (best_average, best_cumulative) {
+        (Some((average, average_hours)), Some((cumulative, cumulative_hours))) if average > 0.0 => {
+            Some((average, average_hours, cumulative, cumulative_hours))
+        }
+        _ => None,
+    }
 }
 
 fn make_spot_short_perpetual_long(
@@ -1876,6 +1899,8 @@ fn build_opportunity(token: &Token, long: &Leg, short: &Leg, funding_per_hour: f
         borrow_interest_per_hour: 0.0,
         apy: funding_per_hour * YEAR_HOURS,
         apy_horizon_hours: 1,
+        maximum_cumulative_funding_return: funding_per_hour,
+        maximum_cumulative_funding_horizon_hours: 1,
         spread,
         average_spread_24h,
         spread_vs_average,
@@ -2187,10 +2212,13 @@ mod tests {
             make_cross_candidate_at(&token, &long, &short, now).expect("funding direction");
         assert_eq!(candidate.long.exchange, "Binance");
         assert_eq!(candidate.short.exchange, "Bybit");
-        let (average, hours) = cross_funding_projection(&long, &short, now, 0.002, 0.001)
-            .expect("profitable projection");
+        let (average, hours, cumulative, cumulative_hours) =
+            cross_funding_projection(&long, &short, now, 0.002, 0.001)
+                .expect("profitable projection");
         assert_eq!(hours, 1);
         assert!((average - 0.002).abs() < 1e-12);
+        assert_eq!(cumulative_hours, 6);
+        assert!((cumulative - 0.006).abs() < 1e-12);
         assert_eq!(
             projected_rate_at(&short, 10 * 60 * 60 * 1_000, 0.001),
             0.002
@@ -2214,9 +2242,12 @@ mod tests {
         short.interval_hours = 1.0;
         short.next_funding_time = 9 * 60 * 60 * 1_000;
 
-        let (average, hours) = cross_funding_projection(&long, &short, now, 0.008, 0.002)
-            .expect("profitable projection");
+        let (average, hours, cumulative, cumulative_hours) =
+            cross_funding_projection(&long, &short, now, 0.008, 0.002)
+                .expect("profitable projection");
         assert_eq!(hours, 7);
         assert!((average - (0.001 + 6.0 * 0.002) / 7.0).abs() < 1e-12);
+        assert_eq!(cumulative_hours, 7);
+        assert!((cumulative - 0.013).abs() < 1e-12);
     }
 }

@@ -123,6 +123,7 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
           <strong>{pct(item.apy, 1)}</strong>
           <small>净收益 {pct(item.fundingPerHour, 4)} / 小时</small>
           {item.routeType === "cross_perpetual" && <small>最佳平均收益需持有 {item.apyHorizonHours} 小时</small>}
+          {item.routeType === "cross_perpetual" && <small>最高累计 {pct(item.maximumCumulativeFundingReturn, 4)} · 持有 {item.maximumCumulativeFundingHorizonHours} 小时</small>}
           {item.borrowInterestPerHour > 0 &&
             <small className="borrow-cost">借币成本 −{pct(item.borrowInterestPerHour, 4).replace("+", "")} / 小时</small>}
         </div>
@@ -1216,8 +1217,9 @@ export default function Dashboard() {
         .some((value) => value.toLowerCase().includes(query.toLowerCase())) &&
       x.apy * 100 >= minApy
     );
-    return [...list].sort((a, b) =>
-      sort === "apy" ? b.apy - a.apy : a.breakEvenHours - b.breakEvenHours
+    return [...list].sort((a, b) => sort === "cumulative"
+      ? (b.maximumCumulativeFundingReturn ?? 0) - (a.maximumCumulativeFundingReturn ?? 0)
+      : b.apy - a.apy
     );
   }, [data, query, minApy, sort]);
   const spotRows = useMemo(() => {
@@ -1226,10 +1228,8 @@ export default function Dashboard() {
         .some((value) => value.toLowerCase().includes(query.toLowerCase())) &&
       x.apy * 100 >= minApy
     );
-    return [...list].sort((a, b) =>
-      sort === "apy" ? b.apy - a.apy : a.breakEvenHours - b.breakEvenHours
-    );
-  }, [data, query, minApy, sort]);
+    return [...list].sort((a, b) => b.apy - a.apy);
+  }, [data, query, minApy]);
   const spreadRows = useMemo(
     () => (data?.spreadOpportunities || [])
       .filter((item) => [item.token.symbol, item.token.name, ...(item.token.tags || [])]
@@ -1318,8 +1318,8 @@ export default function Dashboard() {
           </label>
           <div className="sorter">
             <span><ArrowDownUp size={14} />排序</span>
-            <button className={sort === "apy" ? "selected" : ""} onClick={() => setSort("apy")}>资金 APY</button>
-            <button className={sort === "breakeven" ? "selected" : ""} onClick={() => setSort("breakeven")}>回本时间</button>
+            <button className={sort === "apy" ? "selected" : ""} onClick={() => setSort("apy")}>最高平均收益</button>
+            <button className={sort === "cumulative" ? "selected" : ""} onClick={() => setSort("cumulative")}>最高累计收益</button>
           </div>
         </div>
 
