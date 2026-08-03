@@ -242,11 +242,12 @@ impl MarketService {
         let (mut cross_opportunities, mut spot_candidates): (Vec<_>, Vec<_>) = opportunities
             .into_iter()
             .partition(|opportunity| opportunity.route_type == "cross_perpetual");
-        // Use the current-hour realized settlement edge as a cheap prefilter.
-        // Only the ten strongest candidates need 24h funding history and the
-        // more expensive projection through the next 8-hour boundary.
+        // Use the simple normalized live hourly funding-rate difference as a
+        // cheap prefilter. This keeps high-rate 4h/8h contracts eligible even
+        // when they do not settle at the next hour. Only the twenty strongest
+        // candidates need history and the projection to the next 8h boundary.
         cross_opportunities.sort_by(|a, b| b.apy.total_cmp(&a.apy));
-        cross_opportunities.truncate(10);
+        cross_opportunities.truncate(20);
         self.enrich_cross_funding_projections(&mut cross_opportunities)
             .await;
         cross_opportunities.retain(|opportunity| opportunity.funding_per_hour > 0.0);
@@ -546,25 +547,44 @@ impl MarketService {
                     service.weighted_funding_average(&long),
                     service.weighted_funding_average(&short)
                 );
-                (index, long, short, averages)
-            });
-        }
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok((index, long, short, Ok((long_average, short_average)))) => {
-                    let opportunity = &mut opportunities[index];
-                    if let Some((
-                        average_per_hour,
-                        horizon_hours,
-                        maximum_cumulative_return,
-                        maximum_cumulative_horizon_hours,
-                    )) = cross_funding_projection(
+                let projection = averages.map(|(long_average, short_average)| {
+                    select_cross_funding_direction(
                         &long,
                         &short,
                         chrono::Utc::now().timestamp_millis(),
                         long_average,
                         short_average,
-                    ) {
+                    )
+                });
+                (index, long, short, projection)
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((index, original_long, original_short, Ok(projection))) => {
+                    let opportunity = &mut opportunities[index];
+                    if let Some((
+                        reverse,
+                        average_per_hour,
+                        horizon_hours,
+                        maximum_cumulative_return,
+                        maximum_cumulative_horizon_hours,
+                    )) = projection
+                    {
+                        if reverse {
+                            opportunity.long = original_short;
+                            opportunity.short = original_long;
+                            opportunity.id = format!(
+                                "{}-{}-{}-{}-{}",
+                                opportunity.token.symbol,
+                                opportunity.long.exchange,
+                                opportunity.long.market,
+                                opportunity.short.exchange,
+                                opportunity.short.market
+                            );
+                            opportunity.spread = (opportunity.short.bid - opportunity.long.ask)
+                                / opportunity.long.ask.max(f64::EPSILON);
+                        }
                         opportunity.funding_per_hour = average_per_hour;
                         opportunity.apy = average_per_hour * YEAR_HOURS;
                         opportunity.apy_horizon_hours = horizon_hours;
@@ -1720,20 +1740,18 @@ fn make_cross_candidate_at(
     token: &Token,
     first: &Leg,
     second: &Leg,
-    now: i64,
+    _now: i64,
 ) -> Option<Opportunity> {
-    const HOUR_MILLIS: i64 = 60 * 60 * 1_000;
-    let current_hour = now.div_euclid(HOUR_MILLIS) * HOUR_MILLIS + HOUR_MILLIS;
-    let first_rate = projected_rate_at(first, current_hour, 0.0);
-    let second_rate = projected_rate_at(second, current_hour, 0.0);
-    let (long, short, current_hour_return) = if second_rate > first_rate {
-        (first, second, second_rate - first_rate)
-    } else if first_rate > second_rate {
-        (second, first, first_rate - second_rate)
+    let first_hourly_rate = first.rate / first.interval_hours.max(1.0);
+    let second_hourly_rate = second.rate / second.interval_hours.max(1.0);
+    let (long, short, simple_hourly_return) = if second_hourly_rate > first_hourly_rate {
+        (first, second, second_hourly_rate - first_hourly_rate)
+    } else if first_hourly_rate > second_hourly_rate {
+        (second, first, first_hourly_rate - second_hourly_rate)
     } else {
         return None;
     };
-    Some(build_opportunity(token, long, short, current_hour_return))
+    Some(build_opportunity(token, long, short, simple_hourly_return))
 }
 
 fn settles_at(leg: &Leg, settlement_at: i64) -> bool {
@@ -1792,6 +1810,43 @@ fn cross_funding_projection(
             Some((average, average_hours, cumulative, cumulative_hours))
         }
         _ => None,
+    }
+}
+
+fn select_cross_funding_direction(
+    long: &Leg,
+    short: &Leg,
+    now_millis: i64,
+    long_weighted_average: f64,
+    short_weighted_average: f64,
+) -> Option<(bool, f64, u8, f64, u8)> {
+    let forward = cross_funding_projection(
+        long,
+        short,
+        now_millis,
+        long_weighted_average,
+        short_weighted_average,
+    )
+    .map(|(average, hours, cumulative, cumulative_hours)| {
+        (false, average, hours, cumulative, cumulative_hours)
+    });
+    if (long.interval_hours - short.interval_hours).abs() <= f64::EPSILON {
+        return forward;
+    }
+    let reverse = cross_funding_projection(
+        short,
+        long,
+        now_millis,
+        short_weighted_average,
+        long_weighted_average,
+    )
+    .map(|(average, hours, cumulative, cumulative_hours)| {
+        (true, average, hours, cumulative, cumulative_hours)
+    });
+    match (forward, reverse) {
+        (Some(forward), Some(reverse)) if reverse.1 > forward.1 => Some(reverse),
+        (Some(forward), _) => Some(forward),
+        (None, reverse) => reverse,
     }
 }
 
@@ -2228,6 +2283,71 @@ mod tests {
             0.001
         );
         assert_eq!(projected_rate_at(&long, 11 * 60 * 60 * 1_000, 0.002), 0.0);
+    }
+
+    #[test]
+    fn cross_prefilter_normalizes_live_rates_without_requiring_next_hour_settlement() {
+        let now = 9 * 60 * 60 * 1_000 + 30 * 60 * 1_000;
+        let token = Token {
+            symbol: "TEST".into(),
+            name: "TEST".into(),
+            rank: None,
+            tags: vec![],
+        };
+        let mut four_hour = test_leg("Binance", vec![]);
+        four_hour.rate = 0.04;
+        four_hour.interval_hours = 4.0;
+        four_hour.next_funding_time = 12 * 60 * 60 * 1_000;
+        let mut eight_hour = test_leg("Bybit", vec![]);
+        eight_hour.rate = 0.008;
+        eight_hour.interval_hours = 8.0;
+        eight_hour.next_funding_time = 16 * 60 * 60 * 1_000;
+
+        let candidate = make_cross_candidate_at(&token, &four_hour, &eight_hour, now)
+            .expect("normalized hourly difference should remain eligible");
+        assert_eq!(candidate.long.exchange, "Bybit");
+        assert_eq!(candidate.short.exchange, "Binance");
+        assert!((candidate.funding_per_hour - 0.009).abs() < 1e-12);
+    }
+
+    #[test]
+    fn projection_checks_reverse_direction_when_intervals_differ() {
+        let now = 9 * 60 * 60 * 1_000 + 30 * 60 * 1_000;
+        let mut initial_long = test_leg("Bybit", vec![]);
+        initial_long.rate = 0.009;
+        initial_long.interval_hours = 1.0;
+        initial_long.next_funding_time = 10 * 60 * 60 * 1_000;
+        let mut initial_short = test_leg("Binance", vec![]);
+        initial_short.rate = 0.04;
+        initial_short.interval_hours = 4.0;
+        initial_short.next_funding_time = 12 * 60 * 60 * 1_000;
+
+        let selected =
+            select_cross_funding_direction(&initial_long, &initial_short, now, 0.009, 0.04)
+                .expect("one direction should be profitable");
+        assert!(
+            selected.0,
+            "the detailed projection should reverse the prefilter direction"
+        );
+        assert!((selected.1 - 0.009).abs() < 1e-12);
+        assert_eq!(selected.2, 1);
+    }
+
+    #[test]
+    fn projection_keeps_prefilter_direction_when_intervals_match() {
+        let now = 9 * 60 * 60 * 1_000 + 30 * 60 * 1_000;
+        let mut long = test_leg("Binance", vec![]);
+        long.rate = 0.001;
+        long.interval_hours = 1.0;
+        long.next_funding_time = 10 * 60 * 60 * 1_000;
+        let mut short = test_leg("Bybit", vec![]);
+        short.rate = 0.002;
+        short.interval_hours = 1.0;
+        short.next_funding_time = 10 * 60 * 60 * 1_000;
+
+        let selected = select_cross_funding_direction(&long, &short, now, 0.001, 0.002)
+            .expect("prefilter direction should remain profitable");
+        assert!(!selected.0);
     }
 
     #[test]

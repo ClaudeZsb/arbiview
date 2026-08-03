@@ -122,7 +122,7 @@ function OpportunityCard({ item, index, onTrade, expanded, onToggle, history, hi
           <span className="metric-label">资金费率 APY</span>
           <strong>{pct(item.apy, 1)}</strong>
           <small>净收益 {pct(item.fundingPerHour, 4)} / 小时</small>
-          {item.routeType === "cross_perpetual" && <small>最佳平均收益需持有 {item.apyHorizonHours} 小时</small>}
+          {item.routeType === "cross_perpetual" && <small>最高单位累计收益需持有 {item.apyHorizonHours} 小时</small>}
           {item.routeType === "cross_perpetual" && <small>最高累计 {pct(item.maximumCumulativeFundingReturn, 4)} · 持有 {item.maximumCumulativeFundingHorizonHours} 小时</small>}
           {item.borrowInterestPerHour > 0 &&
             <small className="borrow-cost">借币成本 −{pct(item.borrowInterestPerHour, 4).replace("+", "")} / 小时</small>}
@@ -1300,7 +1300,7 @@ export default function Dashboard() {
           <div>
             <div className="section-kicker"><TrendingUp size={15} /> CROSS-EXCHANGE PERPETUAL</div>
             <h2>跨所永续套利 <span>{rows.length}</span></h2>
-            <div className="configured">仅排名下一整点实际发生结算的机会 · APY 只计该整点结算腿</div>
+            <div className="configured">实时费率按结算周期折算每小时收益初筛前 20 · 再投影至下一 8h 边界</div>
           </div>
           <div className="updated">
             <Clock3 size={15} />
@@ -1318,7 +1318,7 @@ export default function Dashboard() {
           </label>
           <div className="sorter">
             <span><ArrowDownUp size={14} />排序</span>
-            <button className={sort === "apy" ? "selected" : ""} onClick={() => setSort("apy")}>最高平均收益</button>
+            <button className={sort === "apy" ? "selected" : ""} onClick={() => setSort("apy")}>最高单位累计收益</button>
             <button className={sort === "cumulative" ? "selected" : ""} onClick={() => setSort("cumulative")}>最高累计收益</button>
           </div>
         </div>
