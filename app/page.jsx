@@ -1144,8 +1144,13 @@ export default function Dashboard() {
 
   async function cancelBatchIncrease() {
     if (!batchTask?.id) return;
+    const taskBeforeCancel = batchTask;
+    setBatchTask((current) => current ? { ...current, status: "cancelling" } : current);
     try {
-      const response = await fetch(`/backend/trades/batch-increase/${batchTask.id}/cancel`, { method: "POST" });
+      const response = await fetch(`/backend/trades/batch-increase/${taskBeforeCancel.id}/cancel`, {
+        method: "POST",
+        signal: AbortSignal.timeout(10000)
+      });
       const task = await response.json().catch(() => ({}));
       if (!response.ok) {
         const message = task.error || `HTTP ${response.status}`;
@@ -1162,6 +1167,9 @@ export default function Dashboard() {
       }
       setBatchTask(task);
     } catch (error) {
+      setBatchTask((current) => current?.id === taskBeforeCancel.id && current.status === "cancelling"
+        ? taskBeforeCancel
+        : current);
       setNotice(`停止批量加仓失败：${error.message}`);
     }
   }

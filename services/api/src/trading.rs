@@ -1111,6 +1111,19 @@ impl TradingService {
         if !(1..=20).contains(&request.leverage) {
             bail!("leverage must be between 1 and 20");
         }
+        // Only one batch task may run at a time. Return it before resolving the
+        // opportunity, which can require several market-data lookups. This also
+        // makes retries idempotent when the original HTTP response was delayed.
+        if let Some(existing) = self
+            .batch_tasks
+            .read()
+            .await
+            .values()
+            .find(|task| matches!(task.status.as_str(), "queued" | "running" | "cancelling"))
+            .cloned()
+        {
+            return Ok(existing);
+        }
         let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
         if !opportunity.execution_supported {
             bail!("this opportunity is observation-only or currently has no borrowable liquidity");
@@ -1195,6 +1208,18 @@ impl TradingService {
         &self,
         mut request: BatchReduceRequest,
     ) -> Result<BatchIncreaseTask> {
+        // Avoid an authoritative account refresh when this request is a retry
+        // or another batch task is already active.
+        if let Some(existing) = self
+            .batch_tasks
+            .read()
+            .await
+            .values()
+            .find(|task| matches!(task.status.as_str(), "queued" | "running" | "cancelling"))
+            .cloned()
+        {
+            return Ok(existing);
+        }
         let positions = if request.close_all {
             self.refresh_positions_authoritatively().await?
         } else {
