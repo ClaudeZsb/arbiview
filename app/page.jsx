@@ -779,9 +779,22 @@ export default function Dashboard() {
     }
   }, []);
 
+  const loadActiveBatchTask = useCallback(async () => {
+    try {
+      const response = await fetch("/backend/trades/batch-tasks", { cache: "no-store" });
+      const tasks = await readJson(response, "活动批量任务接口");
+      if (!response.ok) throw new Error(tasks.error || `HTTP ${response.status}`);
+      const task = tasks.find((item) => ["queued", "running", "cancelling"].includes(item.status));
+      if (task && ["queued", "running", "cancelling"].includes(task.status)) setBatchTask(task);
+    } catch (error) {
+      setNotice(`批量任务状态：${error.message}`);
+    }
+  }, []);
+
   useEffect(() => {
     load();
     loadAccount();
+    loadActiveBatchTask();
     const opportunityTimer = window.setInterval(load, 20_000);
     const accountTimer = window.setInterval(loadAccountSummary, 20_000);
     const autoCloseTimer = window.setInterval(loadAutoCloseRules, 15_000);
@@ -801,7 +814,13 @@ export default function Dashboard() {
       window.clearTimeout(fundingTimer);
       if (fundingInterval) window.clearInterval(fundingInterval);
     };
-  }, [load, loadAccount, loadAccountSummary, loadAutoCloseRules, loadFullPositions]);
+  }, [load, loadAccount, loadAccountSummary, loadActiveBatchTask, loadAutoCloseRules, loadFullPositions]);
+
+  useEffect(() => {
+    if (!batchTask || batchPanel || !["queued", "running", "cancelling"].includes(batchTask.status)) return;
+    const position = positions.find((item) => item.token === batchTask.token);
+    if (position) setBatchPanel({ position, type: batchTask.action === "reduce" ? "reduce" : "increase" });
+  }, [batchTask, batchPanel, positions]);
 
   const positionSubscriptionKey = useMemo(
     () => account?.mode === "live" ? positions
@@ -1027,14 +1046,13 @@ export default function Dashboard() {
         });
         const tasks = await recoveryResponse.json();
         const action = batchPanel.type === "reduce" ? "reduce" : "increase";
-        const recovered = recoveryResponse.ok && tasks.find((task) =>
-          task.action === action &&
-          task.token === batchPanel.position.token &&
-          Math.abs(task.targetNotionalUsdt - settings.targetNotionalUsdt) < 0.01 &&
-          Math.abs(task.orderNotionalUsdt - settings.orderNotionalUsdt) < 0.01 &&
-          Math.abs(task.intervalSeconds - settings.intervalSeconds) < 0.01 &&
-          Date.now() - task.startedAt < 10 * 60 * 1000
-        );
+        const activeTask = recoveryResponse.ok && Array.isArray(tasks)
+          ? tasks.find((task) => ["queued", "running", "cancelling"].includes(task.status))
+          : null;
+        const recovered = activeTask && activeTask.action === action &&
+          activeTask.token === batchPanel.position.token
+          ? activeTask
+          : null;
         if (recovered) {
           setBatchTask(recovered);
           setNotice("创建响应超时，已自动接管后端正在执行的批量任务");
