@@ -3274,8 +3274,8 @@ impl TradingService {
         let mut empty_checks = 0usize;
         while result.attempts < MAX_RECONCILIATION_ATTEMPTS {
             let (long_state, short_state) = tokio::join!(
-                self.actual_leg(long_leg, "long"),
-                self.actual_leg(short_leg, "short")
+                self.actual_leg_authoritatively(long_leg, "long"),
+                self.actual_leg_authoritatively(short_leg, "short")
             );
             let (long, short) = match (long_state, short_state) {
                 (Ok(long), Ok(short)) => (long, short),
@@ -3342,8 +3342,8 @@ impl TradingService {
             }
         }
         let (long, short) = tokio::join!(
-            self.actual_leg(long_leg, "long"),
-            self.actual_leg(short_leg, "short")
+            self.actual_leg_authoritatively(long_leg, "long"),
+            self.actual_leg_authoritatively(short_leg, "short")
         );
         if let Ok(state) = long {
             result.long = state;
@@ -4131,6 +4131,34 @@ impl TradingService {
         let mut positions = match leg.exchange.as_str() {
             "Binance" => self.binance_positions().await?,
             "Bybit" => self.bybit_positions().await?,
+            exchange => bail!("unsupported exchange {exchange}"),
+        };
+        let quotes = self.market.position_quotes().await?;
+        apply_position_quotes(&mut positions, &quotes);
+        Ok(positions
+            .into_iter()
+            .find(|position| position.symbol == leg.symbol && position.side == side))
+    }
+
+    /// Reads an exchange position directly for post-order reconciliation.
+    /// Account WebSocket events from the two venues can arrive at different
+    /// times; using those transient snapshots to submit another reduce-only
+    /// order can over-close one leg.
+    async fn actual_leg_authoritatively(
+        &self,
+        leg: &Leg,
+        side: &str,
+    ) -> Result<Option<PositionLeg>> {
+        if leg.exchange == "Binance" && leg.market == "spot" {
+            if side != "short" {
+                return Ok(None);
+            }
+            self.account_store.invalidate_binance_margin().await;
+            return self.binance_margin_short_position(leg).await;
+        }
+        let mut positions = match leg.exchange.as_str() {
+            "Binance" => self.fetch_binance_positions().await?,
+            "Bybit" => self.fetch_bybit_positions().await?,
             exchange => bail!("unsupported exchange {exchange}"),
         };
         let quotes = self.market.position_quotes().await?;
