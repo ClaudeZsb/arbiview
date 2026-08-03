@@ -351,6 +351,69 @@ impl MarketService {
         Ok((funding_per_hour, spread, funding_per_hour * YEAR_HOURS))
     }
 
+    /// Builds the executable cross-perpetual direction for one specific funding
+    /// boundary. A leg that does not settle at that boundary contributes zero.
+    pub async fn hourly_cross_funding_opportunity(
+        &self,
+        symbol: &str,
+        settlement_at: i64,
+    ) -> Result<Option<Opportunity>> {
+        let legs = self.trading_legs().await?;
+        let find = |exchange: &str| {
+            legs.iter().find(|leg| {
+                leg.exchange == exchange
+                    && leg.market == "perpetual"
+                    && leg.base.eq_ignore_ascii_case(symbol)
+            })
+        };
+        let (Some(binance), Some(bybit)) = (find("Binance"), find("Bybit")) else {
+            return Ok(None);
+        };
+        let binance_rate = projected_rate_at(binance, settlement_at, binance.rate);
+        let bybit_rate = projected_rate_at(bybit, settlement_at, bybit.rate);
+        let (long, short, funding_return) = if bybit_rate > binance_rate {
+            (binance, bybit, bybit_rate - binance_rate)
+        } else if binance_rate > bybit_rate {
+            (bybit, binance, binance_rate - bybit_rate)
+        } else {
+            return Ok(None);
+        };
+        let token = Token {
+            symbol: symbol.to_uppercase(),
+            name: symbol.to_uppercase(),
+            rank: None,
+            tags: vec!["funding-cycle".into()],
+        };
+        Ok(Some(build_opportunity(&token, long, short, funding_return)))
+    }
+
+    pub async fn hourly_position_funding_return(
+        &self,
+        position: &Position,
+        settlement_at: i64,
+    ) -> Result<f64> {
+        let legs = self.trading_legs().await?;
+        let find = |exchange: &str, market: &str, symbol: &str| {
+            legs.iter().find(|leg| {
+                leg.exchange == exchange && leg.market == market && leg.symbol == symbol
+            })
+        };
+        let long = find(
+            &position.long.exchange,
+            &position.long.market,
+            &position.long.symbol,
+        )
+        .ok_or_else(|| anyhow!("long-leg funding data unavailable"))?;
+        let short = find(
+            &position.short.exchange,
+            &position.short.market,
+            &position.short.symbol,
+        )
+        .ok_or_else(|| anyhow!("short-leg funding data unavailable"))?;
+        Ok(projected_rate_at(short, settlement_at, short.rate)
+            - projected_rate_at(long, settlement_at, long.rate))
+    }
+
     pub async fn refresh_opportunity_quotes(
         &self,
         opportunity: &Opportunity,

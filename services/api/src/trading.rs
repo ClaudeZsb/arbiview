@@ -1097,6 +1097,23 @@ impl TradingService {
         &self,
         request: BatchIncreaseRequest,
     ) -> Result<BatchIncreaseTask> {
+        self.start_batch_increase_inner(request, None).await
+    }
+
+    pub(crate) async fn start_batch_increase_for_opportunity(
+        &self,
+        request: BatchIncreaseRequest,
+        opportunity: Opportunity,
+    ) -> Result<BatchIncreaseTask> {
+        self.start_batch_increase_inner(request, Some(opportunity))
+            .await
+    }
+
+    async fn start_batch_increase_inner(
+        &self,
+        request: BatchIncreaseRequest,
+        opportunity: Option<Opportunity>,
+    ) -> Result<BatchIncreaseTask> {
         if !(10.0..=1_000_000.0).contains(&request.target_notional_usdt) {
             bail!("targetNotionalUsdt must be between 10 and 1,000,000");
         }
@@ -1124,7 +1141,10 @@ impl TradingService {
         {
             return Ok(existing);
         }
-        let opportunity = self.resolve_opportunity(&request.opportunity_id).await?;
+        let opportunity = match opportunity {
+            Some(opportunity) => opportunity,
+            None => self.resolve_opportunity(&request.opportunity_id).await?,
+        };
         if !opportunity.execution_supported {
             bail!("this opportunity is observation-only or currently has no borrowable liquidity");
         }

@@ -1,5 +1,6 @@
 mod account_stream;
 mod config;
+mod funding_cycle_strategy;
 mod market;
 mod models;
 mod spread_strategy;
@@ -14,6 +15,7 @@ use axum::{
     Json, Router,
 };
 use config::Config;
+use funding_cycle_strategy::FundingCycleStrategyService;
 use market::MarketService;
 use models::{
     AdjustLeverageRequest, AdjustPositionRequest, BatchIncreaseRequest, BatchReduceRequest,
@@ -30,6 +32,7 @@ struct AppState {
     market: MarketService,
     trading: TradingService,
     spread_strategy: SpreadStrategyService,
+    funding_cycle_strategy: FundingCycleStrategyService,
 }
 
 #[tokio::main]
@@ -52,15 +55,24 @@ async fn main() -> anyhow::Result<()> {
         config.spread_strategy_enabled,
         config.telegram.clone().map(telegram::TelegramNotifier::new),
     )?;
+    let funding_cycle_strategy = FundingCycleStrategyService::new(
+        market.clone(),
+        trading.clone(),
+        config.dexe_cycle_strategy_state_path.clone(),
+        config.dexe_cycle_strategy_enabled,
+        config.telegram.clone().map(telegram::TelegramNotifier::new),
+    )?;
     let state = Arc::new(AppState {
         market,
         trading,
         spread_strategy,
+        funding_cycle_strategy,
     });
     state.trading.spawn_auto_close_monitor();
     state.trading.spawn_hedge_protection_monitor();
     state.trading.spawn_account_streams();
     state.spread_strategy.spawn();
+    state.funding_cycle_strategy.spawn();
     if let Some(telegram) = config.telegram.clone() {
         telegram::spawn(telegram, state.clone());
     }
@@ -81,6 +93,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/account/stream-status", get(account_stream_status))
         .route("/api/account/hedge-protection", get(hedge_protection))
         .route("/api/spread-strategy", get(spread_strategy_status))
+        .route(
+            "/api/funding-cycle-strategy",
+            get(funding_cycle_strategy_status),
+        )
         .route("/api/auto-close", get(auto_close_rules))
         .route("/api/auto-close/:id/cancel", post(cancel_auto_close))
         .route("/api/positions", get(positions))
@@ -129,6 +145,12 @@ async fn spread_strategy_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.spread_strategy.status().await))
+}
+
+async fn funding_cycle_strategy_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.funding_cycle_strategy.status().await))
 }
 
 async fn spread_history(

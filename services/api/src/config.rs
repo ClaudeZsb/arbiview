@@ -37,6 +37,8 @@ pub struct Config {
     pub position_funding_state_path: Option<PathBuf>,
     pub spread_strategy_state_path: Option<PathBuf>,
     pub spread_strategy_enabled: bool,
+    pub dexe_cycle_strategy_state_path: Option<PathBuf>,
+    pub dexe_cycle_strategy_enabled: bool,
 }
 
 impl Config {
@@ -85,6 +87,15 @@ impl Config {
                     .as_ref()
                     .map(|path| path.with_file_name("spread-strategy.json"))
             });
+        let dexe_cycle_strategy_state_path = std::env::var("DEXE_CYCLE_STRATEGY_STATE_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                auto_close_state_path
+                    .as_ref()
+                    .map(|path| path.with_file_name("dexe-cycle-strategy.json"))
+            });
         Ok(Self {
             port: std::env::var("PORT")
                 .ok()
@@ -111,6 +122,10 @@ impl Config {
             spread_strategy_state_path,
             spread_strategy_enabled: std::env::var("SPREAD_STRATEGY_ENABLED")
                 .unwrap_or_else(|_| "true".into())
+                .parse()?,
+            dexe_cycle_strategy_state_path,
+            dexe_cycle_strategy_enabled: std::env::var("DEXE_CYCLE_STRATEGY_ENABLED")
+                .unwrap_or_else(|_| "false".into())
                 .parse()?,
         })
     }
