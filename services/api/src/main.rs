@@ -21,6 +21,7 @@ use models::{
     AdjustLeverageRequest, AdjustPositionRequest, BatchIncreaseRequest, BatchReduceRequest,
     OpenTradeRequest, SetAutoCloseRequest,
 };
+use serde::Deserialize;
 use serde_json::json;
 use spread_strategy::SpreadStrategyService;
 use std::sync::Arc;
@@ -97,6 +98,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/funding-cycle-strategy",
             get(funding_cycle_strategy_status),
         )
+        .route(
+            "/api/funding-cycle-strategy/enabled",
+            post(set_funding_cycle_strategy_enabled),
+        )
         .route("/api/auto-close", get(auto_close_rules))
         .route("/api/auto-close/:id/cancel", post(cancel_auto_close))
         .route("/api/positions", get(positions))
@@ -151,6 +156,24 @@ async fn funding_cycle_strategy_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.funding_cycle_strategy.status().await))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetStrategyEnabledRequest {
+    enabled: bool,
+}
+
+async fn set_funding_cycle_strategy_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SetStrategyEnabledRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        state
+            .funding_cycle_strategy
+            .set_enabled(request.enabled)
+            .await?,
+    ))
 }
 
 async fn spread_history(

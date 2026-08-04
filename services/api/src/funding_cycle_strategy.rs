@@ -69,7 +69,6 @@ pub struct FundingCycleStrategyService {
     state: Arc<RwLock<FundingCycleStrategyStatus>>,
     state_path: Option<PathBuf>,
     notifier: Option<TelegramNotifier>,
-    enabled: bool,
 }
 
 impl FundingCycleStrategyService {
@@ -85,8 +84,8 @@ impl FundingCycleStrategyService {
                 .context("failed to parse DEXE funding-cycle strategy state")?,
             _ => FundingCycleStrategyStatus::new(enabled),
         };
-        state.enabled = enabled;
         if !enabled {
+            state.enabled = false;
             state.state = "disabled".into();
         }
         Ok(Self {
@@ -95,14 +94,10 @@ impl FundingCycleStrategyService {
             state: Arc::new(RwLock::new(state)),
             state_path,
             notifier,
-            enabled,
         })
     }
 
     pub fn spawn(&self) {
-        if !self.enabled {
-            return;
-        }
         let service = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -120,11 +115,45 @@ impl FundingCycleStrategyService {
         self.state.read().await.clone()
     }
 
+    pub async fn set_enabled(&self, enabled: bool) -> Result<FundingCycleStrategyStatus> {
+        {
+            let mut state = self.state.write().await;
+            state.enabled = enabled;
+            state.state = if enabled {
+                if state.entry_task_id.is_some() {
+                    "entering"
+                } else if state.exit_task_id.is_some() {
+                    "exiting"
+                } else {
+                    "waiting"
+                }
+            } else {
+                "paused"
+            }
+            .into();
+            state.last_action_at = Some(chrono::Utc::now().timestamp_millis());
+            state.last_action = Some(
+                if enabled {
+                    "用户从 UI 启用了策略"
+                } else {
+                    "用户从 UI 暂停了策略；已提交任务不受影响"
+                }
+                .into(),
+            );
+            state.error = None;
+        }
+        self.persist().await?;
+        Ok(self.status().await)
+    }
+
     async fn tick(&self) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         let hour = now.div_euclid(HOUR_MILLIS);
         let offset_seconds = now.rem_euclid(HOUR_MILLIS) / 1_000;
         self.refresh_task_state().await?;
+        if !self.state.read().await.enabled {
+            return Ok(());
+        }
 
         // +00:01: assess whether the next boundary still pays the held route.
         if (1..15).contains(&offset_seconds)

@@ -668,6 +668,26 @@ function AccountBoard({ account, positions, protection, histories, historyLoadin
   );
 }
 
+function FundingStrategyControl({ strategy, busy, onToggle }) {
+  const labels = { waiting: "等待检查", holding: "持仓中", entering: "正在入场", exiting: "正在退场", exit_verifying: "等待残仓复核", waiting_cleanup: "等待清理残仓", paused: "已暂停", disabled: "未启用" };
+  return (
+    <section className={`strategy-control ${strategy?.enabled ? "enabled" : "paused"}`}>
+      <div className="strategy-control-title"><span><ShieldCheck size={17} /> DEXE 周期资费策略</span><b>{labels[strategy?.state] || strategy?.state || "读取中"}</b></div>
+      <div className="strategy-control-metrics">
+        <div><span>运行状态</span><strong>{strategy?.enabled ? "自动交易已启用" : "自动交易已暂停"}</strong></div>
+        <div><span>最近信号方向</span><strong>{strategy?.signalDirection || "—"}</strong></div>
+        <div><span>最近小时收益</span><strong>{strategy?.signalHourlyReturn == null ? "—" : pct(strategy.signalHourlyReturn, 4)}</strong></div>
+        <div><span>最近信号 APY</span><strong>{strategy?.signalApy == null ? "—" : pct(strategy.signalApy, 1)}</strong></div>
+      </div>
+      <div className="strategy-control-footer">
+        <span>{strategy?.lastAction || "尚无策略动作"}{strategy?.entryTaskId || strategy?.exitTaskId ? " · 当前有批量任务执行中" : ""}</span>
+        <button disabled={!strategy || busy} onClick={() => onToggle(!strategy.enabled)}>{busy ? "处理中…" : strategy?.enabled ? "暂停策略" : "启用策略"}</button>
+      </div>
+      {strategy?.error && <div className="strategy-control-error">{strategy.error}</div>}
+    </section>
+  );
+}
+
 export default function Dashboard() {
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
@@ -683,6 +703,8 @@ export default function Dashboard() {
   const [autoCloseRules, setAutoCloseRules] = useState([]);
   const [autoCloseBusy, setAutoCloseBusy] = useState("");
   const [protection, setProtection] = useState(null);
+  const [fundingStrategy, setFundingStrategy] = useState(null);
+  const [fundingStrategyBusy, setFundingStrategyBusy] = useState(false);
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
   const [adjustment, setAdjustment] = useState(null);
@@ -791,13 +813,45 @@ export default function Dashboard() {
     }
   }, []);
 
+  const loadFundingStrategy = useCallback(async () => {
+    try {
+      const response = await fetch("/backend/funding-cycle-strategy", { cache: "no-store" });
+      const strategy = await readJson(response, "周期策略接口");
+      if (!response.ok) throw new Error(strategy.error || `HTTP ${response.status}`);
+      setFundingStrategy(strategy);
+    } catch (error) {
+      setNotice(`周期策略：${error.message}`);
+    }
+  }, []);
+
+  const toggleFundingStrategy = useCallback(async (enabled) => {
+    setFundingStrategyBusy(true);
+    try {
+      const response = await fetch("/backend/funding-cycle-strategy/enabled", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled })
+      });
+      const strategy = await readJson(response, "周期策略控制接口");
+      if (!response.ok) throw new Error(strategy.error || `HTTP ${response.status}`);
+      setFundingStrategy(strategy);
+      setNotice(enabled ? "DEXE 周期策略已启用" : "DEXE 周期策略已暂停；已提交任务将继续执行");
+    } catch (error) {
+      setNotice(`周期策略控制失败：${error.message}`);
+    } finally {
+      setFundingStrategyBusy(false);
+    }
+  }, []);
+
   useEffect(() => {
     load();
     loadAccount();
     loadActiveBatchTask();
+    loadFundingStrategy();
     const opportunityTimer = window.setInterval(load, 20_000);
     const accountTimer = window.setInterval(loadAccountSummary, 20_000);
     const autoCloseTimer = window.setInterval(loadAutoCloseRules, 15_000);
+    const fundingStrategyTimer = window.setInterval(loadFundingStrategy, 5_000);
     const now = new Date();
     const nextFundingRefresh = new Date(now);
     nextFundingRefresh.setMinutes(2, 0, 0);
@@ -811,10 +865,11 @@ export default function Dashboard() {
       window.clearInterval(opportunityTimer);
       window.clearInterval(accountTimer);
       window.clearInterval(autoCloseTimer);
+      window.clearInterval(fundingStrategyTimer);
       window.clearTimeout(fundingTimer);
       if (fundingInterval) window.clearInterval(fundingInterval);
     };
-  }, [load, loadAccount, loadAccountSummary, loadActiveBatchTask, loadAutoCloseRules, loadFullPositions]);
+  }, [load, loadAccount, loadAccountSummary, loadActiveBatchTask, loadAutoCloseRules, loadFullPositions, loadFundingStrategy]);
 
   useEffect(() => {
     if (!batchTask || batchPanel || !["queued", "running", "cancelling"].includes(batchTask.status)) return;
@@ -1320,6 +1375,8 @@ export default function Dashboard() {
       </section>
 
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
+
+      <FundingStrategyControl strategy={fundingStrategy} busy={fundingStrategyBusy} onToggle={toggleFundingStrategy} />
 
       <AccountBoard account={account} positions={positions} protection={protection} histories={opportunityHistories} historyLoading={historyLoading} onLoadHistory={loadPositionHistory} autoCloseRules={autoCloseRules} onSetAutoClose={setAutoClose} onCancelAutoClose={cancelAutoClose} autoCloseBusy={autoCloseBusy} onClose={(position) => {
         if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {

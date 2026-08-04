@@ -312,6 +312,24 @@ h1 em { color: var(--green); font-style: normal; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.strategy-control { max-width: 1385px; margin: 18px auto 0; border: 1px solid var(--line); background: #fff; }
+.strategy-control.enabled { border-left: 4px solid var(--green); }
+.strategy-control.paused { border-left: 4px solid #d78752; }
+.strategy-control-title, .strategy-control-footer { min-height: 44px; padding: 0 18px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.strategy-control-title { border-bottom: 1px solid var(--line); }
+.strategy-control-title span { display: flex; align-items: center; gap: 8px; color: var(--green-dark); font: 600 10px DM Mono, monospace; letter-spacing: .08em; }
+.strategy-control-title b { font-size: 10px; color: var(--muted); }
+.strategy-control-metrics { display: grid; grid-template-columns: repeat(4, 1fr); }
+.strategy-control-metrics > div { min-width: 0; padding: 14px 18px; border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+.strategy-control-metrics > div:last-child { border-right: 0; }
+.strategy-control-metrics span { color: var(--muted); font-size: 9px; }
+.strategy-control-metrics strong { overflow-wrap: anywhere; font: 600 11px DM Mono, monospace; }
+.strategy-control-footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 9px; }
+.strategy-control-footer button { flex: 0 0 auto; min-width: 92px; height: 30px; border: 1px solid var(--green); background: var(--green-dark); color: white; font-size: 9px; }
+.strategy-control.paused .strategy-control-footer button { background: var(--green); }
+.strategy-control-footer button:disabled { opacity: .5; }
+.strategy-control-error { padding: 10px 18px; border-top: 1px solid #efc2b4; background: #fff0ec; color: #a63320; font-size: 9px; overflow-wrap: anywhere; }
+
 .methodology { max-width: 1385px; margin: 35px auto 70px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 1.1fr 1fr 1fr 1fr; }
 .methodology > div { padding: 25px; border-right: 1px solid var(--line); display: flex; gap: 14px; align-items: flex-start; }
 .methodology > div:last-child { border-right: 0; }
@@ -366,6 +384,11 @@ footer span { display: flex; align-items: center; gap: 7px; }
   .methodology { grid-template-columns: 1fr; }
   .account-stats { grid-template-columns: 1fr 1fr; }
   .exchange-balances article { grid-template-columns: 1fr 1fr; }
+  .strategy-control { margin-left: 16px; margin-right: 16px; }
+  .strategy-control-metrics { grid-template-columns: 1fr 1fr; }
+  .strategy-control-metrics > div:nth-child(2) { border-right: 0; }
+  .strategy-control-metrics > div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+  .strategy-control-footer { align-items: flex-start; padding-top: 10px; padding-bottom: 10px; }
   .account-stats > div:nth-child(2) { border-right: 0; }
   .account-stats > div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
   .position-row { grid-template-columns: 1fr; }
