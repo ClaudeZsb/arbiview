@@ -688,6 +688,26 @@ function FundingStrategyControl({ strategy, busy, onToggle }) {
   );
 }
 
+function SpreadStrategyControl({ strategy, busy, onToggle }) {
+  const trade = strategy?.trade;
+  const labels = { entering: "正在入场", reconciling: "仓位确认中", active: "持仓管理中", market_exit: "正在市价退出", closed: "已结束", failed: "异常" };
+  return (
+    <section className={`strategy-control ${strategy?.enabled ? "enabled" : "paused"}`}>
+      <div className="strategy-control-title"><span><ArrowDownUp size={17} /> 价差回归自动策略</span><b>{strategy?.enabled ? labels[trade?.status] || "等待入场信号" : "已暂停"}</b></div>
+      <div className="strategy-control-metrics">
+        <div><span>运行状态</span><strong>{strategy?.enabled ? "自动交易已启用" : "自动交易已暂停"}</strong></div>
+        <div><span>当前标的</span><strong>{trade?.token || "—"}</strong></div>
+        <div><span>入场偏离</span><strong>{trade?.entryDeviation == null ? "—" : pct(trade.entryDeviation, 3)}</strong></div>
+        <div><span>当前 ROI / 目标</span><strong>{trade?.currentRoi == null ? "—" : pct(trade.currentRoi, 2)}{trade?.targetRoi == null ? "" : ` / ${pct(trade.targetRoi, 2)}`}</strong></div>
+      </div>
+      <div className="strategy-control-footer">
+        <span>{trade?.error ? `错误：${trade.error}` : trade ? `状态：${labels[trade.status] || trade.status}` : "价差相对24小时加权均值偏离达到门槛时自动入场"}</span>
+        <button disabled={!strategy || busy} onClick={() => onToggle(!strategy.enabled)}>{busy ? "处理中…" : strategy?.enabled ? "暂停策略" : "启用策略"}</button>
+      </div>
+    </section>
+  );
+}
+
 export default function Dashboard() {
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
@@ -705,6 +725,8 @@ export default function Dashboard() {
   const [protection, setProtection] = useState(null);
   const [fundingStrategy, setFundingStrategy] = useState(null);
   const [fundingStrategyBusy, setFundingStrategyBusy] = useState(false);
+  const [spreadStrategy, setSpreadStrategy] = useState(null);
+  const [spreadStrategyBusy, setSpreadStrategyBusy] = useState(false);
   const [tradeItem, setTradeItem] = useState(null);
   const [tradeBusy, setTradeBusy] = useState(false);
   const [adjustment, setAdjustment] = useState(null);
@@ -843,15 +865,47 @@ export default function Dashboard() {
     }
   }, []);
 
+  const loadSpreadStrategy = useCallback(async () => {
+    try {
+      const response = await fetch("/backend/spread-strategy/control", { cache: "no-store" });
+      const strategy = await readJson(response, "价差策略接口");
+      if (!response.ok) throw new Error(strategy.error || `HTTP ${response.status}`);
+      setSpreadStrategy(strategy);
+    } catch (error) {
+      setNotice(`价差策略：${error.message}`);
+    }
+  }, []);
+
+  const toggleSpreadStrategy = useCallback(async (enabled) => {
+    setSpreadStrategyBusy(true);
+    try {
+      const response = await fetch("/backend/spread-strategy/enabled", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled })
+      });
+      const strategy = await readJson(response, "价差策略控制接口");
+      if (!response.ok) throw new Error(strategy.error || `HTTP ${response.status}`);
+      setSpreadStrategy(strategy);
+      setNotice(enabled ? "价差回归策略已启用" : "价差回归策略已暂停；已提交任务将继续执行");
+    } catch (error) {
+      setNotice(`价差策略控制失败：${error.message}`);
+    } finally {
+      setSpreadStrategyBusy(false);
+    }
+  }, []);
+
   useEffect(() => {
     load();
     loadAccount();
     loadActiveBatchTask();
     loadFundingStrategy();
+    loadSpreadStrategy();
     const opportunityTimer = window.setInterval(load, 20_000);
     const accountTimer = window.setInterval(loadAccountSummary, 20_000);
     const autoCloseTimer = window.setInterval(loadAutoCloseRules, 15_000);
     const fundingStrategyTimer = window.setInterval(loadFundingStrategy, 5_000);
+    const spreadStrategyTimer = window.setInterval(loadSpreadStrategy, 5_000);
     const now = new Date();
     const nextFundingRefresh = new Date(now);
     nextFundingRefresh.setMinutes(2, 0, 0);
@@ -866,10 +920,11 @@ export default function Dashboard() {
       window.clearInterval(accountTimer);
       window.clearInterval(autoCloseTimer);
       window.clearInterval(fundingStrategyTimer);
+      window.clearInterval(spreadStrategyTimer);
       window.clearTimeout(fundingTimer);
       if (fundingInterval) window.clearInterval(fundingInterval);
     };
-  }, [load, loadAccount, loadAccountSummary, loadActiveBatchTask, loadAutoCloseRules, loadFullPositions, loadFundingStrategy]);
+  }, [load, loadAccount, loadAccountSummary, loadActiveBatchTask, loadAutoCloseRules, loadFullPositions, loadFundingStrategy, loadSpreadStrategy]);
 
   useEffect(() => {
     if (!batchTask || batchPanel || !["queued", "running", "cancelling"].includes(batchTask.status)) return;
@@ -1377,6 +1432,7 @@ export default function Dashboard() {
       {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}><X size={14} /></button></div>}
 
       <FundingStrategyControl strategy={fundingStrategy} busy={fundingStrategyBusy} onToggle={toggleFundingStrategy} />
+      <SpreadStrategyControl strategy={spreadStrategy} busy={spreadStrategyBusy} onToggle={toggleSpreadStrategy} />
 
       <AccountBoard account={account} positions={positions} protection={protection} histories={opportunityHistories} historyLoading={historyLoading} onLoadHistory={loadPositionHistory} autoCloseRules={autoCloseRules} onSetAutoClose={setAutoClose} onCancelAutoClose={cancelAutoClose} autoCloseBusy={autoCloseBusy} onClose={(position) => {
         if (batchTask && ["queued", "running", "cancelling"].includes(batchTask.status)) {

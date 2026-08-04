@@ -64,13 +64,21 @@ pub struct SpreadStrategyTrade {
     pub exit_notified: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpreadStrategyControlStatus {
+    pub enabled: bool,
+    pub trade: Option<SpreadStrategyTrade>,
+}
+
 #[derive(Clone)]
 pub struct SpreadStrategyService {
     market: MarketService,
     trading: TradingService,
     state: Arc<RwLock<Option<SpreadStrategyTrade>>>,
     state_path: Option<PathBuf>,
-    enabled: bool,
+    enabled: Arc<RwLock<bool>>,
+    enabled_path: Option<PathBuf>,
     notifier: Option<TelegramNotifier>,
 }
 
@@ -89,20 +97,30 @@ impl SpreadStrategyService {
             ),
             _ => None,
         };
+        let enabled_path = state_path
+            .as_ref()
+            .map(|path| path.with_extension("enabled"));
+        let runtime_enabled = if enabled {
+            enabled_path
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|value| value.trim().parse::<bool>().ok())
+                .unwrap_or(true)
+        } else {
+            false
+        };
         Ok(Self {
             market,
             trading,
             state: Arc::new(RwLock::new(state)),
             state_path,
-            enabled,
+            enabled: Arc::new(RwLock::new(runtime_enabled)),
+            enabled_path,
             notifier,
         })
     }
 
     pub fn spawn(&self) {
-        if !self.enabled {
-            return;
-        }
         let service = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -119,7 +137,30 @@ impl SpreadStrategyService {
         self.state.read().await.clone()
     }
 
+    pub async fn control_status(&self) -> SpreadStrategyControlStatus {
+        SpreadStrategyControlStatus {
+            enabled: *self.enabled.read().await,
+            trade: self.status().await,
+        }
+    }
+
+    pub async fn set_enabled(&self, enabled: bool) -> Result<SpreadStrategyControlStatus> {
+        *self.enabled.write().await = enabled;
+        if let Some(path) = &self.enabled_path {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temporary = path.with_extension("enabled.tmp");
+            std::fs::write(&temporary, enabled.to_string())?;
+            std::fs::rename(temporary, path)?;
+        }
+        Ok(self.control_status().await)
+    }
+
     async fn tick(&self) -> Result<()> {
+        if !*self.enabled.read().await {
+            return Ok(());
+        }
         let current = self.state.read().await.clone();
         match current {
             None => self.scan_entry().await,

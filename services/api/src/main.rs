@@ -94,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/account/stream-status", get(account_stream_status))
         .route("/api/account/hedge-protection", get(hedge_protection))
         .route("/api/spread-strategy", get(spread_strategy_status))
+        .route("/api/spread-strategy/control", get(spread_strategy_control))
+        .route(
+            "/api/spread-strategy/enabled",
+            post(set_spread_strategy_enabled),
+        )
         .route(
             "/api/funding-cycle-strategy",
             get(funding_cycle_strategy_status),
@@ -150,6 +155,21 @@ async fn spread_strategy_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.spread_strategy.status().await))
+}
+
+async fn spread_strategy_control(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.spread_strategy.control_status().await))
+}
+
+async fn set_spread_strategy_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SetStrategyEnabledRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        state.spread_strategy.set_enabled(request.enabled).await?,
+    ))
 }
 
 async fn funding_cycle_strategy_status(
