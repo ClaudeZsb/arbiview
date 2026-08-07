@@ -13,7 +13,10 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::sync::{Mutex, RwLock};
@@ -196,6 +199,7 @@ pub struct TradingService {
     protected_routes: Arc<RwLock<HashMap<String, ProtectedRoute>>>,
     position_funding_baselines: Arc<RwLock<HashMap<String, f64>>>,
     protection_events: Arc<RwLock<Vec<HedgeProtectionEvent>>>,
+    hedge_protection_enabled: Arc<AtomicBool>,
     execution_lock: Arc<Mutex<()>>,
     account_store: AccountStore,
 }
@@ -224,6 +228,7 @@ impl TradingService {
             protected_routes: Arc::new(RwLock::new(HashMap::new())),
             position_funding_baselines: Arc::new(RwLock::new(position_funding_baselines)),
             protection_events: Arc::new(RwLock::new(Vec::new())),
+            hedge_protection_enabled: Arc::new(AtomicBool::new(true)),
             execution_lock: Arc::new(Mutex::new(())),
             account_store: AccountStore::default(),
         })
@@ -378,6 +383,9 @@ impl TradingService {
         tokio::spawn(async move {
             loop {
                 service.account_store.wait_for_position_update().await;
+                if !service.hedge_protection_enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
                 // Debounce the two exchanges' near-simultaneous account events so a
                 // normal paired fill is observed as a pair instead of a transient orphan.
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -399,7 +407,8 @@ impl TradingService {
         protected_tokens.sort();
         protected_tokens.dedup();
         HedgeProtectionStatus {
-            enabled: self.config.trading_mode == TradingMode::Live,
+            enabled: self.config.trading_mode == TradingMode::Live
+                && self.hedge_protection_enabled.load(Ordering::Relaxed),
             tolerance_percent: 0.0,
             minimum_difference_usdt: 0.0,
             order_notional_usdt: HEDGE_PROTECTION_ORDER_USDT,
@@ -407,6 +416,12 @@ impl TradingService {
             protected_tokens,
             events: self.protection_events.read().await.clone(),
         }
+    }
+
+    pub async fn set_hedge_protection_enabled(&self, enabled: bool) -> HedgeProtectionStatus {
+        self.hedge_protection_enabled
+            .store(enabled, Ordering::Relaxed);
+        self.hedge_protection_status().await
     }
 
     pub async fn account_stream_status(&self) -> Value {
@@ -421,6 +436,9 @@ impl TradingService {
     }
 
     async fn inspect_hedge_protection(&self) -> Result<()> {
+        if !self.hedge_protection_enabled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let (binance, bybit, margin, quotes) = tokio::try_join!(
             self.binance_positions(),
             self.bybit_positions(),

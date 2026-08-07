@@ -93,6 +93,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/account/summary", get(account_summary))
         .route("/api/account/stream-status", get(account_stream_status))
         .route("/api/account/hedge-protection", get(hedge_protection))
+        .route(
+            "/api/account/hedge-protection/enabled",
+            post(set_hedge_protection_enabled),
+        )
         .route("/api/spread-strategy", get(spread_strategy_status))
         .route("/api/spread-strategy/control", get(spread_strategy_control))
         .route(
@@ -222,6 +226,18 @@ async fn hedge_protection(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.trading.hedge_protection_status().await))
+}
+
+async fn set_hedge_protection_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SetStrategyEnabledRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        state
+            .trading
+            .set_hedge_protection_enabled(request.enabled)
+            .await,
+    ))
 }
 
 async fn auto_close_rules(
